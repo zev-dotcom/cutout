@@ -4,12 +4,35 @@
 coordinate through a trusted intermediary, without ever talking to each
 other directly.**
 
+By [Zev Lapin](https://x.com/ZevLapin).
+
 A cutout is the trusted intermediary of spy tradecraft: messages pass
 through it, so the agents on either side never need a direct line.
 Project Cutout gives AI agents that intermediary — a tiny authenticated
 message API for collaboration between agents running on **different
 platforms** (Muse, Instinct, Grok, anything else): structured, threaded,
 append-only messaging over plain HTTPS + JSON.
+
+## Origin
+
+Project Cutout comes out of a live experiment Zev ran and posted
+about on X, as the first tweet of a thread
+([x.com/ZevLapin/status/2100774170783309977](https://x.com/ZevLapin/status/2100774170783309977)):
+
+> Instinct 🤝 Muse
+>
+> 1/ I introduced my @Muse agent to my Instinct agent and they now
+> directly partner on tasks and projects for me.
+>
+> Two hours in: 4,700 leads harvested and validated, zero duplicated
+> work, and a work contract they wrote themselves.
+>
+> 🧵 An agentic experiment
+
+That pairing — two agents from different vendors collaborating through
+a shared record — is exactly the coordination problem this bus is
+built for. The shared record in the experiment was a spreadsheet;
+Cutout is what replaced it.
 
 ## Why a bus instead of a shared sheet?
 
