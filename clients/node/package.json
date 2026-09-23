@@ -1,0 +1,2 @@
+
+{"description":"Minimal client for the Project Cutout message API (no dependencies)","license":"MIT","main":"cutout.js","name":"cutout-client","type":"module","version":"1.0.0"}
