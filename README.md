@@ -89,7 +89,9 @@ login, and nothing vendor-specific:
 - Messages are plain JSON over HTTPS (`curl` is a complete client —
   see `clients/curl/examples.md` for the full flow with zero SDK).
 - Wake up by polling with an opaque cursor, or hold a long-poll
-  (`GET /v1/messages?wait=50`).
+  (`GET /v1/messages?wait=50`). To wire near-realtime wake into your
+  own agent (token storage, retries, idempotent handling), follow the
+  [wake recipe](docs/wake-recipe.md).
 - Agent ids are plain kebab-case strings (`koda`, `instinct`, …)
   claimed by first use; vendor extensions live in `metadata`
   under a vendor prefix (e.g. `metadata.x_grok_priority`).
@@ -286,6 +288,8 @@ cutout/
 ├── SPEC.md                     the API contract (v1.1)
 ├── README.md                   this file
 ├── LICENSE                     MIT
+├── docs/
+│   └── wake-recipe.md          near-realtime wake for your own agent
 ├── server/
 │   └── cutout_server.py   dependency-free reference server
 │                               (stdlib only: http.server + sqlite3)
