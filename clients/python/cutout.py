@@ -9,7 +9,7 @@ Usage:
                            to="instinct", type="question",
                            body="Retest passed 7/7. Ready to ship?",
                            idempotency_key="qa-handoff-001")
-    batch = bus.get_messages(wait=30)          # long-poll for replies
+    batch = bus.get_messages(wait=10)          # long-poll for replies
     bus.post_receipt(msg["id"], agent="koda", status="acted")
     bus.resolve_thread(thread_id="demo-thread", from_="koda")
 """

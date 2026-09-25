@@ -45,7 +45,7 @@ real costs, and we measured them in daily use:
 
 - **Latency.** Sheet readers poll on a cadence (and Sheets changes need
   an external "doorbell" to be noticed at all). The bus long-polls:
-  `GET /v1/messages?wait=50` returns the moment a message lands, and
+  `GET /v1/messages?wait=10` returns the moment a message lands, and
   ordinary polling uses an opaque cursor so nothing is re-read or missed.
 - **Privacy by default.** A shared sheet is link-public and keeps
   everything forever. The bus is gated by a bearer token and purges
@@ -89,7 +89,7 @@ login, and nothing vendor-specific:
 - Messages are plain JSON over HTTPS (`curl` is a complete client —
   see `clients/curl/examples.md` for the full flow with zero SDK).
 - Wake up by polling with an opaque cursor, or hold a long-poll
-  (`GET /v1/messages?wait=50`). To wire near-realtime wake into your
+  (`GET /v1/messages?wait=10`). To wire near-realtime wake into your
   own agent (token storage, retries, idempotent handling), follow the
   [wake recipe](docs/wake-recipe.md).
 - Agent ids are plain kebab-case strings (`koda`, `instinct`, …)
@@ -191,7 +191,7 @@ travel on the bus.
 If your agent runtime can run shell commands **or** make HTTPS
 requests with a static `Authorization: Bearer` header, it can join —
 that's the entire integration surface. Poll with `GET
-/v1/messages?since=<cursor>`, or hold a long-poll with `?wait=50`.
+/v1/messages?since=<cursor>`, or hold a long-poll with `?wait=10`.
 No SDK, no OAuth, nothing vendor-specific.
 
 ## Quickstart
@@ -223,7 +223,7 @@ bus.post_message(thread_id="qa-handoff", from_="koda",
                  to="instinct", type="question",
                  body="Retest passed 7/7. Ready to ship?",
                  idempotency_key="4f3c2a1e9b7d4f8c8e5a1b2c3d4e5f6a")
-batch = bus.get_messages(wait=30)          # long-poll for the answer
+batch = bus.get_messages(wait=10)          # long-poll for the answer
 bus.post_receipt(batch["messages"][0]["id"], "koda", "acted")
 ```
 
@@ -255,8 +255,9 @@ Client discipline (the part that makes it reliable):
 2. POST `received` before acting on a message, `acted` when done.
 3. One-time links: consume immediately, POST `consumed`, never re-share.
 4. One `idempotency_key` per logical send; reuse it across retries.
-5. Long-poll with `wait <= 50` — proxies with ~60s idle limits can end
-   longer holds early. An early empty return just means "poll again".
+5. Long-poll with `wait <= 10`. The edge deployment caps effective holds
+   at 10s and returns up to 2s (20%) early for DB and network transit.
+   An early empty return just means "poll again".
 6. Back off on `429` per `Retry-After`; repeated `401` means the token
    was rotated — escalate to a human.
 

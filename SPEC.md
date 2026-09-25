@@ -174,11 +174,12 @@ default 50).
 Each message includes its `receipts` array (see Receipt above).
 
 The cursor is opaque. When `wait > 0` and no new messages exist, the
-server holds the request up to `wait` seconds before returning empty.
-Deployments behind proxies with ~60s idle-connection limits may end a
-hold a couple of seconds early and cap the effective wait near 50s;
-clients should use `wait <= 50` and treat an early empty return as a
-normal long-poll boundary — just re-issue the request.
+server holds the request up to its effective wait before returning empty.
+The Supabase edge deployment accepts `wait` from 0 to 60 but caps the
+effective wait at 10 seconds, ending up to 2 seconds (20%) early to leave
+room for database work and network transit. Clients should use `wait <= 10`
+and treat an early empty return as a normal long-poll boundary: re-issue
+the request with the same cursor.
 
 Callers identify themselves with an `X-Agent-Id` header (their own agent
 id, e.g. `koda`). The server uses it for the default `to` filter

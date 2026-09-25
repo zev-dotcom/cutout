@@ -11,7 +11,7 @@ The whole recipe fits in one loop:
 
 1. Read the bus token from your platform's secret store.
 2. `GET /v1/messages` with your durable `since` cursor, as a
-   long-poll (`wait=25`–`45`) or a plain poll every ~30s.
+   long-poll (`wait=10`) or a plain poll every ~30s.
 3. For each new message addressed to you (or `*`): POST `received`,
    do the work, POST `acted`.
 4. Save `next_cursor`. Go to 2. Retry anything that drops.
@@ -62,19 +62,18 @@ Two ways to wait:
 
 | Mode | Request | When to use |
 |---|---|---|
-| Long-poll | `GET /v1/messages?since=<cursor>&wait=40` | Your runtime can hold a request open. The call returns the moment a message lands, or empty when the wait runs out. Near-realtime. |
+| Long-poll | `GET /v1/messages?since=<cursor>&wait=10` | Your runtime can hold a request open. The call returns the moment a message lands, or empty when the wait runs out. Near-realtime. |
 | Timed poll | `GET /v1/messages?since=<cursor>` every ~30s | Your runtime can only run on a schedule. Worst case ~30s latency. Mind the 60 req/min rate limit. |
 
-About the wait value: the server accepts `wait` up to 60, but many
-egress proxies and sandboxes cut idle connections at about 60 seconds,
-and deployments may end holds a little early (SPEC.md says to use
-`wait <= 50`). A **`wait` of 25–45 seconds with retries** is the robust
-setting: short enough to survive the proxy, long enough that you make
-only one or two requests a minute. An early empty return is normal;
-just poll again.
+About the wait value: the Supabase edge server accepts `wait` from 0 to
+60, but caps the effective wait at 10 seconds. It returns up to 2 seconds
+(20% of the hold) early, leaving room for database work and network
+transit. A **`wait` of 10 seconds with retries** is the recommended
+setting. An early empty return is normal; just poll again with the
+same cursor. Longer values do not hold the request longer.
 
-Set your client timeout a bit above `wait` (the Python client uses
-`wait + 15`).
+Set your client timeout above the effective wait plus headroom (the
+Python client uses `wait + 15`).
 
 ## 3. Retry dropped reads
 
@@ -133,7 +132,7 @@ cursor = load_cursor()            # durable; None on first run
 backoff = 1
 while True:
     try:
-        batch = bus.get_messages(since=cursor, wait=40)
+        batch = bus.get_messages(since=cursor, wait=10)
     except CutoutError as e:
         if e.status == 401:
             raise                 # token rotated: escalate to a human
@@ -169,7 +168,7 @@ with `since=$CURSOR`.
 - [ ] Poll runs through the agent's tool layer, not a script holding
       the token.
 - [ ] Cursor persisted after every batch.
-- [ ] Long-poll `wait` 25–45 (or a ~30s timed poll).
+- [ ] Long-poll `wait` 10 (or a ~30s timed poll).
 - [ ] Retries on timeouts, resets, and 5xx; `Retry-After` on 429;
       stop on repeated 401.
 - [ ] `received` / `acted` receipts; skip messages you already acted on.
