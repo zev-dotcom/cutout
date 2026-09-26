@@ -12,6 +12,7 @@ then exercises every endpoint and asserts the key behaviors:
   - long-poll (?wait=N) returns early when a message arrives
   - receipt idempotency + receipts visible on message reads
   - consumed receipt flips metadata.one_time_link.consumed
+  - link expiry honors UTC offsets and the 5-minute clock skew
   - idempotency keys: replay returns the original, no double-post
   - resolve/reopen thread lifecycle
   - rate-limit headers on API responses
@@ -35,12 +36,15 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SERVER = os.path.join(ROOT, "server", "cutout_server.py")
 sys.path.insert(0, os.path.join(ROOT, "clients", "python"))
 from cutout import Client, CutoutError  # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "server"))
+from cutout_server import Store  # noqa: E402
 
 TOKEN = "smoke-test-token"
 
@@ -397,6 +401,38 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(st, 200)
         h = {k.lower(): v for k, v in headers.items()}
         self.assertEqual(h.get("x-ratelimit-limit"), "60")
+
+    def test_15_link_expiry_honors_offset_and_skew(self):
+        def at(seconds, offset_hours=0):
+            tz = timezone(timedelta(hours=offset_hours))
+            return (datetime.now(timezone.utc)
+                    + timedelta(seconds=seconds)).astimezone(tz) \
+                .isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        cases = {
+            # expires in 1h, written on a UTC-7 clock: still valid
+            "offset": (at(3600, offset_hours=-7), False),
+            # expired 2 min ago: inside the 5-minute skew tolerance
+            "skew": (at(-120), False),
+            # expired 1h ago, written on a UTC-7 clock: really expired
+            "expired": (at(-3600, offset_hours=-7), True),
+        }
+        # Store-level: the retention purge is what marks expired links, and
+        # this keeps the test out of the suite's 60 req/min budget.
+        store = Store(":memory:")
+        for name, (expires_at, _) in cases.items():
+            store.add_message(
+                name, "smoke-link-expiry", "koda", "instinct", "link",
+                "link: %s" % name, None,
+                {"one_time_link": {
+                    "url": "https://example.invalid/auth?case=" + name,
+                    "expires_at": expires_at, "consumed": False}},
+                at(0))
+        store.purge_older_than(30)
+        for name, (expires_at, expired) in cases.items():
+            link = store.get_message(name)["metadata"]["one_time_link"]
+            self.assertEqual(link["consumed"], expired,
+                             "%s link (expires_at=%s)" % (name, expires_at))
 
     # -- rate limit (LAST: it burns the test token's budget) ------------
 
