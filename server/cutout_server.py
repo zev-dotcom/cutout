@@ -137,6 +137,20 @@ def parse_timestamp(value):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def link_expired(link, now):
+    """True when a one_time_link is past its expires_at."""
+    exp = link.get("expires_at")
+    return isinstance(exp, str) and exp < now
+
+
+def redact_link(link):
+    """A used or expired one-time link keeps no URL (spec: never
+    re-share). Marks it consumed and erases the URL in place."""
+    link["consumed"] = True
+    link["url"] = None
+    link["url_redacted"] = True
+
+
 # --------------------------------------------------------------------------
 # storage
 # --------------------------------------------------------------------------
@@ -204,8 +218,8 @@ class Store:
         args.append(limit)
         with self._lock:
             rows = self._db.execute(q, args).fetchall()
-        return self._attach_receipts(
-            [self._row_to_message(r) for r in rows])
+        return self._attach_receipts(self._redact_stale_links(
+            [self._row_to_message(r) for r in rows]))
 
     def get_message(self, msg_id):
         with self._lock:
@@ -289,7 +303,8 @@ class Store:
             self._db.commit()
 
     def mark_link_consumed(self, msg_id):
-        """Flip metadata.one_time_link.consumed to true (if present)."""
+        """Flip metadata.one_time_link.consumed to true (if present) and
+        erase its URL."""
         with self._lock:
             row = self._db.execute(
                 "SELECT metadata FROM messages WHERE id = ?", (msg_id,)
@@ -302,17 +317,37 @@ class Store:
                 return
             link = meta.get("one_time_link") if isinstance(meta, dict) else None
             if isinstance(link, dict):
-                link["consumed"] = True
+                redact_link(link)
                 self._db.execute(
                     "UPDATE messages SET metadata = ? WHERE id = ?",
                     (json.dumps(meta), msg_id),
                 )
                 self._db.commit()
 
+    def _redact_stale_links(self, msgs):
+        """Erase the URL of any consumed or expired one_time_link before
+        it is returned, and persist the redaction."""
+        now = utcnow()
+        for m in msgs:
+            meta = m.get("metadata")
+            link = meta.get("one_time_link") if isinstance(meta, dict) else None
+            if not isinstance(link, dict) or link.get("url_redacted"):
+                continue
+            if not (link.get("consumed") or link_expired(link, now)):
+                continue
+            redact_link(link)
+            with self._lock:
+                self._db.execute(
+                    "UPDATE messages SET metadata = ? WHERE id = ?",
+                    (json.dumps(meta), m["id"]))
+                self._db.commit()
+        return msgs
+
     def purge_older_than(self, days):
         """Spec: retention purge. Delete messages older than `days`
         (by created_at) and mark any expired one_time_link entries as
-        consumed on the survivors. Returns (deleted, links_marked)."""
+        consumed (URL erased) on the survivors.
+        Returns (deleted, links_marked)."""
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)) \
             .isoformat().replace("+00:00", "Z")
         now = datetime.now(timezone.utc)
@@ -342,7 +377,7 @@ class Store:
                     continue
                 exp = parse_timestamp(link.get("expires_at"))
                 if exp is not None and exp < now - CLOCK_SKEW:
-                    link["consumed"] = True
+                    redact_link(link)
                     self._db.execute(
                         "UPDATE messages SET metadata = ? WHERE id = ?",
                         (json.dumps(meta), r["id"]))

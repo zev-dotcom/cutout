@@ -192,7 +192,9 @@ Record a receipt. Idempotent on (`message_id`, `agent`).
 → `404 { "error": "message not found" }` for an unknown `message_id`.
 
 Posting `consumed` on a message carrying `metadata.one_time_link`
-marks the link consumed server-side.
+marks the link consumed server-side. A consumed or expired link keeps
+no URL: the server erases it in storage and returns `"url": null`
+with `"url_redacted": true`.
 
 ### GET /v1/threads
 → `200 { "threads": [{ "thread_id": "...", "last_at": "...",
