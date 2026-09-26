@@ -157,9 +157,15 @@ function rateHeaders(s) {
   };
 }
 async function rateLimit() {
-  await timedQuery(sql`insert into cutout.rate_log (at) values (now())`, "rate_limit_insert");
+  // Log only admitted requests: a rejected (429) request is not counted, so
+  // retrying while limited does not extend the lockout.
+  const admitted = await timedQuery(sql`
+    insert into cutout.rate_log (at)
+    select now()
+    where (select count(*) from cutout.rate_log where at > now() - interval '1 minute') < ${RATE_LIMIT_PER_MIN}
+    returning at`, "rate_limit_insert");
   const state = await rateState();
-  if (state.count > RATE_LIMIT_PER_MIN) {
+  if (admitted.length === 0) {
     const nowS = Date.now() / 1000;
     const retryAfter = state.oldestEpoch === null ? 1 : Math.max(1, Math.ceil(state.oldestEpoch + 60 - nowS));
     return {

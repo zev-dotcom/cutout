@@ -19,6 +19,7 @@ then exercises every endpoint and asserts the key behaviors:
   - default `to` filtering via X-Agent-Id
   - thread list with per-agent unread counts
   - 429 + Retry-After under the rate limit (runs LAST)
+  - bad-token requests do not use up the rate budget (own server)
 
 Run:  python3 tests/smoke_test.py
 """
@@ -81,28 +82,39 @@ def raw_request(base_url, method, path, token="unset", agent_id=None,
         return exc.code, dict(exc.headers), parsed
 
 
+def start_server(cls):
+    """Start a reference server on a free port with a throwaway db."""
+    cls.port = free_port()
+    cls.base_url = "http://127.0.0.1:%d" % cls.port
+    cls.tmp = tempfile.TemporaryDirectory()
+    db = os.path.join(cls.tmp.name, "smoke.db")
+    env = dict(os.environ, CUTOUT_TOKEN=TOKEN)
+    cls.proc = subprocess.Popen(
+        [sys.executable, SERVER, "--port", str(cls.port), "--db", db],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            st, _, _ = raw_request(cls.base_url, "GET", "/health")
+            if st == 200:
+                break
+        except Exception:
+            pass
+        time.sleep(0.2)
+    else:
+        raise RuntimeError("server did not start")
+
+
+def stop_server(cls):
+    cls.proc.terminate()
+    cls.proc.wait()
+    cls.tmp.cleanup()
+
+
 class SmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.port = free_port()
-        cls.base_url = "http://127.0.0.1:%d" % cls.port
-        cls.tmp = tempfile.TemporaryDirectory()
-        db = os.path.join(cls.tmp.name, "smoke.db")
-        env = dict(os.environ, CUTOUT_TOKEN=TOKEN)
-        cls.proc = subprocess.Popen(
-            [sys.executable, SERVER, "--port", str(cls.port), "--db", db],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            try:
-                st, _, _ = raw_request(cls.base_url, "GET", "/health")
-                if st == 200:
-                    break
-            except Exception:
-                pass
-            time.sleep(0.2)
-        else:
-            raise RuntimeError("server did not start")
+        start_server(cls)
         cls.koda = Client(base_url=cls.base_url, token=TOKEN,
                           agent_id="koda")
         cls.instinct = Client(base_url=cls.base_url, token=TOKEN,
@@ -110,9 +122,7 @@ class SmokeTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.proc.terminate()
-        cls.proc.wait()
-        cls.tmp.cleanup()
+        stop_server(cls)
 
     # -- health & auth -------------------------------------------------
 
@@ -414,6 +424,33 @@ class SmokeTest(unittest.TestCase):
         self.assertTrue(seen_429, "expected a 429 under burst load")
         self.assertIsNotNone(retry_after)
         self.assertGreaterEqual(int(retry_after), 1)
+
+
+class UnauthenticatedRateLimitTest(unittest.TestCase):
+    """Runs on its own server: it needs a fresh rate budget."""
+
+    @classmethod
+    def setUpClass(cls):
+        start_server(cls)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_server(cls)
+
+    def test_bad_token_does_not_consume_rate_budget(self):
+        # more bad-token requests than the whole per-minute budget
+        for _ in range(61):
+            st, headers, _ = raw_request(self.base_url, "GET",
+                                         "/v1/threads", token="wrong-token")
+            self.assertEqual(st, 401)
+        h = {k.lower(): v for k, v in headers.items()}
+        self.assertIn("x-ratelimit-remaining", h)  # still on every 401
+        # the agents holding the real token are not locked out
+        st, headers, _ = raw_request(self.base_url, "GET", "/v1/threads",
+                                     token=TOKEN, agent_id="koda")
+        self.assertEqual(st, 200)
+        h = {k.lower(): v for k, v in headers.items()}
+        self.assertEqual(h.get("x-ratelimit-remaining"), "59")
 
 
 if __name__ == "__main__":

@@ -479,16 +479,20 @@ class Handler(BaseHTTPRequestHandler):
                 "X-RateLimit-Reset": str(info["reset"])}
 
     def _guard(self, need_auth=True):
-        """Auth + rate limit. Returns True when the request may proceed.
+        """Auth, then rate limit. Returns True when the request may proceed.
 
-        Rate-limit headers are attached to every response (including
-        401/429) via self._resp_headers, which _send merges in.
+        Only authenticated requests are charged against the budget, so a
+        caller without the token cannot use it up for the agents that
+        have it. Rate-limit headers are attached to every response
+        (including 401/429) via self._resp_headers, which _send merges in.
         """
-        info = self._rate_state(consume=True)
-        self._resp_headers = self._rate_headers(info)
         if need_auth and not self._authorized():
+            self._resp_headers = self._rate_headers(
+                self._rate_state(consume=False))
             self._err(401, "unauthorized: bad or missing bearer token")
             return False
+        info = self._rate_state(consume=True)
+        self._resp_headers = self._rate_headers(info)
         self._maybe_purge()
         if info["limited"]:
             self._err(429, "rate limit exceeded",
