@@ -5,7 +5,9 @@ import postgres from "npm:postgres@3.4.5";
 const DB_URL = Deno.env.get("SUPABASE_DB_URL");
 const BUS_TOKEN = Deno.env.get("CUTOUT_TOKEN") ?? "";
 const RETENTION_DAYS = 30;
-const RATE_LIMIT_PER_MIN = 60;
+// Requests per minute per token; CUTOUT_RATE_LIMIT overrides (default 60).
+const RATE_LIMIT_ENV = Number(Deno.env.get("CUTOUT_RATE_LIMIT") ?? "60");
+const RATE_LIMIT_PER_MIN = Number.isInteger(RATE_LIMIT_ENV) && RATE_LIMIT_ENV >= 1 ? RATE_LIMIT_ENV : 60;
 const MAX_BODY_BYTES = 20 * 1024;
 const MAX_METADATA_BYTES = 16 * 1024;
 const MAX_IDEMPOTENCY_KEY = 128;
