@@ -452,6 +452,27 @@ class SmokeTest(unittest.TestCase):
             self.assertEqual(link["consumed"], expired,
                              "%s link (expires_at=%s)" % (name, expires_at))
 
+    # -- one-time link fields -------------------------------------------
+
+    def test_16_one_time_link_fields_validated(self):
+        def post(link):
+            return self.koda.post_message(
+                thread_id="smoke-link-fields", from_="koda", to="instinct",
+                type="link", body="one-time link inside",
+                metadata={"one_time_link": dict(
+                    {"url": "https://example.com/auth?token=smoke"}, **link)})
+        # a malformed expiry or flag would be stored and break the purge
+        # (few requests: the whole suite shares one rate-limit budget)
+        for bad in ({"expires_at": "soon"},
+                    {"expires_at": "2030-02-30T00:00:00Z"},
+                    {"consumed": "no"}):
+            with self.assertRaises(CutoutError, msg=repr(bad)) as ctx:
+                post(bad)
+            self.assertEqual(ctx.exception.status, 422, repr(bad))
+        # well-formed values are still accepted
+        self.assertIn("id", post({"expires_at": "2030-01-01T02:00:00.5+02:00",
+                                  "consumed": False}))
+
     # -- rate limit (LAST: it burns the test token's budget) ------------
 class RateLimitTest(unittest.TestCase):
     """The limiter on its own server, with the default limit (60)."""

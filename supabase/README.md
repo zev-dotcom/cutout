@@ -10,6 +10,7 @@ same endpoints, fields, and status codes.
   only, no secrets in code.
 - `schema.sql` — base schema: messages, receipts, rate log, meta, and
   the retention purge (runs at cold start and daily via pg_cron).
+  Idempotent: re-run it on an existing install to pick up purge fixes.
 - `schema_v1.1.sql` — v1 → v1.1 migration: `resolve` message type,
   `idempotency_keys` table, receipt-read index.
 

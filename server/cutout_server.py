@@ -637,6 +637,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._err(422, "link messages require"
                               " metadata.one_time_link.url")
                 return
+        link = (metadata or {}).get("one_time_link")
+        if isinstance(link, dict):
+            if link.get("expires_at") is not None \
+                    and parse_timestamp(link["expires_at"]) is None:
+                self._err(422, "metadata.one_time_link.expires_at must be"
+                               " an ISO 8601 timestamp with a timezone")
+                return
+            if link.get("consumed") is not None \
+                    and not isinstance(link["consumed"], bool):
+                self._err(422, "metadata.one_time_link.consumed must be"
+                               " a boolean")
+                return
 
         msg_id = new_id()
         created_at = utcnow()

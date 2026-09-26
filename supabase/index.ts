@@ -204,6 +204,28 @@ function validAttachments(a) {
   }
   return null;
 }
+// RFC 3339 timestamp with an explicit offset, checked field by field so every
+// accepted value also casts cleanly to timestamptz in the retention purge.
+const TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,6})?(Z|[+-](0\d|1[0-4]):[0-5]\d)$/i;
+function validTimestamp(s: unknown) {
+  const m = typeof s === "string" ? TIMESTAMP_RE.exec(s) : null;
+  if (!m) return false;
+  const [y, mo, d, h, mi, sec] = m.slice(1, 7).map(Number);
+  const leap = y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo - 1];
+  return y >= 1 && days !== undefined && d >= 1 && d <= days && h <= 23 && mi <= 59 && sec <= 59;
+}
+function validOneTimeLink(link: unknown) {
+  if (typeof link !== "object" || link === null || Array.isArray(link)) return null;
+  const o = link as Record<string, unknown>;
+  if (o.expires_at !== undefined && o.expires_at !== null && !validTimestamp(o.expires_at)) {
+    return "metadata.one_time_link.expires_at must be an ISO 8601 timestamp with a timezone";
+  }
+  if (o.consumed !== undefined && o.consumed !== null && typeof o.consumed !== "boolean") {
+    return "metadata.one_time_link.consumed must be a boolean";
+  }
+  return null;
+}
 // ---- handlers ---------------------------------------------------------------
 async function postMessage(req) {
   let body;
@@ -259,6 +281,10 @@ async function postMessage(req) {
       error: err
     });
   }
+  const linkErr = validOneTimeLink(metadata.one_time_link);
+  if (linkErr) return jres(422, {
+    error: linkErr
+  });
   let idemKey = null;
   if (body.idempotency_key !== undefined && body.idempotency_key !== null) {
     if (typeof body.idempotency_key !== "string" || body.idempotency_key.length === 0 || body.idempotency_key.length > MAX_IDEMPOTENCY_KEY) {
