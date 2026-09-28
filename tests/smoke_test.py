@@ -479,5 +479,32 @@ class RateLimitTest(unittest.TestCase):
         self.assertGreaterEqual(int(h["retry-after"]), 1)
 
 
+class UnauthenticatedRateLimitTest(unittest.TestCase):
+    """Runs on its own server: it needs a fresh rate budget."""
+
+    @classmethod
+    def setUpClass(cls):
+        start_server(cls)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_server(cls)
+
+    def test_bad_token_does_not_consume_rate_budget(self):
+        # more bad-token requests than the whole per-minute budget
+        for _ in range(61):
+            st, headers, _ = raw_request(self.base_url, "GET",
+                                         "/v1/threads", token="wrong-token")
+            self.assertEqual(st, 401)
+        h = {k.lower(): v for k, v in headers.items()}
+        self.assertIn("x-ratelimit-remaining", h)  # still on every 401
+        # the agents holding the real token are not locked out
+        st, headers, _ = raw_request(self.base_url, "GET", "/v1/threads",
+                                     token=TOKEN, agent_id="koda")
+        self.assertEqual(st, 200)
+        h = {k.lower(): v for k, v in headers.items()}
+        self.assertEqual(h.get("x-ratelimit-remaining"), "59")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
