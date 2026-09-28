@@ -53,7 +53,7 @@ AGENT_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 BODY_MAX_BYTES = 20 * 1024      # spec: body max 20 KB
 METADATA_MAX_BYTES = 16 * 1024  # spec: metadata max 16 KB serialized
 IDEMPOTENCY_KEY_MAX = 128       # spec: idempotency_key max 128 chars
-RATE_LIMIT = 60             # requests ...
+RATE_LIMIT = 60             # requests (default; --rate-limit) ...
 RATE_WINDOW = 60.0          # ... per 60 seconds, per token
 LONG_POLL_MAX = 60
 CLOCK_SKEW = timedelta(minutes=5)  # spec: skew tolerance for expiry checks
@@ -406,6 +406,7 @@ class Handler(BaseHTTPRequestHandler):
     token = ""
     store = None
     retention_days = 30
+    rate_limit = RATE_LIMIT
     _rate_lock = threading.Lock()
     _rate_hits = collections.deque()
     _purge_lock = threading.Lock()
@@ -476,7 +477,7 @@ class Handler(BaseHTTPRequestHandler):
             while dq and dq[0] <= now - RATE_WINDOW:
                 dq.popleft()
             if consume:
-                if len(dq) >= RATE_LIMIT:
+                if len(dq) >= cls.rate_limit:
                     wait = dq[0] + RATE_WINDOW - now
                     return {"limited": True,
                             "retry": max(1, int(wait) + 1),
@@ -484,12 +485,12 @@ class Handler(BaseHTTPRequestHandler):
                             "reset": int(time.time() + wait)}
                 dq.append(now)
             return {"limited": False, "retry": 0,
-                    "remaining": RATE_LIMIT - len(dq),
+                    "remaining": cls.rate_limit - len(dq),
                     "reset": int(time.time() + RATE_WINDOW)}
 
-    @staticmethod
-    def _rate_headers(info):
-        return {"X-RateLimit-Limit": str(RATE_LIMIT),
+    @classmethod
+    def _rate_headers(cls, info):
+        return {"X-RateLimit-Limit": str(cls.rate_limit),
                 "X-RateLimit-Remaining": str(info["remaining"]),
                 "X-RateLimit-Reset": str(info["reset"])}
 
@@ -771,14 +772,21 @@ def main():
                     default=int(os.environ.get("CUTOUT_RETENTION_DAYS",
                                                "30")),
                     help="purge messages older than this (0 disables)")
+    ap.add_argument("--rate-limit", type=int,
+                    default=int(os.environ.get("CUTOUT_RATE_LIMIT",
+                                               str(RATE_LIMIT))),
+                    help="requests per minute per token (default 60)")
     args = ap.parse_args()
 
     if not args.token:
         sys.exit("error: set CUTOUT_TOKEN (or pass --token)")
+    if args.rate_limit < 1:
+        sys.exit("error: --rate-limit must be at least 1")
 
     Handler.token = args.token
     Handler.store = Store(args.db)
     Handler.retention_days = args.retention_days
+    Handler.rate_limit = args.rate_limit
     if args.retention_days > 0:
         deleted, marked = Handler.store.purge_older_than(
             args.retention_days)

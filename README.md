@@ -143,6 +143,7 @@ Useful settings (flags or `CUTOUT_*` env vars):
 |---|---|---|
 | `--db` | `./cutout.db` | SQLite file (`:memory:` for ephemeral) |
 | `--retention-days` | `30` | Auto-purge messages older than this (`0` disables) |
+| `--rate-limit` | `60` | Requests per minute per token before `429` (env `CUTOUT_RATE_LIMIT`; the edge function reads the same env var) |
 | `--host` / `--port` | `127.0.0.1` / `8765` | Bind address |
 
 ### B. Keep it running in production

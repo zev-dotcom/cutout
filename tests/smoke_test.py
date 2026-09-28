@@ -19,7 +19,8 @@ then exercises every endpoint and asserts the key behaviors:
   - 413 on oversize body / metadata
   - default `to` filtering via X-Agent-Id
   - thread list with per-agent unread counts
-  - 429 + Retry-After under the rate limit (runs LAST)
+  - 429 + Retry-After at the default limit of 60 (own server; the
+    main server runs with a high limit so tests do not share a budget)
 
 Run:  python3 tests/smoke_test.py
 """
@@ -47,6 +48,7 @@ sys.path.insert(0, os.path.join(ROOT, "server"))
 from cutout_server import Store  # noqa: E402
 
 TOKEN = "smoke-test-token"
+SMOKE_RATE_LIMIT = 1000  # main suite; RateLimitTest uses the default 60
 
 
 def free_port():
@@ -85,28 +87,45 @@ def raw_request(base_url, method, path, token="unset", agent_id=None,
         return exc.code, dict(exc.headers), parsed
 
 
+def start_server(cls, rate_limit=None):
+    """Start a reference server on a free port with a throwaway db.
+    rate_limit=None runs it with the server's default limit."""
+    cls.port = free_port()
+    cls.base_url = "http://127.0.0.1:%d" % cls.port
+    cls.tmp = tempfile.TemporaryDirectory()
+    db = os.path.join(cls.tmp.name, "smoke.db")
+    env = dict(os.environ, CUTOUT_TOKEN=TOKEN)
+    env.pop("CUTOUT_RATE_LIMIT", None)
+    if rate_limit is not None:
+        env["CUTOUT_RATE_LIMIT"] = str(rate_limit)
+    cls.proc = subprocess.Popen(
+        [sys.executable, SERVER, "--port", str(cls.port), "--db", db],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            st, _, _ = raw_request(cls.base_url, "GET", "/health")
+            if st == 200:
+                break
+        except Exception:
+            pass
+        time.sleep(0.2)
+    else:
+        raise RuntimeError("server did not start")
+
+
+def stop_server(cls):
+    cls.proc.terminate()
+    cls.proc.wait()
+    cls.tmp.cleanup()
+
+
 class SmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.port = free_port()
-        cls.base_url = "http://127.0.0.1:%d" % cls.port
-        cls.tmp = tempfile.TemporaryDirectory()
-        db = os.path.join(cls.tmp.name, "smoke.db")
-        env = dict(os.environ, CUTOUT_TOKEN=TOKEN)
-        cls.proc = subprocess.Popen(
-            [sys.executable, SERVER, "--port", str(cls.port), "--db", db],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            try:
-                st, _, _ = raw_request(cls.base_url, "GET", "/health")
-                if st == 200:
-                    break
-            except Exception:
-                pass
-            time.sleep(0.2)
-        else:
-            raise RuntimeError("server did not start")
+        # High limit: these tests share one budget. The limiter itself
+        # is tested on its own server with the default (RateLimitTest).
+        start_server(cls, rate_limit=SMOKE_RATE_LIMIT)
         cls.koda = Client(base_url=cls.base_url, token=TOKEN,
                           agent_id="koda")
         cls.instinct = Client(base_url=cls.base_url, token=TOKEN,
@@ -114,9 +133,7 @@ class SmokeTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.proc.terminate()
-        cls.proc.wait()
-        cls.tmp.cleanup()
+        stop_server(cls)
 
     # -- health & auth -------------------------------------------------
 
@@ -391,7 +408,7 @@ class SmokeTest(unittest.TestCase):
                                      token=TOKEN, agent_id="koda")
         self.assertEqual(st, 200)
         h = {k.lower(): v for k, v in headers.items()}
-        self.assertEqual(h.get("x-ratelimit-limit"), "60")
+        self.assertEqual(h.get("x-ratelimit-limit"), str(SMOKE_RATE_LIMIT))
         self.assertIn("x-ratelimit-remaining", h)
         self.assertIn("x-ratelimit-reset", h)
         self.assertGreaterEqual(int(h["x-ratelimit-remaining"]), 0)
@@ -400,7 +417,8 @@ class SmokeTest(unittest.TestCase):
                                      token="unset")
         self.assertEqual(st, 200)
         h = {k.lower(): v for k, v in headers.items()}
-        self.assertEqual(h.get("x-ratelimit-limit"), "60")
+        self.assertEqual(h.get("x-ratelimit-limit"), str(SMOKE_RATE_LIMIT))
+
 
     def test_15_link_expiry_honors_offset_and_skew(self):
         def at(seconds, offset_hours=0):
@@ -435,21 +453,30 @@ class SmokeTest(unittest.TestCase):
                              "%s link (expires_at=%s)" % (name, expires_at))
 
     # -- rate limit (LAST: it burns the test token's budget) ------------
+class RateLimitTest(unittest.TestCase):
+    """The limiter on its own server, with the default limit (60)."""
 
-    def test_99_rate_limit(self):
-        seen_429 = False
-        retry_after = None
-        for _ in range(70):
+    @classmethod
+    def setUpClass(cls):
+        start_server(cls)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_server(cls)
+
+    def test_rate_limit(self):
+        statuses = []
+        for _ in range(61):
             st, headers, _ = raw_request(self.base_url, "GET",
                                          "/v1/messages", token=TOKEN,
                                          agent_id="koda")
-            if st == 429:
-                seen_429 = True
-                retry_after = headers.get("Retry-After")
-                break
-        self.assertTrue(seen_429, "expected a 429 under burst load")
-        self.assertIsNotNone(retry_after)
-        self.assertGreaterEqual(int(retry_after), 1)
+            statuses.append(st)
+        h = {k.lower(): v for k, v in headers.items()}
+        self.assertEqual(h.get("x-ratelimit-limit"), "60")
+        # the first 60 in a minute pass, the 61st is limited
+        self.assertEqual(statuses[:60], [200] * 60)
+        self.assertEqual(statuses[60], 429, "expected a 429 at the limit")
+        self.assertGreaterEqual(int(h["retry-after"]), 1)
 
 
 if __name__ == "__main__":
