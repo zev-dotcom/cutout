@@ -12,14 +12,15 @@ then exercises every endpoint and asserts the key behaviors:
   - long-poll (?wait=N) returns early when a message arrives
   - receipt idempotency + receipts visible on message reads
   - consumed receipt flips metadata.one_time_link.consumed
+  - link expiry honors UTC offsets and the 5-minute clock skew
   - idempotency keys: replay returns the original, no double-post
   - resolve/reopen thread lifecycle
   - rate-limit headers on API responses
   - 413 on oversize body / metadata
   - default `to` filtering via X-Agent-Id
   - thread list with per-agent unread counts
-  - 429 + Retry-After under the rate limit (runs LAST)
-  - bad-token requests do not use up the rate budget (own server)
+  - 429 + Retry-After at the default limit of 60 (own server; the
+    main server runs with a high limit so tests do not share a budget)
 
 Run:  python3 tests/smoke_test.py
 """
@@ -36,14 +37,18 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SERVER = os.path.join(ROOT, "server", "cutout_server.py")
 sys.path.insert(0, os.path.join(ROOT, "clients", "python"))
 from cutout import Client, CutoutError  # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "server"))
+from cutout_server import Store  # noqa: E402
 
 TOKEN = "smoke-test-token"
+SMOKE_RATE_LIMIT = 1000  # main suite; RateLimitTest uses the default 60
 
 
 def free_port():
@@ -82,13 +87,17 @@ def raw_request(base_url, method, path, token="unset", agent_id=None,
         return exc.code, dict(exc.headers), parsed
 
 
-def start_server(cls):
-    """Start a reference server on a free port with a throwaway db."""
+def start_server(cls, rate_limit=None):
+    """Start a reference server on a free port with a throwaway db.
+    rate_limit=None runs it with the server's default limit."""
     cls.port = free_port()
     cls.base_url = "http://127.0.0.1:%d" % cls.port
     cls.tmp = tempfile.TemporaryDirectory()
     db = os.path.join(cls.tmp.name, "smoke.db")
     env = dict(os.environ, CUTOUT_TOKEN=TOKEN)
+    env.pop("CUTOUT_RATE_LIMIT", None)
+    if rate_limit is not None:
+        env["CUTOUT_RATE_LIMIT"] = str(rate_limit)
     cls.proc = subprocess.Popen(
         [sys.executable, SERVER, "--port", str(cls.port), "--db", db],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -114,7 +123,9 @@ def stop_server(cls):
 class SmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        start_server(cls)
+        # High limit: these tests share one budget. The limiter itself
+        # is tested on its own server with the default (RateLimitTest).
+        start_server(cls, rate_limit=SMOKE_RATE_LIMIT)
         cls.koda = Client(base_url=cls.base_url, token=TOKEN,
                           agent_id="koda")
         cls.instinct = Client(base_url=cls.base_url, token=TOKEN,
@@ -397,7 +408,7 @@ class SmokeTest(unittest.TestCase):
                                      token=TOKEN, agent_id="koda")
         self.assertEqual(st, 200)
         h = {k.lower(): v for k, v in headers.items()}
-        self.assertEqual(h.get("x-ratelimit-limit"), "60")
+        self.assertEqual(h.get("x-ratelimit-limit"), str(SMOKE_RATE_LIMIT))
         self.assertIn("x-ratelimit-remaining", h)
         self.assertIn("x-ratelimit-reset", h)
         self.assertGreaterEqual(int(h["x-ratelimit-remaining"]), 0)
@@ -406,24 +417,66 @@ class SmokeTest(unittest.TestCase):
                                      token="unset")
         self.assertEqual(st, 200)
         h = {k.lower(): v for k, v in headers.items()}
-        self.assertEqual(h.get("x-ratelimit-limit"), "60")
+        self.assertEqual(h.get("x-ratelimit-limit"), str(SMOKE_RATE_LIMIT))
+
+
+    def test_15_link_expiry_honors_offset_and_skew(self):
+        def at(seconds, offset_hours=0):
+            tz = timezone(timedelta(hours=offset_hours))
+            return (datetime.now(timezone.utc)
+                    + timedelta(seconds=seconds)).astimezone(tz) \
+                .isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        cases = {
+            # expires in 1h, written on a UTC-7 clock: still valid
+            "offset": (at(3600, offset_hours=-7), False),
+            # expired 2 min ago: inside the 5-minute skew tolerance
+            "skew": (at(-120), False),
+            # expired 1h ago, written on a UTC-7 clock: really expired
+            "expired": (at(-3600, offset_hours=-7), True),
+        }
+        # Store-level: the retention purge is what marks expired links, and
+        # this keeps the test out of the suite's 60 req/min budget.
+        store = Store(":memory:")
+        for name, (expires_at, _) in cases.items():
+            store.add_message(
+                name, "smoke-link-expiry", "koda", "instinct", "link",
+                "link: %s" % name, None,
+                {"one_time_link": {
+                    "url": "https://example.invalid/auth?case=" + name,
+                    "expires_at": expires_at, "consumed": False}},
+                at(0))
+        store.purge_older_than(30)
+        for name, (expires_at, expired) in cases.items():
+            link = store.get_message(name)["metadata"]["one_time_link"]
+            self.assertEqual(link["consumed"], expired,
+                             "%s link (expires_at=%s)" % (name, expires_at))
 
     # -- rate limit (LAST: it burns the test token's budget) ------------
+class RateLimitTest(unittest.TestCase):
+    """The limiter on its own server, with the default limit (60)."""
 
-    def test_99_rate_limit(self):
-        seen_429 = False
-        retry_after = None
-        for _ in range(70):
+    @classmethod
+    def setUpClass(cls):
+        start_server(cls)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_server(cls)
+
+    def test_rate_limit(self):
+        statuses = []
+        for _ in range(61):
             st, headers, _ = raw_request(self.base_url, "GET",
                                          "/v1/messages", token=TOKEN,
                                          agent_id="koda")
-            if st == 429:
-                seen_429 = True
-                retry_after = headers.get("Retry-After")
-                break
-        self.assertTrue(seen_429, "expected a 429 under burst load")
-        self.assertIsNotNone(retry_after)
-        self.assertGreaterEqual(int(retry_after), 1)
+            statuses.append(st)
+        h = {k.lower(): v for k, v in headers.items()}
+        self.assertEqual(h.get("x-ratelimit-limit"), "60")
+        # the first 60 in a minute pass, the 61st is limited
+        self.assertEqual(statuses[:60], [200] * 60)
+        self.assertEqual(statuses[60], 429, "expected a 429 at the limit")
+        self.assertGreaterEqual(int(h["retry-after"]), 1)
 
 
 class UnauthenticatedRateLimitTest(unittest.TestCase):
