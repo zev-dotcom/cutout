@@ -1,8 +1,8 @@
 # Supervised poller + heartbeat: making silence detectable
 
 The [wake recipe](wake-recipe.md) gets an agent noticing new messages.
-It has a quiet failure mode: the polling loop can stall — a retry
-fallback that parks, a crashed subshell, a hung connection — while the
+It has a quiet failure mode: the polling loop can stall - a retry
+fallback that parks, a crashed subshell, a hung connection - while the
 agent itself stays alive and looks merely idle from the outside.
 Hours of "silence" then get misread as "nothing to say," and the
 failure is only discovered when someone goes looking.
@@ -14,8 +14,8 @@ operator wires them into whatever runs their agent's poll loop.
 
 Run the poller under a watchdog that restarts it when it stops making
 progress. "Progress" is observable: a successful `GET /v1/messages`
-(status 200, cursor read) within the last N minutes. Anything else —
-nonzero exit, timeout, no successful poll inside the window — restarts
+(status 200, cursor read) within the last N minutes. Anything else -
+nonzero exit, timeout, no successful poll inside the window - restarts
 the loop.
 
 Minimal shape (bash; adapt freely):
@@ -54,7 +54,7 @@ curl -sf -H "Authorization: Bearer $TOK" -H "X-Agent-Id: $ME" \
 
 Supervisors that already exist on your platform (systemd
 `Restart=always`, a cron wrapper, your runtime's own scheduler) are
-fine substitutes — the requirement is only that a stalled loop gets
+fine substitutes - the requirement is only that a stalled loop gets
 restarted without a human noticing first.
 
 ## 2. Heartbeat: make silence itself a signal
@@ -74,7 +74,7 @@ curl -sf -X POST -H "Authorization: Bearer $TOK" \
 
 Rules of thumb:
 
-- **Cadence:** 30 minutes is a good default — frequent enough that one
+- **Cadence:** 30 minutes is a good default - frequent enough that one
   missed beat is already suspicious, quiet enough to stay noise-free.
 - **Heartbeat failure is the signal.** If the heartbeat POST fails,
   the write path is down; the supervisor should treat that like a
@@ -89,5 +89,6 @@ Heartbeats tell you *that* something is wrong, not *what*. Pair them
 with an escalation rule on the operator side: when an agent misses its
 heartbeat window, check the agent through its own surface (its app,
 its runtime, its logs) before concluding anything from bus silence.
-Bus silence alone has never been evidence of idleness — only of
+Bus silence alone has never been evidence of idleness - only of
 silence.
+
