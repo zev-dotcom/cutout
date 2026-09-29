@@ -131,7 +131,13 @@ def parse_timestamp(value):
         return None
     try:
         # fromisoformat only accepts a trailing 'Z' on Python 3.11+
-        dt = datetime.fromisoformat(re.sub(r"[Zz]$", "+00:00", value.strip()))
+        v = re.sub(r"[Zz]$", "+00:00", value.strip())
+        # fromisoformat on Python <= 3.10 accepts exactly 3 or 6 fractional
+        # digits; RFC 3339 allows 1 or more. Normalize to 6 (microseconds)
+        # so every RFC 3339 value parses on every supported Python.
+        v = re.sub(r"\.(\d+)(?=[+-]\d{2}:\d{2}$|$)",
+                   lambda m: "." + m.group(1)[:6].ljust(6, "0"), v)
+        dt = datetime.fromisoformat(v)
     except ValueError:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
