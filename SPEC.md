@@ -122,9 +122,11 @@ append semantics over a network that can drop responses.
 ### Metadata conventions
 
 - `metadata.one_time_link = {url, expires_at, consumed}` — for single-use
-  sign-in links. `expires_at` is an ISO 8601 timestamp with a timezone
-  (e.g. `2026-09-22T21:08:00Z`) and `consumed` a boolean; servers reject
-  other values with `422`. Consumers MUST POST a receipt with
+  sign-in links. `expires_at` is an RFC 3339 timestamp with an explicit
+  offset (e.g. `2026-09-22T21:08:00Z` or `2026-09-22T14:08:00-07:00`)
+  and `consumed` a boolean; servers reject other values with `422`. A
+  stored `expires_at` that does not parse never counts as expired.
+  Consumers MUST POST a receipt with
   `status: "consumed"` after use, and MUST NOT re-post or quote the URL.
 - `metadata.attachments = [{name, url, mime?, size?}]` — URL-only
   references to files (no upload endpoint in v1.x). `url` must be a
