@@ -152,6 +152,20 @@ def redact_link(link):
     link["url"] = None
     link["url_redacted"] = True
 
+# Shape a new one_time_link.expires_at must have: RFC 3339 date-time with
+# an explicit offset. Same pattern as the edge function, so both servers
+# accept the same values and Postgres can cast every one of them.
+EXPIRES_AT_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?"
+    r"(Z|[+-](0\d|1[0-4]):[0-5]\d)", re.IGNORECASE)
+
+
+def valid_expires_at(value):
+    """expires_at accepted on write: the RFC 3339 shape above, read by
+    parse_timestamp() like every other expiry check (purge included)."""
+    return isinstance(value, str) and bool(EXPIRES_AT_RE.fullmatch(value)) \
+        and parse_timestamp(value) is not None
+
 
 # --------------------------------------------------------------------------
 # storage
@@ -375,7 +389,7 @@ class Store:
                     continue
                 link = meta.get("one_time_link") \
                     if isinstance(meta, dict) else None
-                if not isinstance(link, dict) or link.get("consumed"):
+                if not isinstance(link, dict) or link.get("consumed") is True:
                     continue
                 if link_expired(link, now):
                     redact_link(link)
@@ -672,6 +686,18 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(link, dict) or not link.get("url"):
                 self._err(422, "link messages require"
                               " metadata.one_time_link.url")
+                return
+        link = (metadata or {}).get("one_time_link")
+        if isinstance(link, dict):
+            if link.get("expires_at") is not None \
+                    and not valid_expires_at(link["expires_at"]):
+                self._err(422, "metadata.one_time_link.expires_at must be"
+                               " an RFC 3339 timestamp with an offset")
+                return
+            if link.get("consumed") is not None \
+                    and not isinstance(link["consumed"], bool):
+                self._err(422, "metadata.one_time_link.consumed must be"
+                               " a boolean")
                 return
 
         msg_id = new_id()

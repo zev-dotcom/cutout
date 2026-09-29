@@ -14,6 +14,9 @@ then exercises every endpoint and asserts the key behaviors:
   - consumed receipt flips metadata.one_time_link.consumed
   - link expiry honors UTC offsets and the 5-minute clock skew
   - consumed or expired one-time links lose their URL (stored + read)
+  - one_time_link fields validated on write (422); the purge skips
+    malformed stored links (tests/supabase_test.py runs the same cases
+    against the edge function and the SQL purge)
   - idempotency keys: replay returns the original, no double-post
   - resolve/reopen thread lifecycle
   - rate-limit headers on API responses
@@ -51,6 +54,64 @@ from cutout_server import Store  # noqa: E402
 
 TOKEN = "smoke-test-token"
 SMOKE_RATE_LIMIT = 1000  # main suite; RateLimitTest uses the default 60
+
+
+def iso_at(seconds, offset_hours=0):
+    """Now + `seconds`, as RFC 3339 on a clock at UTC+offset_hours."""
+    tz = timezone(timedelta(hours=offset_hours))
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)) \
+        .astimezone(tz).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+# One-time link contract cases. tests/supabase_test.py imports these, so
+# both servers are held to the same table.
+# metadata.one_time_link.expires_at on write: 201 ...
+LINK_EXPIRY_ACCEPTED = (
+    "2030-01-01T00:00:00Z",
+    "2029-12-31T17:00:00-07:00",
+    "2030-01-01T02:00:00.5+02:00",
+    "2030-01-01T00:00:00.123456+14:00",
+)
+# ... or 422
+LINK_EXPIRY_REJECTED = (
+    "soon",
+    "yesterday",               # Postgres would cast this one
+    "2030-02-30T00:00:00Z",    # no such day
+    "2030-01-01T24:00:00Z",
+    "2030-01-01T00:00:00",     # no offset
+    "2030-01-01",              # no time
+    "20300101T000000Z",        # basic format
+    1893456000,                # not a string
+)
+LINK_CONSUMED_REJECTED = ("no", "true", 0)
+
+
+def link_purge_cases():
+    """(name, stored one_time_link, marked consumed by the purge?) for
+    rows an older server may have stored without validation."""
+    naive_utc = (datetime.now(timezone.utc) - timedelta(hours=1)) \
+        .replace(tzinfo=None).isoformat(timespec="seconds")
+    return (
+        # malformed expiry: never counts as expired, purge keeps going
+        ("word", {"expires_at": "soon", "consumed": False}, False),
+        ("pg-word", {"expires_at": "yesterday", "consumed": False}, False),
+        ("no-such-day", {"expires_at": "2020-02-30T00:00:00Z",
+                         "consumed": False}, False),
+        ("number", {"expires_at": 1577836800, "consumed": False}, False),
+        # malformed flag: only JSON true counts as consumed
+        ("bad-flag", {"expires_at": iso_at(-3600), "consumed": "maybe"},
+         True),
+        # valid dates with offsets
+        ("offset-future", {"expires_at": iso_at(3600, -7),
+                           "consumed": False}, False),
+        ("offset-skew", {"expires_at": iso_at(-120, 5),
+                         "consumed": False}, False),
+        ("offset-expired", {"expires_at": iso_at(-3600, -7),
+                            "consumed": False}, True),
+        # no offset: read as UTC, whatever the server's time zone
+        ("no-offset-expired", {"expires_at": naive_utc,
+                               "consumed": False}, True),
+    )
 
 
 def free_port():
@@ -534,6 +595,44 @@ class SmokeTest(unittest.TestCase):
         expired = store.get_message("expired")["metadata"]["one_time_link"]
         self.assertIsNone(expired["url"])
         self.assertTrue(expired["url_redacted"])
+    # -- one-time link fields -------------------------------------------
+
+    def test_18_one_time_link_fields_validated(self):
+        def post(link):
+            return raw_request(
+                self.base_url, "POST", "/v1/messages", token=TOKEN,
+                agent_id="koda", body={
+                    "thread_id": "smoke-link-fields", "from": "koda",
+                    "to": "instinct", "type": "link",
+                    "body": "one-time link inside",
+                    "metadata": {"one_time_link": dict(
+                        {"url": "https://example.com/auth?token=smoke"},
+                        **link)}})[0]
+        for value in LINK_EXPIRY_ACCEPTED:
+            self.assertEqual(post({"expires_at": value, "consumed": False}),
+                             201, repr(value))
+        # a malformed expiry or flag would be stored and confuse the purge
+        for value in LINK_EXPIRY_REJECTED:
+            self.assertEqual(post({"expires_at": value}), 422, repr(value))
+        for value in LINK_CONSUMED_REJECTED:
+            self.assertEqual(post({"consumed": value}), 422, repr(value))
+
+    def test_19_purge_skips_malformed_stored_links(self):
+        store = Store(":memory:")
+        cases = link_purge_cases()
+        for name, link, _ in cases:
+            store.add_message(
+                name, "smoke-link-purge", "koda", "instinct", "link",
+                "stored by an older server", None,
+                {"one_time_link": dict(
+                    {"url": "https://example.invalid/auth"}, **link)},
+                iso_at(0))
+        _, marked = store.purge_older_than(30)
+        for name, link, expired in cases:
+            with self.subTest(name, expires_at=link["expires_at"]):
+                got = store.get_message(name)["metadata"]["one_time_link"]
+                self.assertEqual(got["consumed"] is True, expired)
+        self.assertEqual(marked, sum(1 for c in cases if c[2]))
 
     # -- rate limit (LAST: it burns the test token's budget) ------------
 class RateLimitTest(unittest.TestCase):

@@ -34,8 +34,25 @@ create table if not exists cutout.meta (
   v jsonb not null
 );
 
+-- Timestamp cast that returns NULL instead of raising on malformed input, so
+-- one bad metadata value cannot abort the purge for every row. Reads what the
+-- reference server reads: ISO 8601 date-times only (not words such as
+-- 'yesterday'), and no offset means UTC whatever the database time zone.
+create or replace function cutout.try_timestamptz(v text)
+returns timestamptz language plpgsql stable
+set search_path = pg_catalog set timezone = 'UTC' as $$
+begin
+  if v !~ '^\d{4}-\d{2}-\d{2}([Tt ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?([Zz]|[+-]\d{2}(:?\d{2})?)?$' then
+    return null;
+  end if;
+  return v::timestamptz;
+exception when others then
+  return null;
+end $$;
+
 -- Retention purge (SPEC: startup + at least daily; also marks expired one-time links consumed
 -- and erases their URL).
+-- A link whose expires_at does not parse never counts as expired.
 create or replace function cutout.purge(retention_days int default 30)
 returns jsonb language plpgsql security definer set search_path = cutout as $$
 declare
@@ -48,9 +65,11 @@ begin
   update cutout.messages
      set metadata = jsonb_set(metadata, '{one_time_link}', (metadata->'one_time_link')
            || '{"consumed": true, "url": null, "url_redacted": true}'::jsonb, false)
-   where metadata ? 'one_time_link'
-     and coalesce((metadata->'one_time_link'->>'consumed')::boolean, false) = false
-     and (metadata->'one_time_link'->>'expires_at')::timestamptz < now() - interval '5 minutes';
+   where jsonb_typeof(metadata->'one_time_link') = 'object'
+     and metadata->'one_time_link'->'consumed' is distinct from 'true'::jsonb
+     and jsonb_typeof(metadata->'one_time_link'->'expires_at') = 'string'
+     and cutout.try_timestamptz(metadata->'one_time_link'->>'expires_at')
+           < now() - interval '5 minutes';
   get diagnostics marked = row_count;
   delete from cutout.rate_log where at < now() - interval '1 day';
   insert into cutout.meta(k, v) values ('last_purge', to_jsonb(now()))
