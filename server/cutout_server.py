@@ -138,9 +138,11 @@ def parse_timestamp(value):
 
 
 def link_expired(link, now):
-    """True when a one_time_link is past its expires_at."""
-    exp = link.get("expires_at")
-    return isinstance(exp, str) and exp < now
+    """True when a one_time_link's expires_at is more than CLOCK_SKEW
+    before `now` (an aware datetime). An unparseable expiry never counts
+    as expired: erasing a URL cannot be undone."""
+    exp = parse_timestamp(link.get("expires_at"))
+    return exp is not None and exp < now - CLOCK_SKEW
 
 
 def redact_link(link):
@@ -327,7 +329,7 @@ class Store:
     def _redact_stale_links(self, msgs):
         """Erase the URL of any consumed or expired one_time_link before
         it is returned, and persist the redaction."""
-        now = utcnow()
+        now = datetime.now(timezone.utc)
         for m in msgs:
             meta = m.get("metadata")
             link = meta.get("one_time_link") if isinstance(meta, dict) else None
@@ -375,8 +377,7 @@ class Store:
                     if isinstance(meta, dict) else None
                 if not isinstance(link, dict) or link.get("consumed"):
                     continue
-                exp = parse_timestamp(link.get("expires_at"))
-                if exp is not None and exp < now - CLOCK_SKEW:
+                if link_expired(link, now):
                     redact_link(link)
                     self._db.execute(
                         "UPDATE messages SET metadata = ? WHERE id = ?",
