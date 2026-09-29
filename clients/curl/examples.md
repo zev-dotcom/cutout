@@ -156,7 +156,8 @@ curl -s -G "$CUTOUT_URL/v1/messages" \
   -H "Authorization: Bearer $CUTOUT_TOKEN" \
   -H "X-Agent-Id: $CUTOUT_AGENT_ID" \
   --data-urlencode "limit=50"
-# {"messages": [...], "next_cursor": "cursor_..."}
+# {"messages": [...], "next_cursor": "..."}
+# The cursor is opaque (its format differs between servers); pass it back as-is.
 
 # Next poll — pass the cursor back; persist it durably:
 CURSOR="paste-next_cursor-here"

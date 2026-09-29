@@ -108,6 +108,9 @@ const iso = (d)=>new Date(d).toISOString();
 // Cursor payload: "<created_at as epoch microseconds>|<id>". Numeric microseconds
 // avoid timestamp-typed parameter serialization (which drops sub-millisecond
 // precision and would re-include the boundary row).
+// Polls page by seq (commit order); the cursor names the last message and is
+// resolved to its seq. The format is unchanged, so a redeployed older function
+// can still read cursors issued by this one.
 function encodeCursor(createdUs, id) {
   return "cursor_" + btoa(`${createdUs}|${id}`).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 }
@@ -284,6 +287,10 @@ async function postMessage(req) {
   const id = "msg_" + ulid();
   try {
     const rows = await timedQuery(sql.begin(async (tx)=>{
+      // Inserts wait for the insert-order lock (cutout.assign_seq) until the
+      // previous inserting transaction commits. Give up inside the post
+      // budget so a long transaction yields a 503, not a hung request.
+      await tx`set local lock_timeout = '2500ms'`;
       const r = await tx`
         insert into cutout.messages (id, thread_id, from_agent, to_agent, type, body, reply_to, metadata)
         values (${id}, ${body.thread_id}, ${from}, ${body.to},
@@ -301,6 +308,12 @@ async function postMessage(req) {
       created_at: iso(rows[0].created_at)
     });
   } catch (e) {
+    // lock_timeout: rolled back, nothing stored; safe to retry.
+    if ((e as { code?: string }).code === "55P03") return jres(503, {
+      error: "busy: another write is in progress; retry"
+    }, {
+      "Retry-After": "1"
+    });
     // Concurrent re-post of the same key lost the race: return the winner.
     if (e.code === "23505" && idemKey !== null) {
       const d = await timedQuery(findDup(), "find_duplicate_retry");
@@ -339,16 +352,24 @@ async function getMessages(req, arrivedAt) {
       error: "invalid since cursor"
     });
   }
+  // Resume after the cursor's message in seq (commit) order. If that message
+  // is gone (purged), resume after the last message at or before its
+  // (created_at, id) position: the order older functions used.
+  const after = cursor ? sql`(select coalesce(
+        (select seq from cutout.messages where id = ${cursor.id}),
+        (select max(seq) from cutout.messages
+          where (extract(epoch from created_at) * 1000000)::bigint < ${cursor.us}
+             or ((extract(epoch from created_at) * 1000000)::bigint = ${cursor.us} and id <= ${cursor.id})),
+        0))` : sql`0`;
   const queryOnce = async ()=>{
     const q = sql`
       select id, thread_id, from_agent, to_agent, type, body, reply_to, created_at,
              (extract(epoch from created_at) * 1000000)::bigint as created_us, metadata
       from cutout.messages
-      where true
-      ${cursor ? sql`and ((extract(epoch from created_at) * 1000000)::bigint > ${cursor.us} or ((extract(epoch from created_at) * 1000000)::bigint = ${cursor.us} and id > ${cursor.id}))` : sql``}
+      where seq > ${after}
       ${threadId ? sql`and thread_id = ${threadId}` : sql``}
       ${to ? sql`and to_agent = ${to}` : agentId ? sql`and (to_agent = ${agentId} or to_agent = '*')` : sql``}
-      order by created_at asc, id asc
+      order by seq asc
       limit ${limit}`;
     return await timedQuery(q, "query_once");
   };

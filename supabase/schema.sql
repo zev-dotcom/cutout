@@ -1,8 +1,13 @@
 -- Cutout bus schema (SPEC v1). Dedicated schema in the existing Supabase project.
 create schema if not exists cutout;
 
+-- Delivery order. Values come only from cutout.assign_seq() (below), which
+-- serializes inserts, so seq order is commit order and cursors never skip.
+create sequence if not exists cutout.messages_seq;
+
 create table if not exists cutout.messages (
   id          text primary key,                 -- msg_<ulid>
+  seq         bigint not null,                  -- commit order (cursor)
   thread_id   text not null,
   from_agent  text not null,
   to_agent    text not null,                    -- agent id or '*'
@@ -15,6 +20,24 @@ create table if not exists cutout.messages (
 create index if not exists messages_order_idx  on cutout.messages (created_at, id);
 create index if not exists messages_thread_idx on cutout.messages (thread_id, created_at, id);
 create index if not exists messages_to_idx     on cutout.messages (to_agent, created_at, id);
+create unique index if not exists messages_seq_idx on cutout.messages (seq);
+create index if not exists messages_thread_seq_idx on cutout.messages (thread_id, seq);
+create index if not exists messages_to_seq_idx     on cutout.messages (to_agent, seq);
+
+-- created_at is the transaction start time, so it is not commit order: a
+-- transaction that starts first can commit last, behind rows a poller has
+-- already passed. The lock is held until commit, so a row that takes a
+-- higher seq is always committed after every row with a lower one.
+create or replace function cutout.assign_seq()
+returns trigger language plpgsql set search_path = pg_catalog as $$
+begin
+  perform pg_advisory_xact_lock(hashtext('cutout.messages.seq'));
+  new.seq := nextval('cutout.messages_seq');
+  return new;
+end $$;
+drop trigger if exists messages_assign_seq on cutout.messages;
+create trigger messages_assign_seq before insert on cutout.messages
+  for each row execute function cutout.assign_seq();
 
 create table if not exists cutout.receipts (
   message_id text not null references cutout.messages(id) on delete cascade,
