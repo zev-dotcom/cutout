@@ -34,7 +34,8 @@ create table if not exists cutout.meta (
   v jsonb not null
 );
 
--- Retention purge (SPEC: startup + at least daily; also marks expired one-time links consumed).
+-- Retention purge (SPEC: startup + at least daily; also marks expired one-time links consumed
+-- and erases their URL).
 create or replace function cutout.purge(retention_days int default 30)
 returns jsonb language plpgsql security definer set search_path = cutout as $$
 declare
@@ -45,7 +46,8 @@ begin
     get diagnostics purged = row_count;
   end if;
   update cutout.messages
-     set metadata = jsonb_set(metadata, '{one_time_link,consumed}', 'true'::jsonb, false)
+     set metadata = jsonb_set(metadata, '{one_time_link}', (metadata->'one_time_link')
+           || '{"consumed": true, "url": null, "url_redacted": true}'::jsonb, false)
    where metadata ? 'one_time_link'
      and coalesce((metadata->'one_time_link'->>'consumed')::boolean, false) = false
      and (metadata->'one_time_link'->>'expires_at')::timestamptz < now() - interval '5 minutes';

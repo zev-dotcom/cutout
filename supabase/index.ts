@@ -204,6 +204,28 @@ function validAttachments(a) {
   }
   return null;
 }
+// A consumed or expired one-time link keeps no URL (SPEC: never re-share).
+const REDACTED_LINK = {
+  consumed: true,
+  url: null,
+  url_redacted: true
+};
+const LINK_SKEW_MS = 5 * 60 * 1000; // SPEC: clock skew tolerance for expiry checks
+function staleLink(link: unknown) {
+  if (typeof link !== "object" || link === null || Array.isArray(link)) return false;
+  const l = link as Record<string, unknown>;
+  if (l.url_redacted) return false;
+  if (l.consumed) return true;
+  const exp = typeof l.expires_at === "string" ? Date.parse(l.expires_at) : NaN;
+  return exp < Date.now() - LINK_SKEW_MS; // unparseable -> NaN -> false
+}
+async function redactLinks(ids: string[], label: string) {
+  await timedQuery(sql`update cutout.messages
+    set metadata = jsonb_set(metadata, '{one_time_link}',
+                             (metadata->'one_time_link')
+                               || '{"consumed": true, "url": null, "url_redacted": true}'::jsonb, false)
+    where id = any(${ids}) and jsonb_typeof(metadata->'one_time_link') = 'object'`, label);
+}
 // ---- handlers ---------------------------------------------------------------
 async function postMessage(req) {
   let body;
@@ -364,6 +386,13 @@ async function getMessages(req, arrivedAt) {
     rows = await queryOnce();
   }
   console.log(`cutout poll_hold_ms=${Date.now() - holdStarted} requested_wait=${wait} effective_wait=${Math.min(wait, MAX_HOLD_SECONDS)}`);
+  const staleIds: string[] = [];
+  for (const r of rows){
+    if (!staleLink(r.metadata?.one_time_link)) continue;
+    Object.assign(r.metadata.one_time_link, REDACTED_LINK);
+    staleIds.push(r.id);
+  }
+  if (staleIds.length) await redactLinks(staleIds, "redact_stale_links");
   const receiptsBy = new Map();
   if (rows.length) {
     const ids = rows.map((r)=>r.id);
@@ -430,9 +459,9 @@ async function postReceipt(req) {
     insert into cutout.receipts (message_id, agent, status, at) values (${mid}, ${agent}, ${status}, ${at.toISOString()})
     on conflict (message_id, agent) do update set status = excluded.status, at = excluded.at`, "receipt_write");
   if (status === "consumed" && exists[0].metadata?.one_time_link) {
-    await timedQuery(sql`update cutout.messages
-              set metadata = jsonb_set(metadata, '{one_time_link,consumed}', 'true'::jsonb, false)
-              where id = ${mid}`, "consumed_update");
+    await redactLinks([
+      mid
+    ], "consumed_update");
   }
   return jres(201, {
     ok: true

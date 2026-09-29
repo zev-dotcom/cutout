@@ -13,6 +13,7 @@ then exercises every endpoint and asserts the key behaviors:
   - receipt idempotency + receipts visible on message reads
   - consumed receipt flips metadata.one_time_link.consumed
   - link expiry honors UTC offsets and the 5-minute clock skew
+  - consumed or expired one-time links lose their URL (stored + read)
   - idempotency keys: replay returns the original, no double-post
   - resolve/reopen thread lifecycle
   - rate-limit headers on API responses
@@ -28,6 +29,7 @@ Run:  python3 tests/smoke_test.py
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -93,7 +95,7 @@ def start_server(cls, rate_limit=None):
     cls.port = free_port()
     cls.base_url = "http://127.0.0.1:%d" % cls.port
     cls.tmp = tempfile.TemporaryDirectory()
-    db = os.path.join(cls.tmp.name, "smoke.db")
+    cls.db = db = os.path.join(cls.tmp.name, "smoke.db")
     env = dict(os.environ, CUTOUT_TOKEN=TOKEN)
     env.pop("CUTOUT_RATE_LIMIT", None)
     if rate_limit is not None:
@@ -308,12 +310,18 @@ class SmokeTest(unittest.TestCase):
         before = self.instinct.get_messages(thread_id="smoke-link")["messages"]
         link_msg = [m for m in before if m["id"] == mid][0]
         self.assertFalse(link_msg["metadata"]["one_time_link"]["consumed"])
+        self.assertEqual(link_msg["metadata"]["one_time_link"]["url"],
+                         "https://example.invalid/auth?token=smoke")
         self.assertEqual(
             self.instinct.post_receipt(mid, "instinct", "consumed"),
             {"ok": True})
         after = self.instinct.get_messages(thread_id="smoke-link")["messages"]
         link_msg = [m for m in after if m["id"] == mid][0]
         self.assertTrue(link_msg["metadata"]["one_time_link"]["consumed"])
+        # a used link keeps no URL, in responses or in storage
+        self.assertIsNone(link_msg["metadata"]["one_time_link"]["url"])
+        self.assertTrue(link_msg["metadata"]["one_time_link"]["url_redacted"])
+        self.assertNotIn("token=smoke", self._stored_metadata(mid))
         # receipt for an unknown message is a 404
         with self.assertRaises(CutoutError) as ctx:
             self.instinct.post_receipt("msg_doesnotexist", "instinct",
@@ -451,6 +459,81 @@ class SmokeTest(unittest.TestCase):
             link = store.get_message(name)["metadata"]["one_time_link"]
             self.assertEqual(link["consumed"], expired,
                              "%s link (expires_at=%s)" % (name, expires_at))
+
+    def _stored_metadata(self, mid):
+        con = sqlite3.connect(self.db)
+        try:
+            return con.execute("SELECT metadata FROM messages WHERE id = ?",
+                               (mid,)).fetchone()[0]
+        finally:
+            con.close()
+
+    def test_16_link_redacted_on_read_only_when_expired(self):
+        def at(seconds, offset_hours=0):
+            tz = timezone(timedelta(hours=offset_hours))
+            return (datetime.now(timezone.utc)
+                    + timedelta(seconds=seconds)).astimezone(tz) \
+                .isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        cases = {
+            # expires in 1h, written on a UTC-7 clock: URL must survive
+            "offset": (at(3600, offset_hours=-7), False),
+            # expired 2 min ago: inside the 5-minute skew, URL survives
+            "skew": (at(-120), False),
+            # expired 1h ago, written on a UTC-7 clock: URL is erased
+            "expired": (at(-3600, offset_hours=-7), True),
+        }
+        ids = {}
+        for name, (expires_at, _) in cases.items():
+            ids[name] = self.koda.post_message(
+                thread_id="smoke-link-read", from_="koda", to="instinct",
+                type="link", body="link: %s" % name,
+                metadata={"one_time_link": {
+                    "url": "https://example.invalid/auth?case=" + name,
+                    "expires_at": expires_at, "consumed": False}})["id"]
+        msgs = {m["id"]: m for m in self.instinct.get_messages(
+            thread_id="smoke-link-read")["messages"]}
+        for name, (expires_at, expired) in cases.items():
+            with self.subTest(name, expires_at=expires_at):
+                link = msgs[ids[name]]["metadata"]["one_time_link"]
+                stored = self._stored_metadata(ids[name])
+                url = "https://example.invalid/auth?case=" + name
+                if expired:
+                    self.assertIsNone(link["url"])
+                    self.assertTrue(link["url_redacted"])
+                    self.assertTrue(link["consumed"])
+                    # persisted, not just applied to the response
+                    self.assertNotIn(url, stored)
+                else:
+                    self.assertEqual(link["url"], url)
+                    self.assertNotIn("url_redacted", link)
+                    self.assertFalse(link["consumed"])
+                    self.assertIn(url, stored)
+
+    def test_17_purge_erases_url_of_expired_link_only(self):
+        def at(seconds, offset_hours=0):
+            tz = timezone(timedelta(hours=offset_hours))
+            return (datetime.now(timezone.utc)
+                    + timedelta(seconds=seconds)).astimezone(tz) \
+                .isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        store = Store(":memory:")
+        for name, expires_at in (("valid", at(3600, offset_hours=-7)),
+                                 ("expired", at(-3600, offset_hours=-7))):
+            store.add_message(
+                name, "smoke-link-purge", "koda", "instinct", "link",
+                "link: %s" % name, None,
+                {"one_time_link": {
+                    "url": "https://example.invalid/auth?case=" + name,
+                    "expires_at": expires_at, "consumed": False}},
+                at(0))
+        store.purge_older_than(30)
+        valid = store.get_message("valid")["metadata"]["one_time_link"]
+        self.assertEqual(valid["url"],
+                         "https://example.invalid/auth?case=valid")
+        expired = store.get_message("expired")["metadata"]["one_time_link"]
+        self.assertIsNone(expired["url"])
+        self.assertTrue(expired["url_redacted"])
 
     # -- rate limit (LAST: it burns the test token's budget) ------------
 class RateLimitTest(unittest.TestCase):
