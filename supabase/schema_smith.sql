@@ -1,0 +1,96 @@
+-- Smith v1 schema: identity, pairing, thread ACLs, activity, owner audit.
+-- Run after schema.sql + schema_v1.1.sql. Idempotent.
+-- Single owner per instance; anyone can run their own instance.
+
+create table if not exists smith_agents (
+  agent_id     text primary key,                       -- e.g. 'koda', 'i2'
+  display_name text not null,
+  platform     text not null default 'unknown',        -- Muse, Instinct, Grokbot…
+  token_hash   text unique,                           -- sha256 hex of sm_agt_ token; null = known id, no Smith token yet
+  created_at   timestamptz not null default now(),
+  revoked_at   timestamptz
+);
+create index if not exists smith_agents_token_idx on smith_agents (token_hash);
+
+create table if not exists smith_pairings (
+  id          text primary key,                        -- pg_ + ulid-ish
+  code_hash   text not null unique,                    -- sha256 hex of the code
+  agent_id    text not null references smith_agents(agent_id),
+  expires_at  timestamptz not null,
+  redeemed_at timestamptz,
+  created_at  timestamptz not null default now()
+);
+
+create table if not exists smith_threads (
+  thread_id  text primary key,
+  name       text,
+  created_by text,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists smith_thread_members (
+  thread_id text not null references smith_threads(thread_id) on delete cascade,
+  agent_id  text not null,
+  added_at  timestamptz not null default now(),
+  primary key (thread_id, agent_id)
+);
+create index if not exists smith_members_agent_idx on smith_thread_members (agent_id);
+
+create table if not exists smith_activity (
+  thread_id  text not null,
+  agent_id   text not null,
+  started_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  primary key (thread_id, agent_id)
+);
+create index if not exists smith_activity_expiry_idx on smith_activity (expires_at);
+
+-- One row per instance. The raw token is shown once by the mint script;
+-- only the hash lives here.
+create table if not exists smith_owner (
+  id         int primary key default 1 check (id = 1),
+  token_hash text not null,
+  created_at timestamptz not null default now()
+);
+
+-- Append-only audit log. No route deletes rows.
+create table if not exists smith_audit (
+  id     bigserial primary key,
+  at     timestamptz not null default now(),
+  actor  text not null,                                 -- 'owner' or agent_id
+  action text not null,                                 -- read_thread, issue_pairing, …
+  detail jsonb not null default '{}'::jsonb
+);
+create index if not exists smith_audit_at_idx on smith_audit (at desc);
+
+-- Migrate every pre-existing thread into managed threads, seeding members
+-- from the agent ids already seen on each thread (excluding broadcasts).
+insert into smith_threads (thread_id, created_by)
+select distinct thread_id, null from cutout.messages
+on conflict (thread_id) do nothing;
+
+insert into smith_thread_members (thread_id, agent_id)
+select distinct thread_id, from_agent from cutout.messages
+where from_agent is not null and from_agent <> '*'
+on conflict do nothing;
+
+insert into smith_thread_members (thread_id, agent_id)
+select distinct thread_id, to_agent from cutout.messages
+where to_agent is not null and to_agent <> '*'
+on conflict do nothing;
+
+-- Seed agent rows for ids already on the bus so re-pairing is a rotation,
+-- not a duplicate. token_hash stays null until the owner issues a pairing
+-- code; null means "known id, no Smith token yet".
+insert into smith_agents (agent_id, display_name, platform, token_hash)
+select distinct from_agent, from_agent, 'unknown', null from cutout.messages
+where from_agent is not null and from_agent <> '*'
+on conflict (agent_id) do nothing;
+
+alter table smith_agents enable row level security;
+alter table smith_pairings enable row level security;
+alter table smith_threads enable row level security;
+alter table smith_thread_members enable row level security;
+alter table smith_activity enable row level security;
+alter table smith_owner enable row level security;
+alter table smith_audit enable row level security;

@@ -249,7 +249,7 @@ function validOneTimeLink(link: unknown) {
   return null;
 }
 // ---- handlers ---------------------------------------------------------------
-async function postMessage(req) {
+async function postMessage(req, auth) {
   let body;
   try {
     body = await req.json();
@@ -307,6 +307,38 @@ async function postMessage(req) {
   if (linkErr) return jres(422, {
     error: linkErr
   });
+  // Smith: identity binding + thread membership. Legacy callers keep v1.1 semantics.
+  if (auth.kind === "owner") {
+    if (body.from !== OWNER_ID) return jres(403, {
+      error: "from must match authenticated agent"
+    });
+  } else if (auth.kind === "agent") {
+    if (body.from !== auth.agentId) return jres(403, {
+      error: "from must match authenticated agent"
+    });
+  } else if (auth.agentId && body.from !== auth.agentId) {
+    return jres(403, {
+      error: "from must match authenticated agent"
+    });
+  }
+  if (await isManagedThread(body.thread_id)) {
+    if (auth.kind === "legacy") {
+      // God token: full access with identity. Only the no-identity case is
+      // denied on managed threads (nothing to attribute the write to).
+      if (!auth.agentId) return jres(403, {
+        error: "not a thread member"
+      });
+    } else if (!await isThreadMember(auth, body.thread_id)) {
+      return jres(403, {
+        error: "not a thread member"
+      });
+    }
+  } else if (auth.kind === "agent") {
+    // Agents write only threads they belong to; new threads are born via POST /v1/threads.
+    return jres(403, {
+      error: "not a thread member"
+    });
+  }
   let idemKey = null;
   if (body.idempotency_key !== undefined && body.idempotency_key !== null) {
     if (typeof body.idempotency_key !== "string" || body.idempotency_key.length === 0 || body.idempotency_key.length > MAX_IDEMPOTENCY_KEY) {
@@ -342,6 +374,10 @@ async function postMessage(req) {
         await tx`insert into cutout.idempotency_keys (from_agent, idem_key, message_id)
                  values (${from}, ${idemKey}, ${id})`;
       }
+      if (auth.kind === "owner") {
+        await tx`insert into smith_audit (actor, action, detail)
+                 values ('owner', 'send_message', ${sql.json({ thread_id: body.thread_id })})`;
+      }
       return r;
     }), "post_transaction", 3500);
     return jres(201, {
@@ -361,12 +397,25 @@ async function postMessage(req) {
     throw e;
   }
 }
-async function getMessages(req, arrivedAt) {
+async function getMessages(req, arrivedAt, auth) {
   const u = new URL(req.url);
   const since = u.searchParams.get("since");
   const threadId = u.searchParams.get("thread_id");
   const to = u.searchParams.get("to");
   const agentId = req.headers.get("X-Agent-Id");
+  // Smith: the owner never reads through the agent route; agent-token callers
+  // see only threads they belong to, with identity from the token, never the header.
+  if (auth.kind === "owner") return jres(403, {
+    error: "owner reads must use /v1/owner/*"
+  });
+  const scopeAgent = auth.kind === "agent" ? auth.agentId : agentId;
+  if (threadId && auth.kind === "agent") {
+    if (!await isManagedThread(threadId) || !await isThreadMember(auth, threadId)) {
+      return jres(403, {
+        error: "not a thread member"
+      });
+    }
+  }
   let wait = 0, limit = 50;
   if (u.searchParams.has("wait")) {
     wait = Number(u.searchParams.get("wait"));
@@ -395,7 +444,8 @@ async function getMessages(req, arrivedAt) {
       where true
       ${cursor ? sql`and ((extract(epoch from created_at) * 1000000)::bigint > ${cursor.us} or ((extract(epoch from created_at) * 1000000)::bigint = ${cursor.us} and id > ${cursor.id}))` : sql``}
       ${threadId ? sql`and thread_id = ${threadId}` : sql``}
-      ${to ? sql`and to_agent = ${to}` : agentId ? sql`and (to_agent = ${agentId} or to_agent = '*')` : sql``}
+      ${to ? sql`and to_agent = ${to}` : scopeAgent ? sql`and (to_agent = ${scopeAgent} or to_agent = '*')` : sql``}
+      ${auth.kind === "agent" ? sql`and thread_id in (select thread_id from smith_thread_members where agent_id = ${auth.agentId})` : sql``}
       order by created_at asc, id asc
       limit ${limit}`;
     return await timedQuery(q, "query_once");
@@ -412,13 +462,18 @@ async function getMessages(req, arrivedAt) {
     rows = await queryOnce();
   }
   console.log(`cutout poll_hold_ms=${Date.now() - holdStarted} requested_wait=${wait} effective_wait=${Math.min(wait, MAX_HOLD_SECONDS)}`);
-  const staleIds: string[] = [];
+  return getMessagesTail(rows, since);
+}
+// Shared by GET /v1/messages and the Smith thread feeds: stale one-time-link
+// redaction plus per-message receipts. Behavior is identical everywhere it is used.
+async function enrichMessages(rows, redactLabel) {
+  const staleIds = [];
   for (const r of rows){
     if (!staleLink(r.metadata?.one_time_link)) continue;
     Object.assign(r.metadata.one_time_link, REDACTED_LINK);
     staleIds.push(r.id);
   }
-  if (staleIds.length) await redactLinks(staleIds, "redact_stale_links");
+  if (staleIds.length) await redactLinks(staleIds, redactLabel);
   const receiptsBy = new Map();
   if (rows.length) {
     const ids = rows.map((r)=>r.id);
@@ -435,16 +490,20 @@ async function getMessages(req, arrivedAt) {
       receiptsBy.set(r.message_id, list);
     }
   }
+  return rows.map((r)=>({
+      ...serialize(r),
+      receipts: receiptsBy.get(r.id) ?? []
+    }));
+}
+async function getMessagesTail(rows, since) {
+  const messages = await enrichMessages(rows, "redact_stale_links");
   const nextCursor = rows.length ? encodeCursor(Number(rows[rows.length - 1].created_us), rows[rows.length - 1].id) : since ?? null;
   return jres(200, {
-    messages: rows.map((r)=>({
-        ...serialize(r),
-        receipts: receiptsBy.get(r.id) ?? []
-      })),
+    messages,
     next_cursor: nextCursor
   });
 }
-async function postReceipt(req) {
+async function postReceipt(req, auth) {
   let body;
   try {
     body = await req.json();
@@ -477,6 +536,21 @@ async function postReceipt(req) {
     });
   }
   const mid = body.message_id, agent = body.agent, status = body.status;
+  // Smith: receipts are written only for the authenticated identity. No writing
+  // receipts for someone else. Legacy callers without an agent id keep v1.1 semantics.
+  if (auth.kind === "owner") {
+    if (agent !== OWNER_ID) return jres(403, {
+      error: "agent must match authenticated agent"
+    });
+  } else if (auth.kind === "agent") {
+    if (agent !== auth.agentId) return jres(403, {
+      error: "agent must match authenticated agent"
+    });
+  } else if (auth.agentId && agent !== auth.agentId) {
+    return jres(403, {
+      error: "agent must match authenticated agent"
+    });
+  }
   const exists = await timedQuery(sql`select metadata from cutout.messages where id = ${mid}`, "receipt_exists");
   if (exists.length === 0) return jres(404, {
     error: "message not found"
@@ -516,6 +590,673 @@ async function getThreads(req) {
       }))
   });
 }
+// ---- Smith v1 (additive) ------------------------------------------------------
+// Identity, pairing, thread ACLs, working-on-reply activity, owner audit.
+// Additive on SPEC v1.1: every v1.1 route keeps its path, fields, and status
+// codes for legacy callers. New routes live under the same /v1/ prefix.
+const SMITH_VERSION = "1.0";
+const OWNER_ID = "owner";
+const PAIRING_CODE_LEN = 6;
+const PAIRING_DEFAULT_HOURS = 24;
+const PAIRING_MAX_HOURS = 720; // 30 days
+const ACTIVITY_TTL_SECONDS = 30;
+const REDEEM_LIMIT_PER_MIN = 10;
+const MAX_THREAD_NAME = 200;
+const RESERVED_AGENT_RE = /^owner$/i;
+
+async function sha256Hex(s) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(d)).map((b)=>b.toString(16).padStart(2, "0")).join("");
+}
+function randomHexBytes(n) {
+  const b = new Uint8Array(n);
+  crypto.getRandomValues(b);
+  return Array.from(b).map((x)=>x.toString(16).padStart(2, "0")).join("");
+}
+// 6 chars from the Crockford set (C32), displayed as XXXX-XX. The stored hash
+// covers the 6 raw chars; redeem normalizes input (case, hyphen) before hashing.
+function newPairingCode() {
+  const b = new Uint8Array(PAIRING_CODE_LEN);
+  crypto.getRandomValues(b);
+  let raw = "";
+  for (let i = 0; i < PAIRING_CODE_LEN; i++)raw += C32[b[i] & 31];
+  return {
+    raw,
+    display: raw.slice(0, 4) + "-" + raw.slice(4)
+  };
+}
+// Auth resolution order per request: sm_own_ -> owner (hash in smith_owner),
+// sm_agt_ -> bound agent_id (reject revoked), else the legacy bus token with
+// agent identity from X-Agent-Id when present, else null (caller sends 401).
+// A recognized prefix that fails its lookup is 401, never a legacy fallthrough.
+async function resolveAuth(req) {
+  const m = /^Bearer (.+)$/.exec(req.headers.get("Authorization") ?? "");
+  if (!m) return null;
+  const token = m[1];
+  if (token.startsWith("sm_own_")) {
+    const rows = await timedQuery(sql`select 1 from smith_owner where token_hash = ${await sha256Hex(token)}`, "auth_owner");
+    return rows.length ? {
+      kind: "owner",
+      agentId: OWNER_ID
+    } : null;
+  }
+  if (token.startsWith("sm_agt_")) {
+    const rows = await timedQuery(sql`select agent_id, revoked_at from smith_agents where token_hash = ${await sha256Hex(token)}`, "auth_agent");
+    if (!rows.length || rows[0].revoked_at !== null) return null;
+    return {
+      kind: "agent",
+      agentId: rows[0].agent_id
+    };
+  }
+  if (BUS_TOKEN && token === BUS_TOKEN) {
+    const hid = req.headers.get("X-Agent-Id");
+    return {
+      kind: "legacy",
+      agentId: hid && hid.length ? hid : null
+    };
+  }
+  return null;
+}
+async function audit(actor, action, detail) {
+  await timedQuery(sql`insert into smith_audit (actor, action, detail) values (${actor}, ${action}, ${sql.json(detail ?? {})})`, "audit_append");
+}
+async function isManagedThread(threadId) {
+  const rows = await timedQuery(sql`select 1 from smith_threads where thread_id = ${threadId}`, "thread_managed");
+  return rows.length > 0;
+}
+async function isThreadMember(auth, threadId) {
+  if (auth.kind === "owner") return true; // implicit member of every thread
+  if (!auth.agentId) return false;
+  const rows = await timedQuery(sql`select 1 from smith_thread_members where thread_id = ${threadId} and agent_id = ${auth.agentId}`, "member_check");
+  return rows.length > 0;
+}
+// 404 when the thread is unmanaged, 403 when the caller is not a member, else null.
+// Legacy callers keep the god token: full access with an agent identity; only
+// the no-identity case is denied on managed threads.
+async function threadAccess(auth, threadId) {
+  if (!await isManagedThread(threadId)) return jres(404, {
+    error: "thread not found"
+  });
+  if (auth.kind === "legacy") {
+    return auth.agentId ? null : jres(403, {
+      error: "not a thread member"
+    });
+  }
+  if (!await isThreadMember(auth, threadId)) return jres(403, {
+    error: "not a thread member"
+  });
+  return null;
+}
+async function memberObjects(threadId) {
+  const rows = await timedQuery(sql`
+    select tm.agent_id, a.display_name, a.platform from smith_thread_members tm
+    left join smith_agents a on a.agent_id = tm.agent_id
+    where tm.thread_id = ${threadId} order by tm.agent_id asc`, "thread_members");
+  return rows.map((r)=>({
+      agent_id: r.agent_id,
+      display_name: r.display_name ?? r.agent_id,
+      platform: r.platform ?? "unknown"
+    }));
+}
+// ---- threads ----------------------------------------------------------------
+async function postThread(req, auth) {
+  let body;
+  try {
+    body = await req.json();
+  } catch  {
+    return jres(400, {
+      error: "invalid JSON"
+    });
+  }
+  let name = null;
+  if (body.name !== undefined && body.name !== null) {
+    if (typeof body.name !== "string" || body.name.length === 0 || body.name.length > MAX_THREAD_NAME) {
+      return jres(422, {
+        error: `name must be a non-empty string of at most ${MAX_THREAD_NAME} characters`
+      });
+    }
+    name = body.name;
+  }
+  let memberIds = [];
+  if (body.member_ids !== undefined && body.member_ids !== null) {
+    if (!Array.isArray(body.member_ids) || body.member_ids.some((x)=>typeof x !== "string" || x.length === 0)) {
+      return jres(422, {
+        error: "member_ids must be an array of agent id strings"
+      });
+    }
+    memberIds = [...new Set(body.member_ids)];
+  }
+  for (const mid of memberIds){
+    if (RESERVED_AGENT_RE.test(mid)) return jres(422, {
+      error: "agent_id 'owner' is reserved"
+    });
+  }
+  let tid;
+  if (body.thread_id !== undefined && body.thread_id !== null) {
+    if (typeof body.thread_id !== "string" || !/^x_cutout_thread/.test(body.thread_id)) {
+      return jres(422, {
+        error: "thread_id must be an x_cutout_thread-style id"
+      });
+    }
+    tid = body.thread_id;
+  } else {
+    tid = "th_" + ulid();
+  }
+  const dup = await timedQuery(sql`select 1 from smith_threads where thread_id = ${tid}`, "thread_exists");
+  if (dup.length) return jres(409, {
+    error: "thread already exists"
+  });
+  // Agent creators may only name existing, non-revoked agents. Owner creators
+  // may name unknown ids; they become stub rows (known id, no Smith token yet).
+  const known = await timedQuery(sql`select agent_id, revoked_at from smith_agents where agent_id = any(${memberIds})`, "members_known");
+  const knownMap = new Map(known.map((r)=>[
+      r.agent_id,
+      r.revoked_at
+    ]));
+  for (const mid of memberIds){
+    const rev = knownMap.get(mid);
+    if (auth.kind === "owner") {
+      if (rev === undefined) {
+        await timedQuery(sql`insert into smith_agents (agent_id, display_name, platform) values (${mid}, ${mid}, 'unknown') on conflict (agent_id) do nothing`, "member_stub");
+      } else if (rev !== null) {
+        return jres(422, {
+          error: `agent is revoked: ${mid}`
+        });
+      }
+    } else if (rev === undefined || rev !== null) {
+      return jres(422, {
+        error: `unknown or revoked agent: ${mid}`
+      });
+    }
+  }
+  await timedQuery(sql.begin(async (tx)=>{
+    await tx`insert into smith_threads (thread_id, name, created_by) values (${tid}, ${name}, ${auth.agentId})`;
+    // Adopt pre-existing legacy messages on this id, if any.
+    await tx`insert into smith_thread_members (thread_id, agent_id)
+             select ${tid}, from_agent from cutout.messages
+             where thread_id = ${tid} and from_agent is not null and from_agent <> '*'
+             on conflict do nothing`;
+    await tx`insert into smith_thread_members (thread_id, agent_id)
+             select ${tid}, to_agent from cutout.messages
+             where thread_id = ${tid} and to_agent is not null and to_agent <> '*'
+             on conflict do nothing`;
+    const all = auth.kind === "owner" ? memberIds : [
+      auth.agentId,
+      ...memberIds
+    ];
+    for (const mid of all){
+      await tx`insert into smith_thread_members (thread_id, agent_id) values (${tid}, ${mid}) on conflict do nothing`;
+    }
+  }), "thread_create", 3500);
+  return jres(201, {
+    thread_id: tid,
+    name,
+    members: await memberObjects(tid)
+  });
+}
+async function listThreadsSmith(auth) {
+  const aid = auth.agentId;
+  const scope = auth.kind === "owner" ? sql`` : sql`where t.thread_id in (select thread_id from smith_thread_members where agent_id = ${aid})`;
+  const threads = await timedQuery(sql`
+    select t.thread_id, t.name, max(m.created_at) as last_at,
+      count(*) filter (where (m.to_agent = ${aid} or m.to_agent = '*')
+        and not exists (select 1 from cutout.receipts r where r.message_id = m.id and r.agent = ${aid}))::int as unread
+    from smith_threads t
+    left join cutout.messages m on m.thread_id = t.thread_id
+    ${scope}
+    group by t.thread_id, t.name
+    order by last_at desc nulls last`, "smith_thread_list");
+  const tids = threads.map((t)=>t.thread_id);
+  const membersBy = new Map(), workingBy = new Map();
+  if (tids.length) {
+    const mrows = await timedQuery(sql`
+      select tm.thread_id, tm.agent_id, a.display_name, a.platform
+      from smith_thread_members tm left join smith_agents a on a.agent_id = tm.agent_id
+      where tm.thread_id = any(${tids}) order by tm.thread_id asc, tm.agent_id asc`, "smith_thread_members");
+    for (const r of mrows){
+      const list = membersBy.get(r.thread_id) ?? [];
+      list.push({
+        agent_id: r.agent_id,
+        display_name: r.display_name ?? r.agent_id,
+        platform: r.platform ?? "unknown"
+      });
+      membersBy.set(r.thread_id, list);
+    }
+    const wrows = await timedQuery(sql`
+      select thread_id, agent_id from smith_activity
+      where thread_id = any(${tids}) and expires_at > now() order by thread_id asc, agent_id asc`, "smith_thread_working");
+    for (const r of wrows){
+      const list = workingBy.get(r.thread_id) ?? [];
+      list.push(r.agent_id);
+      workingBy.set(r.thread_id, list);
+    }
+  }
+  return {
+    threads: threads.map((t)=>({
+        thread_id: t.thread_id,
+        name: t.name,
+        last_at: t.last_at ? iso(t.last_at) : null,
+        unread: t.unread,
+        members: membersBy.get(t.thread_id) ?? [],
+        working: workingBy.get(t.thread_id) ?? []
+      }))
+  };
+}
+async function renameThread(req, auth, threadId) {
+  const denied = await threadAccess(auth, threadId);
+  if (denied) return denied;
+  let body;
+  try {
+    body = await req.json();
+  } catch  {
+    return jres(400, {
+      error: "invalid JSON"
+    });
+  }
+  if (typeof body.name !== "string" || body.name.length === 0 || body.name.length > MAX_THREAD_NAME) {
+    return jres(422, {
+      error: `name must be a non-empty string of at most ${MAX_THREAD_NAME} characters`
+    });
+  }
+  const cur = await timedQuery(sql`select name from smith_threads where thread_id = ${threadId}`, "thread_name");
+  const oldName = cur.length ? cur[0].name : null;
+  const noteId = "msg_" + ulid();
+  await timedQuery(sql.begin(async (tx)=>{
+    await tx`update smith_threads set name = ${body.name} where thread_id = ${threadId}`;
+    // Renames are data, not message edits: append a note message carrying the
+    // compat key, matching the UI contract.
+    await tx`insert into cutout.messages (id, thread_id, from_agent, to_agent, type, body, metadata)
+             values (${noteId}, ${threadId}, ${auth.agentId}, '*', 'note',
+                     ${"Chat renamed to \"" + body.name + "\""},
+                     ${sql.json({ x_cutout_thread_rename: { from: oldName, to: body.name } })})`;
+  }), "thread_rename", 3500);
+  return jres(200, {
+    thread_id: threadId,
+    name: body.name
+  });
+}
+async function addMember(req, auth, threadId) {
+  const denied = await threadAccess(auth, threadId);
+  if (denied) return denied;
+  let body;
+  try {
+    body = await req.json();
+  } catch  {
+    return jres(400, {
+      error: "invalid JSON"
+    });
+  }
+  const aid = body.agent_id;
+  if (typeof aid !== "string" || aid.length === 0) return jres(422, {
+    error: "agent_id is required"
+  });
+  if (RESERVED_AGENT_RE.test(aid)) return jres(422, {
+    error: "agent_id 'owner' is reserved"
+  });
+  const rows = await timedQuery(sql`select revoked_at from smith_agents where agent_id = ${aid}`, "member_agent");
+  if (!rows.length || rows[0].revoked_at !== null) return jres(422, {
+    error: `unknown or revoked agent: ${aid}`
+  });
+  await timedQuery(sql`insert into smith_thread_members (thread_id, agent_id) values (${threadId}, ${aid}) on conflict do nothing`, "member_add");
+  return jres(200, {
+    thread_id: threadId,
+    agent_id: aid
+  });
+}
+// ---- thread feed (client's one-call view) -------------------------------------
+function parseFeedQuery(req) {
+  const u = new URL(req.url);
+  let limit = 50;
+  if (u.searchParams.has("limit")) {
+    limit = Number(u.searchParams.get("limit"));
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) return {
+      error: jres(422, {
+        error: "limit must be between 1 and 100"
+      })
+    };
+  }
+  let cursor = null;
+  const since = u.searchParams.get("since");
+  if (since) {
+    cursor = decodeCursor(since);
+    if (!cursor) return {
+      error: jres(422, {
+        error: "invalid since cursor"
+      })
+    };
+  }
+  return {
+    limit,
+    cursor,
+    since
+  };
+}
+async function feedMessages(threadId, cursor, limit) {
+  return await timedQuery(sql`
+    select id, thread_id, from_agent, to_agent, type, body, reply_to, created_at,
+           (extract(epoch from created_at) * 1000000)::bigint as created_us, metadata
+    from cutout.messages
+    where thread_id = ${threadId}
+    ${cursor ? sql`and ((extract(epoch from created_at) * 1000000)::bigint > ${cursor.us} or ((extract(epoch from created_at) * 1000000)::bigint = ${cursor.us} and id > ${cursor.id}))` : sql``}
+    order by created_at asc, id asc
+    limit ${limit}`, "feed_query");
+}
+async function buildFeed(threadId, q, redactLabel) {
+  const rows = await feedMessages(threadId, q.cursor, q.limit);
+  const messages = await enrichMessages(rows, redactLabel);
+  // Working state is evaluated on read (expires_at > now()): a crashed agent's
+  // dots clear within the TTL with no client timer to trust.
+  const wrows = await timedQuery(sql`select agent_id, started_at from smith_activity where thread_id = ${threadId} and expires_at > now() order by agent_id asc`, "feed_working");
+  return {
+    messages,
+    next_cursor: rows.length ? encodeCursor(Number(rows[rows.length - 1].created_us), rows[rows.length - 1].id) : q.since ?? null,
+    working: wrows.map((r)=>({
+        agent_id: r.agent_id,
+        started_at: iso(r.started_at)
+      }))
+  };
+}
+async function threadFeed(req, auth, threadId) {
+  const denied = await threadAccess(auth, threadId);
+  if (denied) return denied;
+  const q = parseFeedQuery(req);
+  if (q.error) return q.error;
+  return jres(200, await buildFeed(threadId, q, "feed_redact"));
+}
+// ---- working-on-reply activity (the cue dots) -----------------------------------
+async function postActivity(req, auth) {
+  const aid = auth.kind === "agent" ? auth.agentId : auth.kind === "legacy" ? auth.agentId : null;
+  if (!aid) {
+    return jres(403, {
+      error: auth.kind === "owner" ? "owner cannot post activity" : "agent identity required"
+    });
+  }
+  let body;
+  try {
+    body = await req.json();
+  } catch  {
+    return jres(400, {
+      error: "invalid JSON"
+    });
+  }
+  if (typeof body.thread_id !== "string" || body.thread_id.length === 0) return jres(422, {
+    error: "thread_id is required"
+  });
+  if (body.state !== "working" && body.state !== "idle") return jres(422, {
+    error: "state must be working or idle"
+  });
+  const denied = await threadAccess(auth, body.thread_id);
+  if (denied) return denied;
+  if (body.state === "working") {
+    await timedQuery(sql`
+      insert into smith_activity (thread_id, agent_id, started_at, expires_at)
+      values (${body.thread_id}, ${aid}, now(), now() + (${ACTIVITY_TTL_SECONDS} * interval '1 second'))
+      on conflict (thread_id, agent_id) do update set expires_at = excluded.expires_at`, "activity_working");
+  } else {
+    await timedQuery(sql`delete from smith_activity where thread_id = ${body.thread_id} and agent_id = ${aid}`, "activity_idle");
+  }
+  return jres(200, {
+    ok: true
+  });
+}
+// ---- pairing (owner issues, agent redeems) ---------------------------------------
+async function issuePairing(req, auth) {
+  if (auth.kind !== "owner") return jres(403, {
+    error: "owner token required"
+  });
+  let body;
+  try {
+    body = await req.json();
+  } catch  {
+    return jres(400, {
+      error: "invalid JSON"
+    });
+  }
+  const aid = body.agent_id;
+  if (typeof aid !== "string" || aid.length === 0) return jres(422, {
+    error: "agent_id is required"
+  });
+  if (RESERVED_AGENT_RE.test(aid)) return jres(422, {
+    error: "agent_id 'owner' is reserved"
+  });
+  if (typeof body.display_name !== "string" || body.display_name.length === 0) {
+    return jres(422, {
+      error: "display_name is required"
+    });
+  }
+  const platform = body.platform === undefined || body.platform === null ? "unknown" : body.platform;
+  if (typeof platform !== "string" || platform.length === 0) return jres(422, {
+    error: "platform must be a string"
+  });
+  let hours = PAIRING_DEFAULT_HOURS;
+  if (body.expires_in_hours !== undefined && body.expires_in_hours !== null) {
+    hours = Number(body.expires_in_hours);
+    if (!Number.isFinite(hours) || hours <= 0 || hours > PAIRING_MAX_HOURS) {
+      return jres(422, {
+        error: `expires_in_hours must be greater than 0 and at most ${PAIRING_MAX_HOURS}`
+      });
+    }
+  }
+  const existing = await timedQuery(sql`select revoked_at from smith_agents where agent_id = ${aid}`, "pairing_agent");
+  if (existing.length && existing[0].revoked_at === null) return jres(409, {
+    error: "agent already paired"
+  });
+  const code = newPairingCode();
+  const pid = "pg_" + ulid();
+  const expiresAt = new Date(Date.now() + hours * 3600 * 1000);
+  await timedQuery(sql.begin(async (tx)=>{
+    if (existing.length) {
+      await tx`update smith_agents set display_name = ${body.display_name}, platform = ${platform} where agent_id = ${aid}`;
+    } else {
+      await tx`insert into smith_agents (agent_id, display_name, platform) values (${aid}, ${body.display_name}, ${platform})`;
+    }
+    await tx`insert into smith_pairings (id, code_hash, agent_id, expires_at)
+             values (${pid}, ${await sha256Hex(code.raw)}, ${aid}, ${expiresAt.toISOString()})`;
+  }), "pairing_issue", 3500);
+  await audit(OWNER_ID, "issue_pairing", {
+    pairing_id: pid,
+    agent_id: aid
+  });
+  return jres(201, {
+    pairing_id: pid,
+    code: code.display,
+    agent_id: aid,
+    expires_at: expiresAt.toISOString()
+  });
+}
+// 10 attempts/minute per IP, tracked in memory per isolate. Guards the two
+// unauthenticated routes (pairing redeem, owner claim); the code / setup key
+// is the credential.
+const redeemHits = new Map();
+function redeemAllowed(ip) {
+  const now = Date.now();
+  const arr = (redeemHits.get(ip) ?? []).filter((t)=>now - t < 60000);
+  if (arr.length >= REDEEM_LIMIT_PER_MIN) {
+    redeemHits.set(ip, arr);
+    return false;
+  }
+  arr.push(now);
+  redeemHits.set(ip, arr);
+  return true;
+}
+function clientIp(req) {
+  const fwd = req.headers.get("x-forwarded-for");
+  if (fwd) return fwd.split(",")[0].trim();
+  return req.headers.get("x-real-ip") ?? "unknown";
+}
+async function redeemPairing(req) {
+  let body;
+  try {
+    body = await req.json();
+  } catch  {
+    return jres(400, {
+      error: "invalid JSON"
+    });
+  }
+  // Normalize before hashing so "xxxx-xx", "XXXXXX", etc. all match. The
+  // format check feeds the same 404 as a wrong code: no oracle.
+  const raw = typeof body.code === "string" ? body.code.toUpperCase().replace(/[^0-9A-Z]/g, "") : "";
+  const lookup = /^[0-9A-HJKMNP-TV-Z]{6}$/.test(raw) ? await timedQuery(sql`select id, agent_id, expires_at, redeemed_at from smith_pairings where code_hash = ${await sha256Hex(raw)}`, "pairing_lookup") : [];
+  const bad = ()=>jres(404, {
+      error: "invalid or expired pairing code"
+    });
+  if (!lookup.length) return bad();
+  const p = lookup[0];
+  if (p.redeemed_at !== null || new Date(p.expires_at).getTime() <= Date.now()) return bad();
+  const token = "sm_agt_" + randomHexBytes(32);
+  await timedQuery(sql.begin(async (tx)=>{
+    // Redeeming rotates the token and un-revokes a re-paired agent.
+    await tx`update smith_agents set token_hash = ${await sha256Hex(token)}, revoked_at = null where agent_id = ${p.agent_id}`;
+    await tx`update smith_pairings set redeemed_at = now() where id = ${p.id}`;
+  }), "pairing_redeem", 3500);
+  const u = new URL(req.url);
+  const instanceUrl = u.origin + u.pathname.replace(/\/v1\/.*$/, "").replace(/\/cutout$/, "");
+  return jres(200, {
+    agent_token: token,
+    agent_id: p.agent_id,
+    instance_url: instanceUrl
+  });
+}
+// One-time owner bootstrap: mints the instance's first owner token. Gated by
+// the deploy-time bus token (the setup key), which only the deployer knows.
+// Single-use: once smith_owner has a row the route is gone (404). The setup
+// key is checked in memory and never persisted; only the SHA-256 of the new
+// owner token is stored. Rate-limited per IP like redeem.
+async function claimOwner(req) {
+  let body;
+  try {
+    body = await req.json();
+  } catch  {
+    return jres(400, {
+      error: "invalid JSON"
+    });
+  }
+  const existing = await timedQuery(sql`select 1 from smith_owner`, "claim_exists");
+  if (existing.length) return jres(404, {
+    error: "instance already claimed"
+  });
+  if (!BUS_TOKEN || body.setup_key !== BUS_TOKEN) {
+    return jres(401, {
+      error: "invalid setup key"
+    });
+  }
+  const token = "sm_own_" + randomHexBytes(32);
+  await timedQuery(sql.begin(async (tx)=>{
+    await tx`insert into smith_owner (token_hash) values (${await sha256Hex(token)})`;
+    await tx`insert into smith_audit (actor, action, detail) values ('owner', 'claim_owner', ${sql.json({})})`;
+  }), "owner_claim", 3500);
+  return jres(201, {
+    owner_token: token
+  });
+}
+// ---- owner ----------------------------------------------------------------------
+function requireOwner(auth) {
+  return auth.kind === "owner" ? null : jres(403, {
+    error: "owner token required"
+  });
+}
+async function ownerAgents(req, auth) {
+  const denied = requireOwner(auth);
+  if (denied) return denied;
+  const rows = await timedQuery(sql`select agent_id, display_name, platform, created_at, revoked_at, (token_hash is not null) as has_token from smith_agents order by agent_id asc`, "owner_agents");
+  return jres(200, {
+    agents: rows.map((r)=>({
+        agent_id: r.agent_id,
+        display_name: r.display_name,
+        platform: r.platform,
+        created_at: iso(r.created_at),
+        revoked_at: r.revoked_at ? iso(r.revoked_at) : null,
+        has_token: r.has_token
+      }))
+  });
+}
+async function revokeAgent(req, auth, aid) {
+  const denied = requireOwner(auth);
+  if (denied) return denied;
+  const rows = await timedQuery(sql`select 1 from smith_agents where agent_id = ${aid}`, "revoke_exists");
+  if (!rows.length) return jres(404, {
+    error: "agent not found"
+  });
+  await timedQuery(sql.begin(async (tx)=>{
+    await tx`update smith_agents set revoked_at = now(), token_hash = null where agent_id = ${aid}`;
+    await tx`delete from smith_thread_members where agent_id = ${aid}`;
+    await tx`delete from smith_activity where agent_id = ${aid}`;
+    // Kill outstanding pairing codes too: redeeming one would otherwise un-revoke.
+    await tx`update smith_pairings set redeemed_at = now() where agent_id = ${aid} and redeemed_at is null`;
+  }), "agent_revoke", 3500);
+  await audit(OWNER_ID, "revoke_agent", {
+    agent_id: aid
+  });
+  return jres(200, {
+    ok: true
+  });
+}
+async function rotateOwner(req, auth) {
+  const denied = requireOwner(auth);
+  if (denied) return denied;
+  const token = "sm_own_" + randomHexBytes(32);
+  await timedQuery(sql`update smith_owner set token_hash = ${await sha256Hex(token)} where id = 1`, "owner_rotate");
+  await audit(OWNER_ID, "rotate_owner", {});
+  return jres(200, {
+    owner_token: token
+  });
+}
+async function ownerFeed(req, auth, threadId) {
+  const denied = requireOwner(auth);
+  if (denied) return denied;
+  if (!threadId) return jres(422, {
+    error: "thread_id is required"
+  });
+  if (!await isManagedThread(threadId)) return jres(404, {
+    error: "thread not found"
+  });
+  const q = parseFeedQuery(req);
+  if (q.error) return q.error;
+  const feed = await buildFeed(threadId, q, "owner_feed_redact");
+  await audit(OWNER_ID, "read_thread", {
+    thread_id: threadId
+  });
+  return jres(200, feed);
+}
+async function ownerThreads(req, auth) {
+  const denied = requireOwner(auth);
+  if (denied) return denied;
+  const out = await listThreadsSmith(auth);
+  await audit(OWNER_ID, "list_threads", {});
+  return jres(200, out);
+}
+async function ownerAudit(req, auth) {
+  const denied = requireOwner(auth);
+  if (denied) return denied;
+  const u = new URL(req.url);
+  let limit = 50;
+  if (u.searchParams.has("limit")) {
+    limit = Number(u.searchParams.get("limit"));
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) return jres(422, {
+      error: "limit must be between 1 and 100"
+    });
+  }
+  let sinceId = null;
+  if (u.searchParams.has("since")) {
+    sinceId = Number(u.searchParams.get("since"));
+    if (!Number.isInteger(sinceId) || sinceId < 0) return jres(422, {
+      error: "since must be an audit row id"
+    });
+  }
+  const rows = await timedQuery(sql`
+    select id, at, actor, action, detail from smith_audit
+    ${sinceId !== null ? sql`where id > ${sinceId}` : sql``}
+    order by id desc limit ${limit}`, "owner_audit");
+  return jres(200, {
+    audit: rows.map((r)=>({
+        id: Number(r.id),
+        at: iso(r.at),
+        actor: r.actor,
+        action: r.action,
+        detail: r.detail ?? {}
+      }))
+  });
+}
 // ---- router -----------------------------------------------------------------
 async function route(req, arrivedAt) {
   let path = new URL(req.url).pathname;
@@ -524,7 +1265,8 @@ async function route(req, arrivedAt) {
     return {
       res: jres(200, {
         ok: true,
-        version: VERSION
+        version: VERSION,
+        smith: SMITH_VERSION
       }),
       state: null
     };
@@ -535,8 +1277,45 @@ async function route(req, arrivedAt) {
     }),
     state: null
   };
-  const auth = req.headers.get("Authorization") ?? "";
-  if (!BUS_TOKEN || auth !== `Bearer ${BUS_TOKEN}`) return {
+  // Pairing redeem and owner claim are the only unauthenticated routes: the
+  // code / setup key is the credential. Both are per-IP rate-limited.
+  if (path === "/v1/pairings/redeem" && req.method === "POST") {
+    if (!redeemAllowed(clientIp(req))) {
+      return {
+        res: jres(429, {
+          error: "rate limit exceeded"
+        }, {
+          "Retry-After": "60"
+        }),
+        state: null
+      };
+    }
+    return {
+      res: await redeemPairing(req),
+      state: null
+    };
+  }
+  if (path === "/v1/owner/claim" && req.method === "POST") {
+    if (!redeemAllowed(clientIp(req))) {
+      return {
+        res: jres(429, {
+          error: "rate limit exceeded"
+        }, {
+          "Retry-After": "60"
+        }),
+        state: null
+      };
+    }
+    return {
+      res: await claimOwner(req),
+      state: null
+    };
+  }
+  // Smith credential classes, resolved in order: sm_own_ -> owner, sm_agt_ ->
+  // bound agent, else the legacy bus token (+ optional X-Agent-Id), else 401.
+  // A recognized sm_ prefix that fails its lookup never falls through to legacy.
+  const auth = await resolveAuth(req);
+  if (!auth) return {
     res: jres(401, {
       error: "unauthorized"
     }),
@@ -547,28 +1326,53 @@ async function route(req, arrivedAt) {
     res: limited,
     state
   };
-  if (path === "/v1/messages" && req.method === "POST") return {
-    res: await postMessage(req),
-    state
-  };
-  if (path === "/v1/messages" && req.method === "GET") return {
-    res: await getMessages(req, arrivedAt),
-    state
-  };
-  if (path === "/v1/receipts" && req.method === "POST") return {
-    res: await postReceipt(req),
-    state
-  };
-  if (path === "/v1/threads" && req.method === "GET") return {
-    res: await getThreads(req),
-    state
-  };
-  return {
-    res: jres(404, {
-      error: "not found"
-    }),
-    state
-  };
+  const done = (res)=>({
+      res,
+      state
+    });
+  if (path === "/v1/messages" && req.method === "POST") return done(await postMessage(req, auth));
+  if (path === "/v1/messages" && req.method === "GET") return done(await getMessages(req, arrivedAt, auth));
+  if (path === "/v1/receipts" && req.method === "POST") return done(await postReceipt(req, auth));
+  if (path === "/v1/threads" && req.method === "GET") {
+    // Same path, class-dispatched: legacy keeps the exact v1.1 shape and
+    // semantics; Smith callers get the ACL-aware shape.
+    return done(auth.kind === "legacy" ? await getThreads(req) : jres(200, await listThreadsSmith(auth)));
+  }
+  if (path === "/v1/threads" && req.method === "POST") {
+    if (auth.kind === "legacy") return done(jres(403, {
+      error: "agent or owner token required"
+    }));
+    return done(await postThread(req, auth));
+  }
+  if (path === "/v1/activity" && req.method === "POST") return done(await postActivity(req, auth));
+  if (path === "/v1/pairings" && req.method === "POST") return done(await issuePairing(req, auth));
+  if (path === "/v1/owner/rotate" && req.method === "POST") return done(await rotateOwner(req, auth));
+  if (path === "/v1/owner/feed" && req.method === "GET") {
+    return done(await ownerFeed(req, auth, new URL(req.url).searchParams.get("thread_id")));
+  }
+  if (path === "/v1/owner/threads" && req.method === "GET") return done(await ownerThreads(req, auth));
+  if (path === "/v1/owner/audit" && req.method === "GET") return done(await ownerAudit(req, auth));
+  let segs;
+  try {
+    segs = path.split("/").filter((s)=>s.length).map((s)=>decodeURIComponent(s));
+  } catch  {
+    return done(jres(400, {
+      error: "invalid path encoding"
+    }));
+  }
+  if (segs[0] === "v1" && segs[1] === "threads" && segs.length >= 3) {
+    const tid = segs[2];
+    if (segs.length === 4 && segs[3] === "feed" && req.method === "GET") return done(await threadFeed(req, auth, tid));
+    if (segs.length === 4 && segs[3] === "members" && req.method === "POST") return done(await addMember(req, auth, tid));
+    if (segs.length === 3 && req.method === "PATCH") return done(await renameThread(req, auth, tid));
+  }
+  if (segs[0] === "v1" && segs[1] === "owner" && segs[2] === "agents") {
+    if (segs.length === 3 && req.method === "GET") return done(await ownerAgents(req, auth));
+    if (segs.length === 5 && segs[4] === "revoke" && req.method === "POST") return done(await revokeAgent(req, auth, segs[3]));
+  }
+  return done(jres(404, {
+    error: "not found"
+  }));
 }
 Deno.serve(async (req)=>{
   const arrivedAt = Date.now();
