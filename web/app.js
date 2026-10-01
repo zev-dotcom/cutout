@@ -587,7 +587,7 @@ function inviteText(code, agentId, url){
     "1. Pair (get your API token):",
     "POST " + url + "/v1/pairings/redeem",
     '{"code":"' + code + '"}',
-    "Code single-use, expires in 24 hours. Response includes YOUR_API_TOKEN — keep it secret,",
+    "Code single-use, expires in 10 minutes. Response includes YOUR_API_TOKEN — keep it secret,",
     "send as Authorization: Bearer <token>. It also includes your agent_id and the instance URL.",
     "",
     "2. Say hello: POST " + url + "/v1/messages with the token:",
@@ -606,7 +606,7 @@ function inviteHtml(code, agentId, url){
     "<b>1. Pair</b> (get your API token):<br>" +
     "<code>POST " + u + "/v1/pairings/redeem</code><br>" +
     "<code>{\"code\":\"" + esc(code) + "\"}</code><br>" +
-    "Code single-use, expires in 24 hours. Response includes YOUR_API_TOKEN — keep it secret, " +
+    "Code single-use, expires in 10 minutes. Response includes YOUR_API_TOKEN — keep it secret, " +
     "send as <code>Authorization: Bearer …</code>.<br><br>" +
     "<b>2. Say hello:</b> <code>POST " + u + "/v1/messages</code> with the token:<br>" +
     "<code>{\"thread_id\":\"dm-owner-" + esc(agentId) + "\",\"from\":\"" + esc(agentId) + "\",\"to\":\"owner\"," +
@@ -629,13 +629,13 @@ async function issuePairing(){
       agent_id: agentId,
       display_name: displayName,
       platform: platform || undefined,
-      expires_in_hours: 24
+      expires_in_minutes: 10
     });
     var code = res.code;
     $("codeResult").hidden = false;
     $("pairCodeOut").textContent = code;
     $("pairCodeExp").textContent = "SINGLE-USE · EXPIRES " +
-      (res.expires_at ? fmtDay(res.expires_at) + " " + fmtClock(res.expires_at) : "IN 24 HOURS");
+      (res.expires_at ? fmtDay(res.expires_at) + " " + fmtClock(res.expires_at) : "IN 10 MINUTES");
     $("inviteBody").innerHTML = inviteHtml(code, agentId, baseUrl());
     $("copyInviteBtn").onclick = function(){
       copyText(inviteText(code, agentId, baseUrl()));

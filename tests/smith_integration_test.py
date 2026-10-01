@@ -5,29 +5,50 @@ Boots supabase/index.ts under Deno against a real local Postgres (schemas
 already applied), then exercises the Smith contract end to end:
 
   1. /health gains "smith": "1.0"
-  2. Owner claim: wrong key 401, right key 201 (token once), second claim 404
-  3. Pairing issue -> redeem round trip; double redeem 404 (no oracle)
+  2. Owner claim: separate setup key checked first; wrong key and
+     already-claimed return the identical 404 (no claimed-state oracle);
+     the bus token is NOT accepted as the setup key
+  3. Pairing issue -> redeem round trip; double redeem 404 (no oracle);
+     default code lifetime is 10 minutes
   4. Agent token binds identity: from-mismatch 403, header spoof ignored
   5. Cross-agent thread isolation
-  6. Owner send creates an audit row
-  7. Activity expiry evaluated on read (backdated row -> no working)
-  8. Revoked token 401s
-  9. Legacy cutout.py behavior intact (legacy token + X-Agent-Id)
+  6. Strict legacy mode: bus token + X-Agent-Id is refused on managed
+     threads for read, write, feed, and message-list paths
+  7. Member-add is owner-only and audited; non-member heartbeat 403
+  8. Owner send creates an audit row; owner reads are fail-closed
+     (denied when the audit write fails); failed owner auth is audited
+  9. smith_audit is append-only at the DB level (UPDATE/DELETE rejected)
+ 10. Pairing: atomic concurrent redeem (exactly one winner), per-code
+     lockout, global brute-force budget that ignores X-Forwarded-For
+ 11. Seeded legacy agent rows (token_hash null) may be paired (no 409)
+ 12. Revocation applies on the legacy path too
+ 13. Legacy-unverified provenance is surfaced; owner can verify members
+ 14. Activity expiry evaluated on read (backdated row -> no working)
+ 15. Legacy cutout.py behavior intact on unmanaged threads
 
 Setup: Postgres with schema.sql + schema_v1.1.sql + schema_smith.sql applied,
-then: SUPABASE_DB_URL=... CUTOUT_TOKEN=<key> deno run -A supabase/index.ts
-Run:  python3 tests/smith_integration_test.py [base_url] [setup_key]
+then e.g.:
+  SUPABASE_DB_URL=... CUTOUT_TOKEN=<bus> SMITH_SETUP_KEY=<setup> \\
+  SMITH_LEGACY_STRICT=1 SMITH_REDEEM_BUDGET_PER_HOUR=40 \\
+  SMITH_REDEEM_CODE_LOCKOUT_AFTER=3 SMITH_CLAIM_BUDGET_PER_HOUR=20 \\
+  deno run -A supabase/index.ts
+Run:  python3 tests/smith_integration_test.py [base_url] [setup_key] [bus_token]
 """
 
+import hashlib
 import json
+import os
+import subprocess
 import sys
+import threading
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timedelta, timezone
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 SETUP_KEY = sys.argv[2] if len(sys.argv) > 2 else "test-setup-key-001"
+BUS_TOKEN = sys.argv[3] if len(sys.argv) > 3 else "test-bus-token-001"
 
 PASS = []
 FAIL = []
@@ -63,22 +84,55 @@ def bearer(tok):
     return {"Authorization": f"Bearer {tok}"}
 
 
+_pg = "/usr/local/lib/python3.12/dist-packages/pgserver/pginstall/bin"
+_env = dict(os.environ, PGPASSWORD="smithtest",
+            PATH=_pg + ":" + os.environ.get("PATH", ""),
+            LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/pgserver/pginstall/lib")
+
+
+def psql(sql, expect_fail=False):
+    """Run SQL directly. Returns (ok, stdout)."""
+    p = subprocess.run([f"{_pg}/psql", "-h", "127.0.0.1", "-p", "5433", "-U", "smithtest",
+                        "-d", "smithtest", "-v", "ON_ERROR_STOP=1", "-tA", "-c", sql],
+                       env=_env, capture_output=True, text=True)
+    ok = p.returncode == 0
+    if expect_fail:
+        return (not ok, (p.stderr or p.stdout).strip())
+    return ok, (p.stdout or p.stderr).strip()
+
+
+def legacy_headers(agent_id=None, extra=None):
+    h = {"Authorization": f"Bearer {BUS_TOKEN}"}
+    if agent_id:
+        h["X-Agent-Id"] = agent_id
+    if extra:
+        h.update(extra)
+    return h
+
+
 # 1. health
 s, h = req("GET", "/health")
 check("health 200 + smith field", s == 200 and h.get("smith") == "1.0", f"{s} {h}")
 
-# 2. owner claim
-s, _ = req("POST", "/v1/owner/claim", {"setup_key": "wrong-key"})
-check("claim wrong key -> 401", s == 401, f"{s}")
+# 2. owner claim: separate setup key, checked first, no oracle
+s, wrong_body = req("POST", "/v1/owner/claim", {"setup_key": "wrong-key"})
+check("claim wrong setup key -> 404", s == 404, f"{s} {wrong_body}")
 s, c = req("POST", "/v1/owner/claim", {"setup_key": SETUP_KEY})
 OWNER = c.get("owner_token") if isinstance(c, dict) else None
-check("claim right key -> 201 + sm_own_ token", s == 201 and OWNER and OWNER.startswith("sm_own_"), f"{s} {c}")
-s, _ = req("POST", "/v1/owner/claim", {"setup_key": SETUP_KEY})
+check("claim right setup key -> 201 + sm_own_ token", s == 201 and OWNER and OWNER.startswith("sm_own_"), f"{s} {c}")
+s, bus_body = req("POST", "/v1/owner/claim", {"setup_key": BUS_TOKEN})
+check("claim with bus token as setup key -> 404 (separation)", s == 404, f"{s} {bus_body}")
+s, again_body = req("POST", "/v1/owner/claim", {"setup_key": SETUP_KEY})
 check("second claim -> 404 forever", s == 404, f"{s}")
+check("wrong-key and already-claimed bodies identical (no oracle)",
+      wrong_body == again_body == {"error": "not found"}, f"{wrong_body} vs {again_body}")
 
 # bad smith token never falls through to legacy
 s, _ = req("GET", "/v1/threads", headers=bearer("sm_own_deadbeef"))
 check("bad sm_own_ token -> 401 (no legacy fallthrough)", s == 401, f"{s}")
+s, au = req("GET", "/v1/owner/audit?limit=20", headers=bearer(OWNER))
+acts = [(r.get("action"), (r.get("detail") or {}).get("credential_class")) for r in au.get("audit", [])]
+check("failed owner auth is audited", ("auth_failed", "owner") in acts, f"{acts}")
 s, _ = req("GET", "/v1/threads", headers=bearer("sm_agt_deadbeef"))
 check("bad sm_agt_ token -> 401 (no legacy fallthrough)", s == 401, f"{s}")
 
@@ -87,7 +141,14 @@ s, p = req("POST", "/v1/pairings",
            {"agent_id": "agent-a", "display_name": "Agent A", "platform": "Muse"},
            bearer(OWNER))
 CODE = p.get("code") if isinstance(p, dict) else None
+exp = p.get("expires_at") if isinstance(p, dict) else None
 check("issue pairing -> 201 + code", s == 201 and CODE, f"{s} {p}")
+try:
+    delta = datetime.fromisoformat(exp) - datetime.now(timezone.utc)
+    life_ok = timedelta(minutes=5) < delta < timedelta(minutes=15)
+except Exception:
+    life_ok = False
+check("pairing default lifetime is 10 minutes", life_ok, f"{exp}")
 s, r = req("POST", "/v1/pairings/redeem", {"code": CODE})
 TOK_A = r.get("agent_token") if isinstance(r, dict) else None
 check("redeem -> 200 + sm_agt_ token", s == 200 and TOK_A and TOK_A.startswith("sm_agt_")
@@ -95,12 +156,17 @@ check("redeem -> 200 + sm_agt_ token", s == 200 and TOK_A and TOK_A.startswith("
 s, _ = req("POST", "/v1/pairings/redeem", {"code": CODE})
 check("double redeem -> 404 no oracle", s == 404, f"{s}")
 
-# second agent
+# second + third agents
 s, p2 = req("POST", "/v1/pairings",
             {"agent_id": "agent-b", "display_name": "Agent B", "platform": "Muse"},
             bearer(OWNER))
 s, r2 = req("POST", "/v1/pairings/redeem", {"code": p2["code"]})
 TOK_B = r2["agent_token"]
+s, p3 = req("POST", "/v1/pairings",
+            {"agent_id": "agent-c", "display_name": "Agent C", "platform": "Muse"},
+            bearer(OWNER))
+s, r3 = req("POST", "/v1/pairings/redeem", {"code": p3["code"]})
+TOK_C = r3["agent_token"]
 
 # 4. agent identity binding
 s, t = req("POST", "/v1/threads", {"name": "a-thread", "member_ids": []}, bearer(TOK_A))
@@ -122,6 +188,17 @@ s, _ = req("POST", "/v1/messages",
            {**bearer(TOK_A), "X-Agent-Id": "agent-b"})
 check("X-Agent-Id spoof ignored for token-bound agent", s in (200, 201), f"{s}")
 
+# 6. strict legacy mode: the shared bus token is refused on managed threads
+s, b = req("GET", f"/v1/threads/{TH_A}/feed", headers=legacy_headers("agent-a"))
+check("strict: legacy+X-Agent-Id cannot read managed thread feed -> 403",
+      s == 403 and b.get("error") == "legacy credentials not accepted on managed threads", f"{s} {b}")
+s, b = req("POST", "/v1/messages",
+           {"from": "agent-a", "thread_id": TH_A, "to": "*", "type": "note", "body": "legacy write",
+            "idempotency_key": "klw-" + uuid.uuid4().hex}, legacy_headers("agent-a"))
+check("strict: legacy+X-Agent-Id cannot write to managed thread -> 403", s == 403, f"{s} {b}")
+s, b = req("GET", f"/v1/messages?thread_id={TH_A}", headers=legacy_headers("agent-a"))
+check("strict: legacy cannot scope legacy message-list to managed thread -> 403", s == 403, f"{s} {b}")
+
 # 5. cross-agent isolation
 s, _ = req("GET", f"/v1/threads/{TH_A}/feed", headers=bearer(TOK_B))
 check("agent B cannot read agent A's thread", s == 403, f"{s}")
@@ -129,7 +206,20 @@ s, tl = req("GET", "/v1/threads", headers=bearer(TOK_B))
 ids = [e["thread_id"] for e in (tl if isinstance(tl, list) else [])]
 check("agent B thread list excludes A's thread", TH_A not in ids, f"{ids}")
 
-# 6. owner send -> audit row
+# 7. member-add is owner-only and audited; non-member heartbeat denied
+s, _ = req("POST", f"/v1/threads/{TH_A}/members", {"agent_id": "agent-c"}, bearer(TOK_A))
+check("member-add by non-owner -> 403", s == 403, f"{s}")
+s, _ = req("POST", "/v1/activity", {"thread_id": TH_A, "state": "working"}, bearer(TOK_C))
+check("non-member activity heartbeat -> 403", s == 403, f"{s}")
+s, madd = req("POST", f"/v1/threads/{TH_A}/members", {"agent_id": "agent-c"}, bearer(OWNER))
+check("owner member-add -> 200", s == 200 and madd.get("agent_id") == "agent-c", f"{s} {madd}")
+s, au = req("GET", "/v1/owner/audit?limit=20", headers=bearer(OWNER))
+acts = [r.get("action") for r in au.get("audit", [])]
+check("member-add is audited", "add_member" in acts, f"{acts}")
+s, _ = req("POST", "/v1/activity", {"thread_id": TH_A, "state": "working"}, bearer(TOK_C))
+check("member heartbeat works after owner add -> 200", s == 200, f"{s}")
+
+# 8. owner send -> audit row; owner reads use owner routes
 s, _ = req("POST", "/v1/messages",
            {"from": "owner", "thread_id": TH_A, "to": "*", "type": "note", "body": "owner says hi",
             "idempotency_key": "ko-" + uuid.uuid4().hex}, bearer(OWNER))
@@ -138,48 +228,150 @@ s, au = req("GET", "/v1/owner/audit?limit=20", headers=bearer(OWNER))
 acts = [r.get("action") for r in (au.get("audit", au) if isinstance(au, dict) else au)]
 check("owner send created audit row", "send_message" in acts, f"{acts}")
 
-# owner reads must use owner routes
 s, _ = req("GET", "/v1/messages", headers=bearer(OWNER))
 check("owner GET /v1/messages -> 403 pointer", s == 403, f"{s}")
 s, of = req("GET", f"/v1/owner/feed?thread_id={TH_A}", headers=bearer(OWNER))
 check("owner feed works + is audited", s == 200 and isinstance(of, dict), f"{s}")
 
-# 7. activity expiry evaluated on read
+# 8b. owner reads are fail-closed: break audit inserts, reads must be denied
+ok, _ = psql("CREATE TRIGGER boom BEFORE INSERT ON smith_audit FOR EACH ROW "
+             "EXECUTE FUNCTION smith_audit_deny_write();")
+check("psql: boom trigger installed", ok)
+s, b = req("GET", f"/v1/owner/feed?thread_id={TH_A}", headers=bearer(OWNER))
+check("owner feed denied when audit write fails -> 500, no data",
+      s == 500 and b.get("error") == "audit unavailable", f"{s} {b}")
+s, b = req("GET", "/v1/owner/threads", headers=bearer(OWNER))
+check("owner threads denied when audit write fails -> 500", s == 500, f"{s} {b}")
+ok, _ = psql("DROP TRIGGER boom ON smith_audit;")
+check("psql: boom trigger dropped", ok)
+s, _ = req("GET", f"/v1/owner/feed?thread_id={TH_A}", headers=bearer(OWNER))
+check("owner feed works again after trigger dropped", s == 200, f"{s}")
+
+# 9. smith_audit is append-only at the DB level
+ok, err = psql("UPDATE smith_audit SET action = 'tampered';", expect_fail=True)
+check("DB rejects UPDATE on smith_audit", ok and "append-only" in err, err[:120])
+ok, err = psql("DELETE FROM smith_audit;", expect_fail=True)
+check("DB rejects DELETE on smith_audit", ok and "append-only" in err, err[:120])
+
+# 14. activity expiry evaluated on read
 s, _ = req("POST", "/v1/activity", {"thread_id": TH_A, "state": "working"}, bearer(TOK_A))
 check("activity heartbeat -> 200", s == 200, f"{s}")
 s, f1 = req("GET", f"/v1/threads/{TH_A}/feed", headers=bearer(TOK_A))
 w1 = [w["agent_id"] for w in f1.get("working", [])]
 check("feed shows working agent", "agent-a" in w1, f"{w1}")
-# simulate a crashed agent: backdate expiry, then read again
-import os
-import subprocess
-_pg = "/usr/local/lib/python3.12/dist-packages/pgserver/pginstall/bin"
-_env = dict(os.environ, PGPASSWORD="smithtest",
-            PATH=_pg + ":" + os.environ.get("PATH", ""),
-            LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/pgserver/pginstall/lib")
-subprocess.run([f"{_pg}/psql", "-h", "127.0.0.1", "-p", "5433", "-U", "smithtest",
-                "-d", "smithtest",
-                "-c", "UPDATE smith_activity SET expires_at = now() - interval '1 second';"],
-               env=_env, capture_output=True)
+ok, _ = psql("UPDATE smith_activity SET expires_at = now() - interval '1 second';")
+check("psql: backdate activity expiry", ok)
 s, f2 = req("GET", f"/v1/threads/{TH_A}/feed", headers=bearer(TOK_A))
 w2 = f2.get("working", [])
 check("expired activity clears from feed on read", w2 == [], f"{w2}")
 
-# 8. revoke -> 401
+# 12. revoke applies on every credential class, including the legacy path
 s, _ = req("POST", "/v1/owner/agents/agent-b/revoke", {}, bearer(OWNER))
 check("revoke agent-b -> 200", s == 200, f"{s}")
 s, _ = req("GET", "/v1/threads", headers=bearer(TOK_B))
 check("revoked token -> 401", s == 401, f"{s}")
+s, _ = req("GET", "/v1/threads", headers=legacy_headers("agent-b"))
+check("revoked identity denied on legacy path -> 401", s == 401, f"{s}")
 
-# 9. legacy cutout.py behavior intact
-LEG = {"Authorization": f"Bearer {SETUP_KEY}", "X-Agent-Id": "legacy-bot"}
+# 11. seeded legacy agent rows (token_hash null) may be paired
+ok, _ = psql("INSERT INTO smith_agents (agent_id, display_name, platform, token_hash, legacy_unverified) "
+             "VALUES ('legacy-seed', 'Legacy Seed', 'unknown', NULL, true);")
+check("psql: seed legacy agent row", ok)
+s, ps = req("POST", "/v1/pairings",
+            {"agent_id": "legacy-seed", "display_name": "Legacy Seed", "platform": "Muse"},
+            bearer(OWNER))
+check("seeded agent can be paired (no 409)", s == 201 and ps.get("code"), f"{s} {ps}")
+s, rs = req("POST", "/v1/pairings/redeem", {"code": ps["code"]})
+check("seeded agent redeem works", s == 200 and rs.get("agent_id") == "legacy-seed", f"{s} {rs}")
+
+# 10a. concurrent redeem: exactly one winner (atomic)
+s, pd = req("POST", "/v1/pairings",
+            {"agent_id": "agent-d", "display_name": "Agent D", "platform": "Muse"},
+            bearer(OWNER))
+CODE_D = pd["code"]
+results = []
+def race_redeem():
+    st, _ = req("POST", "/v1/pairings/redeem", {"code": CODE_D})
+    results.append(st)
+threads = [threading.Thread(target=race_redeem) for _ in range(10)]
+[t.start() for t in threads]
+[t.join() for t in threads]
+check("concurrent redeem: exactly one 200, rest 404",
+      results.count(200) == 1 and results.count(404) == 9, f"{sorted(results)}")
+
+# 10b. per-code lockout: hammering one (expired) code locks it
+s, pe = req("POST", "/v1/pairings",
+            {"agent_id": "agent-e", "display_name": "Agent E", "platform": "Muse"},
+            bearer(OWNER))
+CODE_E = pe["code"]
+EHASH = hashlib.sha256(CODE_E.replace("-", "").encode()).hexdigest()
+ok, _ = psql(f"UPDATE smith_pairings SET expires_at = now() - interval '1 minute' "
+             f"WHERE code_hash = '{EHASH}';")
+check("psql: expire code E", ok)
+ok, _ = psql("TRUNCATE smith_auth_attempts;")
+check("psql: reset attempt table", ok)
+for _ in range(3):  # SMITH_REDEEM_CODE_LOCKOUT_AFTER=3 in the test env
+    s, _ = req("POST", "/v1/pairings/redeem", {"code": CODE_E})
+    assert s == 404, s
+ok, out = psql(f"SELECT locked_at IS NOT NULL FROM smith_pairings WHERE code_hash = '{EHASH}';")
+check("code locked after lockout threshold", ok and out.strip() == "t", out)
+s, _ = req("POST", "/v1/pairings/redeem", {"code": CODE_E})
+check("locked code stays 404", s == 404, f"{s}")
+
+# 10c. global brute-force budget ignores X-Forwarded-For
+ok, _ = psql("TRUNCATE smith_auth_attempts;")
+check("psql: reset attempt table", ok)
+got_429 = False
+for i in range(41):  # SMITH_REDEEM_BUDGET_PER_HOUR=40 in the test env
+    s, _ = req("POST", "/v1/pairings/redeem", {"code": "BBBBBB"},
+               headers={"X-Forwarded-For": f"10.9.9.{i}"})
+    if s == 429:
+        got_429 = True
+        break
+    assert s == 404, (i, s)
+check("global budget trips despite rotating forged X-Forwarded-For -> 429", got_429, "")
+# a fresh code cannot be redeemed while the instance is locked out
+s, _ = req("POST", "/v1/pairings/redeem", {"code": "CCCCCC"})
+check("redeem locked out at budget -> 429", s == 429, f"{s}")
+ok, _ = psql("TRUNCATE smith_auth_attempts;")
+check("psql: reset attempt table", ok)
+
+# 13. legacy-unverified provenance is surfaced; owner can verify
+ok, _ = psql("INSERT INTO smith_agents (agent_id, display_name, platform, token_hash, legacy_unverified) "
+             "VALUES ('legacy-ghost', 'Legacy Ghost', 'unknown', NULL, true);")
+check("psql: seed legacy-ghost agent", ok)
+s, tg = req("POST", "/v1/threads", {"name": "ghost-thread", "member_ids": ["legacy-ghost"]}, bearer(TOK_A))
+TH_G = tg.get("thread_id") if isinstance(tg, dict) else None
+members = tg.get("members", []) if isinstance(tg, dict) else []
+ghost = next((m for m in members if m.get("agent_id") == "legacy-ghost"), None)
+check("thread create surfaces legacy_unverified on members",
+      s == 201 and ghost is not None and "legacy_unverified" in ghost, f"{s} {ghost}")
+s, ag = req("GET", "/v1/owner/agents", headers=bearer(OWNER))
+ghosts = [a for a in ag.get("agents", []) if a.get("agent_id") == "legacy-ghost"]
+check("owner agents list surfaces legacy_unverified",
+      len(ghosts) == 1 and ghosts[0].get("legacy_unverified") is True, f"{ghosts}")
+s, _ = req("POST", f"/v1/owner/threads/{TH_G}/members/legacy-ghost/verify", {}, bearer(OWNER))
+check("owner verify member -> 200", s == 200, f"{s}")
+ok, out = psql(f"SELECT legacy_unverified FROM smith_thread_members "
+               f"WHERE thread_id = '{TH_G}' AND agent_id = 'legacy-ghost';")
+check("member flag cleared after verify", ok and out.strip() == "f", out)
+s, au = req("GET", "/v1/owner/audit?limit=20", headers=bearer(OWNER))
+acts = [r.get("action") for r in au.get("audit", [])]
+check("verify_member is audited", "verify_member" in acts, f"{acts}")
+
+# 15. legacy cutout.py behavior intact on unmanaged threads
+LEG = legacy_headers("legacy-bot")
 s, _ = req("POST", "/v1/messages",
            {"from": "legacy-bot", "thread_id": "cutout", "to": "*", "type": "note", "body": "legacy ping",
             "idempotency_key": "kl-" + uuid.uuid4().hex}, LEG)
 check("legacy post via bus token + X-Agent-Id", s in (200, 201), f"{s}")
-s, lt = req("GET", "/v1/threads", headers={"Authorization": f"Bearer {SETUP_KEY}"})
+s, lt = req("GET", "/v1/threads", headers={"Authorization": f"Bearer {BUS_TOKEN}"})
 check("legacy GET /v1/threads keeps v1.1 shape", s == 200 and isinstance(lt, dict)
       and isinstance(lt.get("threads"), list), f"{s} {type(lt)}")
+s, lm = req("GET", "/v1/messages?limit=50", headers=LEG)
+managed_leak = [m for m in lm.get("messages", []) if m.get("thread_id") == TH_A]
+check("strict: legacy message list excludes managed threads",
+      s == 200 and not managed_leak, f"{s} leaked={len(managed_leak)}")
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:

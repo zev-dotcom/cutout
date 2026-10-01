@@ -8,8 +8,10 @@ create table if not exists smith_agents (
   platform     text not null default 'unknown',        -- Muse, Instinct, Grokbot…
   token_hash   text unique,                           -- sha256 hex of sm_agt_ token; null = known id, no Smith token yet
   created_at   timestamptz not null default now(),
-  revoked_at   timestamptz
+  revoked_at   timestamptz,
+  legacy_unverified boolean not null default false     -- true when seeded from unverified legacy sender fields
 );
+alter table smith_agents add column if not exists legacy_unverified boolean not null default false;
 create index if not exists smith_agents_token_idx on smith_agents (token_hash);
 
 create table if not exists smith_pairings (
@@ -18,8 +20,20 @@ create table if not exists smith_pairings (
   agent_id    text not null references smith_agents(agent_id),
   expires_at  timestamptz not null,
   redeemed_at timestamptz,
+  locked_at   timestamptz,                             -- set after too many failed redeem attempts
   created_at  timestamptz not null default now()
 );
+alter table smith_pairings add column if not exists locked_at timestamptz;
+
+-- Failed unauthenticated auth attempts (pairing redeem, owner claim).
+-- Backs the global brute-force budgets; pruned to the last hour on each attempt.
+create table if not exists smith_auth_attempts (
+  id        bigserial primary key,
+  kind      text not null,                             -- 'redeem' or 'claim'
+  code_hash text,                                      -- redeem code hash; null for claim/invalid
+  at        timestamptz not null default now()
+);
+create index if not exists smith_auth_attempts_kind_at_idx on smith_auth_attempts (kind, at desc);
 
 create table if not exists smith_threads (
   thread_id  text primary key,
@@ -32,8 +46,10 @@ create table if not exists smith_thread_members (
   thread_id text not null references smith_threads(thread_id) on delete cascade,
   agent_id  text not null,
   added_at  timestamptz not null default now(),
+  legacy_unverified boolean not null default false,    -- true when seeded from unverified legacy sender fields
   primary key (thread_id, agent_id)
 );
+alter table smith_thread_members add column if not exists legacy_unverified boolean not null default false;
 create index if not exists smith_members_agent_idx on smith_thread_members (agent_id);
 
 create table if not exists smith_activity (
@@ -65,27 +81,39 @@ create index if not exists smith_audit_at_idx on smith_audit (at desc);
 
 -- Migrate every pre-existing thread into managed threads, seeding members
 -- from the agent ids already seen on each thread (excluding broadcasts).
+-- Seeded rows are marked legacy_unverified: the owner reviews them (see the
+-- verify_member owner route) before treating membership as authoritative.
 insert into smith_threads (thread_id, created_by)
 select distinct thread_id, null from cutout.messages
 on conflict (thread_id) do nothing;
 
-insert into smith_thread_members (thread_id, agent_id)
-select distinct thread_id, from_agent from cutout.messages
+insert into smith_thread_members (thread_id, agent_id, legacy_unverified)
+select distinct thread_id, from_agent, true from cutout.messages
 where from_agent is not null and from_agent <> '*'
 on conflict do nothing;
 
-insert into smith_thread_members (thread_id, agent_id)
-select distinct thread_id, to_agent from cutout.messages
+insert into smith_thread_members (thread_id, agent_id, legacy_unverified)
+select distinct thread_id, to_agent, true from cutout.messages
 where to_agent is not null and to_agent <> '*'
 on conflict do nothing;
 
 -- Seed agent rows for ids already on the bus so re-pairing is a rotation,
 -- not a duplicate. token_hash stays null until the owner issues a pairing
 -- code; null means "known id, no Smith token yet".
-insert into smith_agents (agent_id, display_name, platform, token_hash)
-select distinct from_agent, from_agent, 'unknown', null from cutout.messages
+insert into smith_agents (agent_id, display_name, platform, token_hash, legacy_unverified)
+select distinct from_agent, from_agent, 'unknown', null, true from cutout.messages
 where from_agent is not null and from_agent <> '*'
 on conflict (agent_id) do nothing;
+
+-- Append-only audit log: no route deletes rows, and the database itself
+-- rejects UPDATE and DELETE so a compromised function cannot rewrite history.
+create or replace function smith_audit_deny_write() returns trigger as $$
+begin
+  raise exception 'smith_audit is append-only';
+end; $$ language plpgsql;
+drop trigger if exists smith_audit_no_update_delete on smith_audit;
+create trigger smith_audit_no_update_delete before update or delete on smith_audit
+  for each row execute function smith_audit_deny_write();
 
 alter table smith_agents enable row level security;
 alter table smith_pairings enable row level security;
@@ -94,3 +122,4 @@ alter table smith_thread_members enable row level security;
 alter table smith_activity enable row level security;
 alter table smith_owner enable row level security;
 alter table smith_audit enable row level security;
+alter table smith_auth_attempts enable row level security;

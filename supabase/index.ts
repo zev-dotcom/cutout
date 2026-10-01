@@ -323,8 +323,13 @@ async function postMessage(req, auth) {
   }
   if (await isManagedThread(body.thread_id)) {
     if (auth.kind === "legacy") {
-      // God token: full access with identity. Only the no-identity case is
-      // denied on managed threads (nothing to attribute the write to).
+      // Strict mode (default): the shared legacy token is refused on managed
+      // threads entirely — otherwise anyone holding it could read or write
+      // any managed thread as any identity. Relax SMITH_LEGACY_STRICT only
+      // during a legacy migration window.
+      if (LEGACY_STRICT) return jres(403, {
+        error: "legacy credentials not accepted on managed threads"
+      });
       if (!auth.agentId) return jres(403, {
         error: "not a thread member"
       });
@@ -416,6 +421,13 @@ async function getMessages(req, arrivedAt, auth) {
       });
     }
   }
+  if (threadId && auth.kind === "legacy" && LEGACY_STRICT && await isManagedThread(threadId)) {
+    // Strict mode: the shared legacy token cannot scope reads on managed
+    // threads (it carries no verifiable membership). Use /v1/threads/:id/feed.
+    return jres(403, {
+      error: "legacy credentials not accepted on managed threads"
+    });
+  }
   let wait = 0, limit = 50;
   if (u.searchParams.has("wait")) {
     wait = Number(u.searchParams.get("wait"));
@@ -446,6 +458,7 @@ async function getMessages(req, arrivedAt, auth) {
       ${threadId ? sql`and thread_id = ${threadId}` : sql``}
       ${to ? sql`and to_agent = ${to}` : scopeAgent ? sql`and (to_agent = ${scopeAgent} or to_agent = '*')` : sql``}
       ${auth.kind === "agent" ? sql`and thread_id in (select thread_id from smith_thread_members where agent_id = ${auth.agentId})` : sql``}
+      ${auth.kind === "legacy" && LEGACY_STRICT ? sql`and not exists (select 1 from smith_threads s where s.thread_id = thread_id)` : sql``}
       order by created_at asc, id asc
       limit ${limit}`;
     return await timedQuery(q, "query_once");
@@ -551,10 +564,15 @@ async function postReceipt(req, auth) {
       error: "agent must match authenticated agent"
     });
   }
-  const exists = await timedQuery(sql`select metadata from cutout.messages where id = ${mid}`, "receipt_exists");
+  const exists = await timedQuery(sql`select thread_id, metadata from cutout.messages where id = ${mid}`, "receipt_exists");
   if (exists.length === 0) return jres(404, {
     error: "message not found"
   });
+  if (auth.kind === "legacy" && LEGACY_STRICT && await isManagedThread(exists[0].thread_id)) {
+    return jres(403, {
+      error: "legacy credentials not accepted on managed threads"
+    });
+  }
   await timedQuery(sql`
     insert into cutout.receipts (message_id, agent, status, at) values (${mid}, ${agent}, ${status}, ${at.toISOString()})
     on conflict (message_id, agent) do update set status = excluded.status, at = excluded.at`, "receipt_write");
@@ -577,6 +595,7 @@ async function getThreads(req) {
           and not exists (select 1 from cutout.receipts r where r.message_id = m.id and r.agent = ${agentId})
       )::int` : sql`0`} as unread
     from cutout.messages m
+    ${LEGACY_STRICT ? sql`where not exists (select 1 from smith_threads s where s.thread_id = m.thread_id)` : sql``}
     group by m.thread_id
     order by last_at desc`, "threads");
   return jres(200, {
@@ -597,12 +616,33 @@ async function getThreads(req) {
 const SMITH_VERSION = "1.0";
 const OWNER_ID = "owner";
 const PAIRING_CODE_LEN = 6;
-const PAIRING_DEFAULT_HOURS = 24;
-const PAIRING_MAX_HOURS = 720; // 30 days
+// Pairing codes default to 10 minutes (short-lived, single-use). The owner
+// may explicitly request longer, up to 30 days.
+const PAIRING_DEFAULT_MINUTES = 10;
+const PAIRING_MAX_MINUTES = 43200; // 30 days
 const ACTIVITY_TTL_SECONDS = 30;
-const REDEEM_LIMIT_PER_MIN = 10;
 const MAX_THREAD_NAME = 200;
 const RESERVED_AGENT_RE = /^owner$/i;
+// Owner bootstrap: a dedicated setup key, separate from the bus token agents
+// hold. Set SMITH_SETUP_KEY at deploy time; it falls back to CUTOUT_TOKEN
+// only when unset (log warns). Agents holding the bus token must never hold
+// the setup key on a live instance.
+const SETUP_KEY = Deno.env.get("SMITH_SETUP_KEY") ?? "";
+const EFFECTIVE_SETUP_KEY = SETUP_KEY || BUS_TOKEN;
+// Strict legacy mode (default on): the legacy bus token (+ X-Agent-Id) is
+// refused on managed-thread routes. Relax only during a legacy migration.
+const LEGACY_STRICT = (Deno.env.get("SMITH_LEGACY_STRICT") ?? "1") === "1";
+// Brute-force budgets for the unauthenticated routes, enforced globally per
+// instance (never keyed on client-supplied X-Forwarded-For). Env-overridable
+// for tests; the defaults assume ~30-bit pairing codes with 10-minute life.
+function intEnv(name, dflt) {
+  const v = Number(Deno.env.get(name));
+  return Number.isInteger(v) && v >= 1 ? v : dflt;
+}
+const REDEEM_BUDGET_PER_HOUR = intEnv("SMITH_REDEEM_BUDGET_PER_HOUR", 120);
+const REDEEM_CODE_LOCKOUT_AFTER = intEnv("SMITH_REDEEM_CODE_LOCKOUT_AFTER", 10);
+const CLAIM_BUDGET_PER_HOUR = intEnv("SMITH_CLAIM_BUDGET_PER_HOUR", 20);
+if (!SETUP_KEY && BUS_TOKEN) console.warn("smith: SMITH_SETUP_KEY unset, owner claim falls back to CUTOUT_TOKEN");
 
 async function sha256Hex(s) {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
@@ -635,10 +675,17 @@ async function resolveAuth(req) {
   const token = m[1];
   if (token.startsWith("sm_own_")) {
     const rows = await timedQuery(sql`select 1 from smith_owner where token_hash = ${await sha256Hex(token)}`, "auth_owner");
-    return rows.length ? {
+    if (rows.length) return {
       kind: "owner",
       agentId: OWNER_ID
-    } : null;
+    };
+    // Failed owner auth attempt: audit it (best-effort), then deny.
+    try {
+      await audit("unknown", "auth_failed", {
+        credential_class: "owner"
+      });
+    } catch  {}
+    return null;
   }
   if (token.startsWith("sm_agt_")) {
     const rows = await timedQuery(sql`select agent_id, revoked_at from smith_agents where token_hash = ${await sha256Hex(token)}`, "auth_agent");
@@ -650,9 +697,24 @@ async function resolveAuth(req) {
   }
   if (BUS_TOKEN && token === BUS_TOKEN) {
     const hid = req.headers.get("X-Agent-Id");
+    const aid = hid && hid.length ? hid : null;
+    if (aid) {
+      // Revocation applies to every credential class, including the legacy
+      // bus-token path: a revoked identity cannot return through it.
+      const rows = await timedQuery(sql`select revoked_at from smith_agents where agent_id = ${aid}`, "auth_legacy_revoked");
+      if (rows.length && rows[0].revoked_at !== null) {
+        try {
+          await audit(aid, "auth_failed", {
+            credential_class: "legacy",
+            reason: "revoked"
+          });
+        } catch  {}
+        return null;
+      }
+    }
     return {
       kind: "legacy",
-      agentId: hid && hid.length ? hid : null
+      agentId: aid
     };
   }
   return null;
@@ -671,13 +733,18 @@ async function isThreadMember(auth, threadId) {
   return rows.length > 0;
 }
 // 404 when the thread is unmanaged, 403 when the caller is not a member, else null.
-// Legacy callers keep the god token: full access with an agent identity; only
-// the no-identity case is denied on managed threads.
+// In strict mode (default) the legacy bus token (+ X-Agent-Id) is refused on
+// managed threads entirely: while agents still hold the shared legacy token,
+// the thread-isolation guarantee would not hold otherwise. Relax
+// SMITH_LEGACY_STRICT only during a legacy migration window.
 async function threadAccess(auth, threadId) {
   if (!await isManagedThread(threadId)) return jres(404, {
     error: "thread not found"
   });
   if (auth.kind === "legacy") {
+    if (LEGACY_STRICT) return jres(403, {
+      error: "legacy credentials not accepted on managed threads"
+    });
     return auth.agentId ? null : jres(403, {
       error: "not a thread member"
     });
@@ -689,13 +756,14 @@ async function threadAccess(auth, threadId) {
 }
 async function memberObjects(threadId) {
   const rows = await timedQuery(sql`
-    select tm.agent_id, a.display_name, a.platform from smith_thread_members tm
+    select tm.agent_id, tm.legacy_unverified, a.display_name, a.platform from smith_thread_members tm
     left join smith_agents a on a.agent_id = tm.agent_id
     where tm.thread_id = ${threadId} order by tm.agent_id asc`, "thread_members");
   return rows.map((r)=>({
       agent_id: r.agent_id,
       display_name: r.display_name ?? r.agent_id,
-      platform: r.platform ?? "unknown"
+      platform: r.platform ?? "unknown",
+      legacy_unverified: r.legacy_unverified === true
     }));
 }
 // ---- threads ----------------------------------------------------------------
@@ -876,8 +944,13 @@ async function renameThread(req, auth, threadId) {
   });
 }
 async function addMember(req, auth, threadId) {
-  const denied = await threadAccess(auth, threadId);
+  // Owner-only: any member could otherwise expose full thread history to
+  // another agent. The add is audited; the new member sees history from here.
+  const denied = requireOwner(auth);
   if (denied) return denied;
+  if (!await isManagedThread(threadId)) return jres(404, {
+    error: "thread not found"
+  });
   let body;
   try {
     body = await req.json();
@@ -898,6 +971,10 @@ async function addMember(req, auth, threadId) {
     error: `unknown or revoked agent: ${aid}`
   });
   await timedQuery(sql`insert into smith_thread_members (thread_id, agent_id) values (${threadId}, ${aid}) on conflict do nothing`, "member_add");
+  await audit(OWNER_ID, "add_member", {
+    thread_id: threadId,
+    agent_id: aid
+  });
   return jres(200, {
     thread_id: threadId,
     agent_id: aid
@@ -1028,22 +1105,24 @@ async function issuePairing(req, auth) {
   if (typeof platform !== "string" || platform.length === 0) return jres(422, {
     error: "platform must be a string"
   });
-  let hours = PAIRING_DEFAULT_HOURS;
-  if (body.expires_in_hours !== undefined && body.expires_in_hours !== null) {
-    hours = Number(body.expires_in_hours);
-    if (!Number.isFinite(hours) || hours <= 0 || hours > PAIRING_MAX_HOURS) {
+  let minutes = PAIRING_DEFAULT_MINUTES;
+  if (body.expires_in_minutes !== undefined && body.expires_in_minutes !== null) {
+    minutes = Number(body.expires_in_minutes);
+    if (!Number.isFinite(minutes) || minutes <= 0 || minutes > PAIRING_MAX_MINUTES) {
       return jres(422, {
-        error: `expires_in_hours must be greater than 0 and at most ${PAIRING_MAX_HOURS}`
+        error: `expires_in_minutes must be greater than 0 and at most ${PAIRING_MAX_MINUTES}`
       });
     }
   }
-  const existing = await timedQuery(sql`select revoked_at from smith_agents where agent_id = ${aid}`, "pairing_agent");
-  if (existing.length && existing[0].revoked_at === null) return jres(409, {
+  const existing = await timedQuery(sql`select revoked_at, token_hash from smith_agents where agent_id = ${aid}`, "pairing_agent");
+  // "Already paired" means an active Smith token exists. Seeded legacy rows
+  // (token_hash null) and revoked rows may be paired: issuing rotates in.
+  if (existing.length && existing[0].revoked_at === null && existing[0].token_hash !== null) return jres(409, {
     error: "agent already paired"
   });
   const code = newPairingCode();
   const pid = "pg_" + ulid();
-  const expiresAt = new Date(Date.now() + hours * 3600 * 1000);
+  const expiresAt = new Date(Date.now() + minutes * 60 * 1000);
   await timedQuery(sql.begin(async (tx)=>{
     if (existing.length) {
       await tx`update smith_agents set display_name = ${body.display_name}, platform = ${platform} where agent_id = ${aid}`;
@@ -1064,25 +1143,26 @@ async function issuePairing(req, auth) {
     expires_at: expiresAt.toISOString()
   });
 }
-// 10 attempts/minute per IP, tracked in memory per isolate. Guards the two
-// unauthenticated routes (pairing redeem, owner claim); the code / setup key
-// is the credential.
-const redeemHits = new Map();
-function redeemAllowed(ip) {
-  const now = Date.now();
-  const arr = (redeemHits.get(ip) ?? []).filter((t)=>now - t < 60000);
-  if (arr.length >= REDEEM_LIMIT_PER_MIN) {
-    redeemHits.set(ip, arr);
-    return false;
-  }
-  arr.push(now);
-  redeemHits.set(ip, arr);
-  return true;
+// Brute-force defense for the unauthenticated routes (pairing redeem, owner
+// claim): a global per-instance attempt budget plus per-code lockout, tracked
+// in smith_auth_attempts. Deliberately NOT keyed on client-supplied
+// X-Forwarded-For, which an attacker controls. Rows older than an hour are
+// pruned on each attempt, so the table stays tiny.
+async function authAttemptPrune(kind) {
+  await timedQuery(sql`delete from smith_auth_attempts where kind = ${kind} and at < now() - interval '1 hour'`, "attempt_prune");
 }
-function clientIp(req) {
-  const fwd = req.headers.get("x-forwarded-for");
-  if (fwd) return fwd.split(",")[0].trim();
-  return req.headers.get("x-real-ip") ?? "unknown";
+async function authBudgetExceeded(kind, budget) {
+  const rows = await timedQuery(sql`select count(*)::int as c from smith_auth_attempts where kind = ${kind} and at > now() - interval '1 hour'`, "attempt_count");
+  return rows[0].c >= budget;
+}
+async function recordAuthFailure(kind, codeHash) {
+  await timedQuery(sql`insert into smith_auth_attempts (kind, code_hash) values (${kind}, ${codeHash})`, "attempt_fail");
+}
+async function lockCodeIfNeeded(codeHash) {
+  const rows = await timedQuery(sql`select count(*)::int as c from smith_auth_attempts where kind = 'redeem' and code_hash = ${codeHash} and at > now() - interval '1 hour'`, "attempt_code");
+  if (rows[0].c >= REDEEM_CODE_LOCKOUT_AFTER) {
+    await timedQuery(sql`update smith_pairings set locked_at = now() where code_hash = ${codeHash} and locked_at is null`, "pairing_lock");
+  }
 }
 async function redeemPairing(req) {
   let body;
@@ -1093,35 +1173,64 @@ async function redeemPairing(req) {
       error: "invalid JSON"
     });
   }
+  await authAttemptPrune("redeem");
+  if (await authBudgetExceeded("redeem", REDEEM_BUDGET_PER_HOUR)) {
+    return jres(429, {
+      error: "rate limit exceeded"
+    }, {
+      "Retry-After": "3600"
+    });
+  }
   // Normalize before hashing so "xxxx-xx", "XXXXXX", etc. all match. The
   // format check feeds the same 404 as a wrong code: no oracle.
   const raw = typeof body.code === "string" ? body.code.toUpperCase().replace(/[^0-9A-Z]/g, "") : "";
-  const lookup = /^[0-9A-HJKMNP-TV-Z]{6}$/.test(raw) ? await timedQuery(sql`select id, agent_id, expires_at, redeemed_at from smith_pairings where code_hash = ${await sha256Hex(raw)}`, "pairing_lookup") : [];
-  const bad = ()=>jres(404, {
+  const codeHash = /^[0-9A-HJKMNP-TV-Z]{6}$/.test(raw) ? await sha256Hex(raw) : null;
+  const bad = async ()=>{
+    await recordAuthFailure("redeem", codeHash);
+    if (codeHash) await lockCodeIfNeeded(codeHash);
+    return jres(404, {
       error: "invalid or expired pairing code"
     });
-  if (!lookup.length) return bad();
-  const p = lookup[0];
-  if (p.redeemed_at !== null || new Date(p.expires_at).getTime() <= Date.now()) return bad();
+  };
+  if (!codeHash) return bad();
   const token = "sm_agt_" + randomHexBytes(32);
-  await timedQuery(sql.begin(async (tx)=>{
-    // Redeeming rotates the token and un-revokes a re-paired agent.
-    await tx`update smith_agents set token_hash = ${await sha256Hex(token)}, revoked_at = null where agent_id = ${p.agent_id}`;
-    await tx`update smith_pairings set redeemed_at = now() where id = ${p.id}`;
-  }), "pairing_redeem", 3500);
+  const tokenHash = await sha256Hex(token);
+  // Atomic redemption: a single conditional UPDATE claims the code. Two
+  // concurrent redeems cannot both win; the loser's update matches zero rows.
+  const INVALID_CODE = Symbol("invalid_code");
+  let redeemed = null;
+  try {
+    await timedQuery(sql.begin(async (tx)=>{
+      const rows = await tx`update smith_pairings set redeemed_at = now()
+        where code_hash = ${codeHash} and redeemed_at is null and locked_at is null and expires_at > now()
+        returning id, agent_id`;
+      if (!rows.length) throw INVALID_CODE;
+      redeemed = rows[0];
+      // Redeeming rotates the token and un-revokes a re-paired agent.
+      await tx`update smith_agents set token_hash = ${tokenHash}, revoked_at = null where agent_id = ${redeemed.agent_id}`;
+    }), "pairing_redeem", 3500);
+  } catch (e) {
+    if (e === INVALID_CODE) return bad();
+    throw e;
+  }
+  await audit(redeemed.agent_id, "redeem_pairing", {
+    pairing_id: redeemed.id
+  });
   const u = new URL(req.url);
   const instanceUrl = u.origin + u.pathname.replace(/\/v1\/.*$/, "").replace(/\/cutout$/, "");
   return jres(200, {
     agent_token: token,
-    agent_id: p.agent_id,
+    agent_id: redeemed.agent_id,
     instance_url: instanceUrl
   });
 }
 // One-time owner bootstrap: mints the instance's first owner token. Gated by
-// the deploy-time bus token (the setup key), which only the deployer knows.
-// Single-use: once smith_owner has a row the route is gone (404). The setup
+// a dedicated setup key (SMITH_SETUP_KEY, falling back to the bus token only
+// when unset), NOT the bus token agents hold. The key is checked FIRST and
+// both failure modes (wrong key, already claimed) return the identical 404,
+// so unauthenticated callers cannot oracle claimed/unclaimed state. The setup
 // key is checked in memory and never persisted; only the SHA-256 of the new
-// owner token is stored. Rate-limited per IP like redeem.
+// owner token is stored.
 async function claimOwner(req) {
   let body;
   try {
@@ -1131,15 +1240,23 @@ async function claimOwner(req) {
       error: "invalid JSON"
     });
   }
-  const existing = await timedQuery(sql`select 1 from smith_owner`, "claim_exists");
-  if (existing.length) return jres(404, {
-    error: "instance already claimed"
-  });
-  if (!BUS_TOKEN || body.setup_key !== BUS_TOKEN) {
-    return jres(401, {
-      error: "invalid setup key"
+  await authAttemptPrune("claim");
+  if (await authBudgetExceeded("claim", CLAIM_BUDGET_PER_HOUR)) {
+    return jres(429, {
+      error: "rate limit exceeded"
+    }, {
+      "Retry-After": "3600"
     });
   }
+  const gone = async ()=>{
+    await recordAuthFailure("claim", null);
+    return jres(404, {
+      error: "not found"
+    });
+  };
+  if (!EFFECTIVE_SETUP_KEY || body.setup_key !== EFFECTIVE_SETUP_KEY) return gone();
+  const existing = await timedQuery(sql`select 1 from smith_owner`, "claim_exists");
+  if (existing.length) return gone();
   const token = "sm_own_" + randomHexBytes(32);
   await timedQuery(sql.begin(async (tx)=>{
     await tx`insert into smith_owner (token_hash) values (${await sha256Hex(token)})`;
@@ -1158,7 +1275,7 @@ function requireOwner(auth) {
 async function ownerAgents(req, auth) {
   const denied = requireOwner(auth);
   if (denied) return denied;
-  const rows = await timedQuery(sql`select agent_id, display_name, platform, created_at, revoked_at, (token_hash is not null) as has_token from smith_agents order by agent_id asc`, "owner_agents");
+  const rows = await timedQuery(sql`select agent_id, display_name, platform, created_at, revoked_at, legacy_unverified, (token_hash is not null) as has_token from smith_agents order by agent_id asc`, "owner_agents");
   return jres(200, {
     agents: rows.map((r)=>({
         agent_id: r.agent_id,
@@ -1166,6 +1283,7 @@ async function ownerAgents(req, auth) {
         platform: r.platform,
         created_at: iso(r.created_at),
         revoked_at: r.revoked_at ? iso(r.revoked_at) : null,
+        legacy_unverified: r.legacy_unverified === true,
         has_token: r.has_token
       }))
   });
@@ -1191,8 +1309,27 @@ async function revokeAgent(req, auth, aid) {
     ok: true
   });
 }
-async function rotateOwner(req, auth) {
+// Owner review of seeded (legacy-unverified) membership: clears the flag once
+// the owner has confirmed the membership is legitimate. Audited.
+async function verifyMember(req, auth, threadId, aid) {
   const denied = requireOwner(auth);
+  if (denied) return denied;
+  if (!await isManagedThread(threadId)) return jres(404, {
+    error: "thread not found"
+  });
+  const rows = await timedQuery(sql`update smith_thread_members set legacy_unverified = false where thread_id = ${threadId} and agent_id = ${aid} returning 1`, "member_verify");
+  if (!rows.length) return jres(404, {
+    error: "member not found"
+  });
+  await audit(OWNER_ID, "verify_member", {
+    thread_id: threadId,
+    agent_id: aid
+  });
+  return jres(200, {
+    ok: true
+  });
+}
+async function rotateOwner(req, auth) {  const denied = requireOwner(auth);
   if (denied) return denied;
   const token = "sm_own_" + randomHexBytes(32);
   await timedQuery(sql`update smith_owner set token_hash = ${await sha256Hex(token)} where id = 1`, "owner_rotate");
@@ -1212,17 +1349,31 @@ async function ownerFeed(req, auth, threadId) {
   });
   const q = parseFeedQuery(req);
   if (q.error) return q.error;
+  // Fail-closed audit: the audit row is written BEFORE the read, and the read
+  // is denied if the audit write fails. No owner read may happen unaudited.
+  try {
+    await audit(OWNER_ID, "read_thread", {
+      thread_id: threadId
+    });
+  } catch  {
+    return jres(500, {
+      error: "audit unavailable"
+    });
+  }
   const feed = await buildFeed(threadId, q, "owner_feed_redact");
-  await audit(OWNER_ID, "read_thread", {
-    thread_id: threadId
-  });
   return jres(200, feed);
 }
 async function ownerThreads(req, auth) {
   const denied = requireOwner(auth);
   if (denied) return denied;
   const out = await listThreadsSmith(auth);
-  await audit(OWNER_ID, "list_threads", {});
+  try {
+    await audit(OWNER_ID, "list_threads", {});
+  } catch  {
+    return jres(500, {
+      error: "audit unavailable"
+    });
+  }
   return jres(200, out);
 }
 async function ownerAudit(req, auth) {
@@ -1241,6 +1392,16 @@ async function ownerAudit(req, auth) {
     sinceId = Number(u.searchParams.get("since"));
     if (!Number.isInteger(sinceId) || sinceId < 0) return jres(422, {
       error: "since must be an audit row id"
+    });
+  }
+  // Fail-closed: audit the read before performing it.
+  try {
+    await audit(OWNER_ID, "read_audit", {
+      limit
+    });
+  } catch  {
+    return jres(500, {
+      error: "audit unavailable"
     });
   }
   const rows = await timedQuery(sql`
@@ -1278,34 +1439,15 @@ async function route(req, arrivedAt) {
     state: null
   };
   // Pairing redeem and owner claim are the only unauthenticated routes: the
-  // code / setup key is the credential. Both are per-IP rate-limited.
+  // code / setup key is the credential. Brute-force budgets are enforced
+  // globally per instance inside each handler (never on X-Forwarded-For).
   if (path === "/v1/pairings/redeem" && req.method === "POST") {
-    if (!redeemAllowed(clientIp(req))) {
-      return {
-        res: jres(429, {
-          error: "rate limit exceeded"
-        }, {
-          "Retry-After": "60"
-        }),
-        state: null
-      };
-    }
     return {
       res: await redeemPairing(req),
       state: null
     };
   }
   if (path === "/v1/owner/claim" && req.method === "POST") {
-    if (!redeemAllowed(clientIp(req))) {
-      return {
-        res: jres(429, {
-          error: "rate limit exceeded"
-        }, {
-          "Retry-After": "60"
-        }),
-        state: null
-      };
-    }
     return {
       res: await claimOwner(req),
       state: null
@@ -1369,6 +1511,9 @@ async function route(req, arrivedAt) {
   if (segs[0] === "v1" && segs[1] === "owner" && segs[2] === "agents") {
     if (segs.length === 3 && req.method === "GET") return done(await ownerAgents(req, auth));
     if (segs.length === 5 && segs[4] === "revoke" && req.method === "POST") return done(await revokeAgent(req, auth, segs[3]));
+  }
+  if (segs[0] === "v1" && segs[1] === "owner" && segs[2] === "threads" && segs.length === 7 && segs[4] === "members" && segs[6] === "verify" && req.method === "POST") {
+    return done(await verifyMember(req, auth, segs[3], segs[5]));
   }
   return done(jres(404, {
     error: "not found"

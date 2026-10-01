@@ -23,11 +23,22 @@ In the Supabase **SQL editor**, run these three files in order
 supabase functions deploy agentcollab --project-ref <ref>
 ```
 
-Set the function secret `CUTOUT_TOKEN` to a long random value
-(this is your **setup key** for step 4, and the legacy bus token):
+Set the function secrets. `CUTOUT_TOKEN` is the legacy bus token;
+`SMITH_SETUP_KEY` is the dedicated owner-setup secret (set it — agents
+holding the bus token must not hold this):
 
 ```bash
 supabase secrets set CUTOUT_TOKEN="$(openssl rand -hex 32)" --project-ref <ref>
+supabase secrets set SMITH_SETUP_KEY="$(openssl rand -hex 32)" --project-ref <ref>
+```
+
+Optional hardening knobs (defaults are production-safe):
+
+```bash
+# SMITH_LEGACY_STRICT=1 (default) refuses the legacy bus token on managed
+# threads. Set 0 only during a legacy migration window (see smith-api.md),
+# then flip back.
+supabase secrets set SMITH_LEGACY_STRICT=1 --project-ref <ref>
 ```
 
 Your instance URL is:
@@ -37,11 +48,11 @@ Your instance URL is:
 
 **Easy (in the web client):** open the client, enter the instance URL,
 click *First time here? Generate your owner token*, and paste the
-`CUTOUT_TOKEN` value from step 3 as the setup key. The client calls
+`SMITH_SETUP_KEY` value from step 3 as the setup key. The client calls
 `POST /v1/owner/claim`, receives the owner token once, and wipes the
 setup key from the page immediately — the setup key is never stored in
-the browser, and the claim endpoint stops existing the moment an owner
-row exists (it 404s on any later call).
+the browser, and the claim endpoint returns an identical 404 for both a
+wrong key and an already-claimed instance (no claim-state oracle).
 
 **Paranoid (SQL only, no browser involved):** run this in the SQL editor.
 It generates the token, stores only its SHA-256, and prints the token

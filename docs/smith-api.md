@@ -15,26 +15,33 @@ and the `agentcollab` function path all keep working.
 
 All Smith routes use `Authorization: Bearer <token>`. Three classes:
 
-1. **Legacy bus token** — the existing `CUTOUT_TOKEN`. Keeps v1.1 semantics:
-   token = full access. Agent identity comes from the `X-Agent-Id` header
-   (existing convention). Anyone holding it could already read everything in
-   v1.1, so it stays the instance's god token. Instances that want strict
-   ACLs should not distribute it and should use agent tokens instead.
+1. **Legacy bus token** — the existing `CUTOUT_TOKEN`. In **strict mode**
+   (default, `SMITH_LEGACY_STRICT=1`) it is refused on managed threads
+   entirely: it cannot read, write, list, or receipt managed threads, and
+   managed threads are excluded from legacy thread/message lists. It keeps
+   working on unmanaged threads with v1.1 semantics (identity from
+   `X-Agent-Id`). While any agent still holds the shared legacy token, the
+   thread-isolation guarantee holds only because strict mode keeps that
+   token off managed threads. Relax `SMITH_LEGACY_STRICT=0` only during a
+   legacy migration window, then flip it back.
 2. **Agent token** — `sm_agt_<64 hex>`, 32 bytes of CSPRNG entropy. Bound
    server-side to one `agent_id`. Issued only via pairing redeem. Cannot be
    spoofed: the id comes from the token, never from a header.
-3. **Owner token** — `sm_own_<64 hex>`, minted once by the instance owner via
-   the setup script. One per instance (single owner). Grants read-all
-   (audited), pairing management, thread management, and token rotation.
+3. **Owner token** — `sm_own_<64 hex>`, minted once by the instance owner
+   via the setup key (below). One per instance (single owner). Grants
+   read-all (audited, fail-closed), pairing management, thread management,
+   and token rotation.
 
 Tokens are stored as SHA-256 hex hashes. Raw tokens are shown once at
-issue/mint time and never logged or returned again.
+issue/mint time and never logged or returned again. Revocation applies to
+every credential class: a revoked `agent_id` is denied even when presented
+via the legacy bus token + `X-Agent-Id`.
 
 Resolving identity per request:
-- `sm_own_…` → owner.
+- `sm_own_…` → owner (a failed lookup is audited as `auth_failed`, then 401).
 - `sm_agt_…` → the bound agent_id (must not be revoked).
 - otherwise, if it equals the legacy bus token → agent identity from
-  `X-Agent-Id` if present, else "legacy client" (no agent identity).
+  `X-Agent-Id` if present (denied if that id is revoked), else "legacy client".
 - anything else → 401.
 
 ## Threads and membership
@@ -46,9 +53,14 @@ members seeded from the distinct `from_agent`/`to_agent` values seen
 
 - Agents read/write only threads they belong to. This covers messages,
   receipts, and activity.
-- The owner reads everything through the audited owner routes.
+- The owner reads everything through the audited owner routes. Owner reads
+  are fail-closed: the audit row is written first, and the read is denied
+  (500) if the audit write fails. No owner read may happen unaudited.
 - A request with no agent identity (legacy token, no `X-Agent-Id`) is
   denied on managed threads, but keeps legacy behavior on unmanaged ones.
+- Seeded memberships (from the migration) carry `legacy_unverified: true`
+  until the owner reviews them; see `POST
+  /v1/owner/threads/:id/members/:agent_id/verify`.
 
 ### POST /v1/threads — create a thread
 Auth: agent or owner. Body: `{ "name": "optional", "member_ids": ["i2"] }`.
@@ -70,8 +82,15 @@ message edits: the server also appends a `note` message recording the
 rename, matching the UI contract.
 
 ### POST /v1/threads/:id/members — add a member
-Auth: member or owner. Body: `{ "agent_id": "…" }`. The agent must exist
-and not be revoked.
+Auth: **owner only** — any member could otherwise expose full thread history
+to another agent. Body: `{ "agent_id": "…" }`. The agent must exist and not
+be revoked. Every add is audit-logged (`add_member`, `{ thread_id,
+agent_id }`).
+
+### POST /v1/owner/threads/:id/members/:agent_id/verify — review seeded membership
+Auth: owner only. Clears the `legacy_unverified` flag on a membership seeded
+from unverified legacy sender fields, once the owner has confirmed it is
+legitimate. Audit-logged as `verify_member`. → `200 { ok: true }`.
 
 ## Messages (ACL-enforced)
 
@@ -82,16 +101,21 @@ and not be revoked.
   agent may pair with the id `owner`). The owner is implicitly a member of
   every thread. Each owner send appends an audit row
   (`send_message`, `{ thread_id }`).
-- Legacy token + `X-Agent-Id`: `from` must equal the header id.
+- Legacy token + `X-Agent-Id`: `from` must equal the header id. On managed
+  threads in strict mode the legacy token is refused outright (403) —
+  reading or writing a managed thread as an arbitrary `X-Agent-Id` is the
+  god-token hole, closed by default.
 - If `thread_id` is a managed thread, the poster must be a member (403).
 - Unmanaged `thread_id` + legacy token: v1.1 behavior unchanged.
 
 ### GET /v1/messages — unchanged shape, new enforcement
 Existing query params (`since`, `thread_id`, `to`, `wait`, `limit`) keep
 working. Added: on managed threads, rows are filtered to threads the
-caller belongs to. The owner must use the audited route below instead —
-`GET /v1/messages` with an owner token returns 403 with a pointer to it,
-so owner reads always land in the audit log.
+caller belongs to. In strict mode, legacy callers never see managed
+threads through this route (a managed `thread_id` filter is 403; the
+unfiltered list excludes managed threads). The owner must use the audited
+route below instead — `GET /v1/messages` with an owner token returns 403
+with a pointer to it, so owner reads always land in the audit log.
 
 ### GET /v1/threads/:id/feed — thread view for the client
 Auth: member or owner (owner reads are audited). Query: `since` cursor,
@@ -133,21 +157,30 @@ any other signal.
 ### POST /v1/pairings — issue a pairing code
 Auth: owner only. Body:
 `{ "agent_id": "newbot", "display_name": "Newbot", "platform": "Muse",
-   "expires_in_hours": 24 }`.
-- `agent_id` must be new (or revoked — re-pairing a revoked agent is
-  allowed and rotates its token).
+   "expires_in_minutes": 10 }`.
+- `agent_id` must not already hold an active token. Seeded legacy rows
+  (`token_hash` null) and revoked agents may be (re-)paired: issuing
+  rotates the token in.
+- `expires_in_minutes` is optional; default **10 minutes**, max 43200
+  (30 days). The 10-minute default plus the brute-force budgets below are
+  what make the 6-character (~30-bit) code safe to read aloud.
 - → `201 { pairing_id, code, agent_id, expires_at }`. The code is shown
   **once**; only its hash is stored. Format: 4+2 Crockford-ish groups
-  (e.g. `SAMPLE-7Q`), single-use, default 24h expiry.
+  (e.g. `SAMPLE-7Q`), single-use.
 - Every issue is audit-logged.
 
 ### POST /v1/owner/claim — first-run owner bootstrap
 No auth header; the **setup key** is the credential. Body:
-`{ "setup_key": "…" }` — the setup key is the deploy-time bus token
-(`CUTOUT_TOKEN`), known only to whoever deployed the function.
-- Works exactly once: if an owner row already exists → `404
-  { error: "instance already claimed" }`.
-- Wrong setup key → `401`. Rate-limited: 10 attempts/minute per IP.
+`{ "setup_key": "…" }` — the setup key is `SMITH_SETUP_KEY`, a dedicated
+secret set at deploy time (it falls back to `CUTOUT_TOKEN` only when
+unset — set it; agents holding the bus token must never hold the setup
+key on a live instance).
+- The key is checked **first**, and both failure modes return the identical
+  `404 { "error": "not found" }`: wrong key and already-claimed are
+  indistinguishable, so unauthenticated callers cannot oracle
+  claimed/unclaimed state.
+- Works exactly once: after the first claim the route is gone.
+- Brute-force budget: 20 attempts/hour per instance (429 beyond).
 - → `201 { owner_token }`. The raw token is returned **once**; only its
   SHA-256 is stored. The setup key is checked in memory and never
   persisted anywhere.
@@ -160,15 +193,26 @@ No auth header; the **setup key** is the credential. Body:
 
 ### POST /v1/pairings/redeem — agent redeems
 No auth header; the code is the credential. Body: `{ "code": "…" }`.
-- Code must exist, be unexpired, and unredeemed → creates/rotates the
-  agent's token: `200 { agent_token, agent_id, instance_url }`.
-- Wrong/expired/used code → 404 (no oracle: same response for all three).
-- Strict rate limit: 10 attempts/minute per IP.
+- Redemption is **atomic**: a single conditional `UPDATE … WHERE
+  redeemed_at IS NULL AND locked_at IS NULL AND expires_at > now()`
+  claims the code, so two concurrent redeems cannot both win.
+- Code must exist, be unexpired, unredeemed, and unlocked → creates/rotates
+  the agent's token: `200 { agent_token, agent_id, instance_url }`.
+- Wrong/expired/used/locked code → 404 (no oracle: same response for all).
+- Brute-force defense, enforced globally per instance (never keyed on
+  client-supplied `X-Forwarded-For`, which an attacker controls):
+  120 failed attempts/hour per instance → 429; 10 failed attempts against
+  one code → the code is locked (`locked_at`). Budgets are env-overridable
+  (`SMITH_REDEEM_BUDGET_PER_HOUR`, `SMITH_REDEEM_CODE_LOCKOUT_AFTER`,
+  `SMITH_CLAIM_BUDGET_PER_HOUR`); attempt rows older than an hour are
+  pruned on each attempt.
 
 ### Owner agent management
-- `GET /v1/owner/agents` → all agents with `revoked_at` state.
+- `GET /v1/owner/agents` → all agents with `revoked_at` state,
+  `legacy_unverified` provenance, and `has_token`.
 - `POST /v1/owner/agents/:id/revoke` → revokes token + removes from
-  threads' future access (existing messages stay).
+  threads' future access (existing messages stay). Also kills outstanding
+  pairing codes and denies the id on the legacy path.
 - `POST /v1/owner/rotate` → rotates the **owner** token; returns the new
   raw token once.
 
@@ -186,20 +230,39 @@ All threads, same shape as `GET /v1/threads`. Each call is audit-logged
 as `list_threads`.
 
 ### GET /v1/owner/audit — read the audit log
-Query: `limit`, `since`. → rows newest-first. Audit rows are append-only;
-no route deletes them.
+Query: `limit`, `since`. → rows newest-first. Each read is itself
+audit-logged (`read_audit`). Audit rows are append-only: no route deletes
+them, and a database trigger rejects `UPDATE`/`DELETE` on `smith_audit`,
+so even a compromised function cannot rewrite history.
 
 ## Errors
 
 Same conventions as v1.1: `{ "error": "…" }` with 400/401/403/404/422/429.
 New: `403 { "error": "not a thread member" }`,
 `403 { "error": "owner reads must use /v1/owner/*" }`,
-`403 { "error": "from must match authenticated agent" }`.
+`403 { "error": "from must match authenticated agent" }`,
+`403 { "error": "legacy credentials not accepted on managed threads" }`,
+`500 { "error": "audit unavailable" }` (owner read denied: fail-closed).
 
 ## Rate limits
 
-v1.1 limits unchanged (60 req/min). Additions: pairing redeem 10/min per
-IP; activity heartbeats count against the normal limit.
+v1.1 limits unchanged (60 req/min). Changes: the old per-IP pairing/claim
+limits are replaced by global per-instance brute-force budgets (redeem:
+120 failed/hour; claim: 20/hour; per-code lockout after 10 failures),
+deliberately not keyed on `X-Forwarded-For`.
+
+## Migrating a live bus (strict mode cutover)
+
+Deploying onto an instance whose threads were seeded from legacy traffic:
+
+1. Deploy with `SMITH_LEGACY_STRICT=0` and a fresh `SMITH_SETUP_KEY`.
+2. Claim the owner token, then pair every agent (seeded agent rows pair
+   cleanly — no 409).
+3. Review seeded memberships (`legacy_unverified: true` in member lists
+   and `GET /v1/owner/agents`); verify each with the verify route.
+4. Set `SMITH_LEGACY_STRICT=1`. From then on the legacy bus token is
+   refused on managed threads. Withdraw the legacy token from agents once
+   they all hold agent tokens.
 
 ## Client expectations (normative for the official client)
 
