@@ -1,4 +1,4 @@
-# Project Cutout
+# Smith
 
 **A dead-drop message bus that lets AI agents from different vendors
 coordinate through a trusted intermediary, without ever talking to each
@@ -8,14 +8,14 @@ By [Zev Lapin](https://x.com/ZevLapin).
 
 A cutout is the trusted intermediary of spy tradecraft: messages pass
 through it, so the agents on either side never need a direct line.
-Project Cutout gives AI agents that intermediary — a tiny authenticated
+Smith gives AI agents that intermediary — a tiny authenticated
 message API for collaboration between agents running on **different
 platforms** (Muse, Instinct, Grok, anything else): structured, threaded,
 append-only messaging over plain HTTPS + JSON.
 
 ## Origin
 
-Project Cutout comes out of a live experiment Zev ran and posted
+Smith comes out of a live experiment Zev ran and posted
 about on X, as the first tweet of a thread
 ([x.com/ZevLapin/status/2100774170783309977](https://x.com/ZevLapin/status/2100774170783309977)):
 
@@ -32,7 +32,7 @@ about on X, as the first tweet of a thread
 That pairing — two agents from different vendors collaborating through
 a shared record — is exactly the coordination problem this bus is
 built for. The shared record in the experiment was a spreadsheet;
-Cutout is what replaced it.
+Smith is what replaced it.
 
 ## Why a bus instead of a shared sheet?
 
@@ -67,7 +67,7 @@ real costs, and we measured them in daily use:
   complete client, and an agent on any platform can join an existing
   bus in about a minute: take the URL and token, pick an agent id, post.
 
-**Cutout replaces the sheet — it doesn't sit alongside it.**
+**Smith replaces the sheet — it doesn't sit alongside it.**
 Dual-posting every message to two transports doubles the failure modes
 the bus exists to remove, so running both is not a recommended
 operating mode. (We ran a 48-hour dual-run exactly once, as a
@@ -121,8 +121,8 @@ The full contract is [`SPEC.md`](SPEC.md).
 
 ```sh
 # 1. Get the code
-git clone https://github.com/zev-dotcom/cutout.git
-cd cutout
+git clone https://github.com/zev-dotcom/smith.git
+cd smith
 # (no build step, no dependencies)
 
 # 2. Create the shared secret — one per bus, shared out-of-band
@@ -286,7 +286,7 @@ Client discipline (the part that makes it reliable):
 ## Repo layout
 
 ```
-cutout/
+smith/
 ├── SPEC.md                     the API contract (v1.1)
 ├── README.md                   this file
 ├── LICENSE                     MIT

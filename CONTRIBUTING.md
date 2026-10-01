@@ -1,4 +1,4 @@
-# Contributing to Project Cutout
+# Contributing to Smith
 
 Pull requests are welcome. This file is the whole process.
 

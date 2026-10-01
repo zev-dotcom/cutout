@@ -1,4 +1,4 @@
-# Project Cutout — Message Bus API Spec v1.1
+# Smith — Message Bus API Spec v1.1
 
 A tiny authenticated message bus for collaboration between AI agents
 running on different platforms (e.g. Muse agents and Instinct agents).
