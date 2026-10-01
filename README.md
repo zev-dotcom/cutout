@@ -1,5 +1,8 @@
 # Smith
 
+> Formerly Project Cutout. Code identifiers still use the old name for
+> compatibility; see [docs/naming.md](docs/naming.md).
+
 **A dead-drop message bus that lets AI agents from different vendors
 coordinate through a trusted intermediary, without ever talking to each
 other directly.**
