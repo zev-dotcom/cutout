@@ -286,7 +286,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-02.11";
+var SMITH_BUILD = "2026-10-02.12";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -698,6 +698,11 @@ function appendMessages(msgs, opts){
     // Concurrent polls (timer + send) can return the same message twice: render each id once.
     if (m.id && box.querySelector('[data-mid="' + String(m.id).replace(/"/g, "") + '"]')) return;
     if (m.id) indexMsg(m);
+    if (m.from === "owner" && m.body){
+      // The server copy of a message we are still sending (stream or poll beat the POST reply): drop the temporary bubble.
+      var pend = Array.prototype.filter.call(box.querySelectorAll(".msgrow.pending[data-pk]"), function(r){ return r.dataset.pbody === m.body; })[0];
+      if (pend){ delete pendingSends[pend.dataset.pk]; pend.remove(); }
+    }
     var day = fmtDay(m.created_at);
     if (day !== lastDay){
       box.insertAdjacentHTML("beforeend", '<div class="day">' + esc(day) + "</div>");
@@ -929,40 +934,73 @@ function pickMention(i){
 }
 
 /* ---------- composer ---------- */
-var sending = false, draftKey = null;
+var draftKey = null;
 function growComposer(){ var i = $("composerInput"); i.style.height = "auto"; i.style.height = Math.min(128, i.scrollHeight) + "px"; }
-async function sendMessage(){
-  if (sending) return;   // a double tap while a send is in flight is ignored
+/* Optimistic send: the bubble shows at once as "Sending…", the POST runs in the background and the
+   server's id replaces the temporary one. A failed send stays on screen with a tap-to-retry that reuses
+   the same idempotency key, so a retry (or a double tap) can never post twice. */
+var pendingSends = {};
+function pendingRow(p){
+  var box = $("threadMsgs");
+  var row = box.querySelector('[data-pk="' + CSS.escape(p.key) + '"]');
+  return row;
+}
+function showPending(p){
+  var box = $("threadMsgs");
+  var msg = { id: "pending-" + p.key, from: "owner", to: p.to, type: "note", body: p.body, created_at: p.at, metadata: p.mentions.length ? { mentions: p.mentions } : {} };
+  var day = fmtDay(p.at), lastDay = box.dataset.lastday || "";
+  if (day !== lastDay){ box.insertAdjacentHTML("beforeend", '<div class="day">' + esc(day) + "</div>"); box.dataset.lastday = day; }
+  box.insertAdjacentHTML("beforeend", msgHtml(msg));
+  var rows = box.querySelectorAll(".msgrow.msg-out"), row = rows[rows.length - 1];
+  row.classList.add("pending"); row.dataset.pk = p.key; row.dataset.pbody = p.body; row.removeAttribute("data-mid");
+  var r = row.querySelector(".rcpt"); if (!r){ r = document.createElement("div"); r.className = "rcpt"; row.appendChild(r); }
+  r.textContent = "Sending…";
+  box.scrollTop = box.scrollHeight;
+}
+function markFailed(p, text){
+  var row = pendingRow(p); if (!row) return;
+  row.classList.remove("pending"); row.classList.add("failed");
+  var r = row.querySelector(".rcpt"); if (r) r.innerHTML = '<button type="button" class="retrybtn">Not sent. Tap to retry</button>';
+  var btn = row.querySelector(".retrybtn");
+  if (btn) btn.onclick = function(){ row.classList.remove("failed"); row.classList.add("pending"); r.textContent = "Sending…"; postPending(p); };
+  if (text) toast(text);
+}
+async function postPending(p){
+  try {
+    var res = await api("POST", "/v1/messages", {
+      thread_id: p.tid, from: "owner", to: p.to, type: "note", body: p.body,
+      ...(p.mentions.length ? { metadata: { mentions: p.mentions } } : {}),
+      idempotency_key: p.key
+    });
+    delete pendingSends[p.key];
+    var row = pendingRow(p);
+    if (p.tid !== state.currentThread){ if (row) row.remove(); return; }
+    var real = { id: res.id, from: "owner", to: p.to, type: "note", body: p.body, created_at: res.created_at || p.at,
+      metadata: p.mentions.length ? { mentions: p.mentions } : {} };
+    if ($("threadMsgs").querySelector('[data-mid="' + CSS.escape(String(res.id)) + '"]')){ if (row) row.remove(); return; } // the stream got there first
+    if (row) row.remove();
+    appendMessages([real]);
+    $("threadMsgs").scrollTop = $("threadMsgs").scrollHeight;
+    pollThread(); // pick up receipts and anything else, off the critical path
+  } catch(e){
+    markFailed(p, e.message);
+  }
+}
+function sendMessage(){
   var tid = state.currentThread;
   var input = $("composerInput");
   var body = input.value.trim();
-  if (!tid || !body) return;
+  if (!tid || !body) return;   // a double tap finds the composer already empty
   var t = state.threadById[tid];
   var members = (t && t.members || []).filter(function(m){ return m.agent_id !== "owner"; });
   var to = members.length === 1 ? members[0].agent_id : "*";
   var mentions = Object.keys(mentionPicks).filter(function(id){ return body.indexOf("@" + mentionPicks[id]) >= 0; });
-  sending = true;
-  $("sendBtn").disabled = true;
-  if (!draftKey) draftKey = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
-  try {
-    await api("POST", "/v1/messages", {
-      thread_id: tid,
-      from: "owner",
-      to: to,
-      type: "note",
-      body: body,
-      ...(mentions.length ? { metadata: { mentions: mentions } } : {}),
-      idempotency_key: draftKey
-    });
-    draftKey = null;
-    input.value = ""; growComposer(); mentionPicks = {}; closeMentionPop();
-    pollThread(); // fetch our own message right away
-  } catch(e){
-    toast(e.message); // keep the text; nothing is faked
-  } finally {
-    sending = false;
-    $("sendBtn").disabled = false;
-  }
+  var p = { key: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()), tid: tid, body: body, to: to,
+    mentions: mentions, at: new Date().toISOString() };
+  pendingSends[p.key] = p;
+  input.value = ""; growComposer(); mentionPicks = {}; closeMentionPop(); draftKey = null;
+  showPending(p);
+  postPending(p);
 }
 
 /* ---------- thread management ---------- */
