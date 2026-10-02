@@ -208,6 +208,9 @@ function agentPlat(agentId){
   var a = state.agentById[agentId];
   return a ? a.platform : null;
 }
+/* Registered = paired through Smith (has its own token). Legacy bus ids carried over
+   from a pre-Smith bus have no Smith identity and are never offered to the user. */
+function isRegistered(a){ return !a.legacy_unverified && !a.revoked_at; }
 function indexAgents(list){
   state.agents = list || [];
   state.agentById = {};
@@ -530,7 +533,7 @@ async function addMember(){
   await ensureAgents();
   var have = {};
   (t.members || []).forEach(function(m){ have[m.agent_id] = 1; });
-  var cands = state.agents.filter(function(a){ return !have[a.agent_id] && !a.revoked_at; });
+  var cands = state.agents.filter(function(a){ return !have[a.agent_id] && isRegistered(a); });
   if (!cands.length){ toast("No other agents to add."); return; }
   var opts = cands.map(function(a){
     return '<option value="' + esc(a.agent_id) + '">' +
@@ -551,14 +554,20 @@ async function addMember(){
 }
 async function createThread(){
   await ensureAgents();
-  var cands = state.agents.filter(function(a){ return !a.revoked_at; });
+  var cands = state.agents.filter(isRegistered);
+  if (!cands.length){
+    modal("New chat",
+      '<p class="fine">No agents yet. Add one first: you issue a pairing code, the agent redeems it, and then it shows up here.</p>',
+      "Add an agent", function(){ showScreen("agents"); });
+    return;
+  }
   var boxes = cands.map(function(a){
     return '<label style="display:flex;align-items:center;gap:10px;min-height:44px;font-size:14px">' +
       '<input type="checkbox" value="' + esc(a.agent_id) + '" style="width:20px;height:20px"> ' +
       esc(a.display_name || a.agent_id) +
       (a.platform ? ' <span class="plat">' + esc(String(a.platform).toUpperCase()) + "</span>" : "") +
       "</label>";
-  }).join("") || '<p class="fine">No agents yet — pair one first.</p>';
+  }).join("");
   modal("New chat",
     '<div class="field"><label for="mTName">CHAT NAME (OPTIONAL)</label>' +
     '<input id="mTName" placeholder="e.g. Weekend deploy"></div>' +
@@ -671,11 +680,12 @@ async function loadAgents(){
     var list = await api("GET", "/v1/owner/agents");
     indexAgents(Array.isArray(list) ? list : (list.agents || []));
     box.innerHTML = "";
-    if (!state.agents.length){
-      box.appendChild(el("p", "fine", "No agents paired yet. Issue a pairing code to add one."));
-      return;
+    var shown = state.agents.filter(function(a){ return !a.legacy_unverified; });
+    var hiddenLegacy = state.agents.length - shown.length;
+    if (!shown.length){
+      box.appendChild(el("p", "fine", "No agents yet. Issue a pairing code below to add one."));
     }
-    state.agents.forEach(function(a){
+    shown.forEach(function(a){
       var row = el("div", "accrow");
       var sub = (a.platform ? '<span class="plat">' + esc(String(a.platform).toUpperCase()) + "</span> " : "") +
         '<span style="font-family:ui-monospace,Menlo,monospace">' + esc(a.agent_id) + "</span>";
@@ -697,6 +707,10 @@ async function loadAgents(){
       }
       box.appendChild(row);
     });
+    if (hiddenLegacy){
+      box.appendChild(el("p", "fine", hiddenLegacy + " unregistered bus id" + (hiddenLegacy === 1 ? "" : "s") +
+        " from before Smith are hidden. They cannot sign in to Smith and never appear in pickers."));
+    }
   } catch(e){
     box.innerHTML = '<p class="fine">Could not load agents: ' + esc(e.message) + "</p>";
   }
