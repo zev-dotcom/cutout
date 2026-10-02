@@ -28,14 +28,13 @@ input,select,textarea{font-family:inherit}
 .setup-card{width:100%;max-width:440px;background:var(--bg2);border:1.5px solid var(--line);
   border-radius:24px;padding:32px 28px;box-shadow:0 24px 70px rgba(0,0,0,.10)}
 .setup-card h1{font-size:28px;font-weight:800;letter-spacing:-.03em;margin-bottom:6px}
-.sigdots{color:var(--red);letter-spacing:2px;font-size:22px;vertical-align:-1px}
+.sigdots{color:var(--red);letter-spacing:2px;font-size:22px;vertical-align:-2px;margin-left:5px}
 /* Wordmark dots: decorative signature only. Ripple every 30s, still under reduced-motion.
    In chat the same dots are the incoming-response indicator, rendered only from feed.working. */
 @keyframes sigripple{0%,95.5%,100%{opacity:1}97.5%{opacity:.45}}
 .sigdots i{font-style:normal}
-.sigdots.live i{animation:sigwave 30s ease-in-out infinite}
-.sigdots.live i:nth-child(2){animation-delay:.3s}.sigdots.live i:nth-child(3){animation-delay:.6s}
-@keyframes sigwave{0%,5%,100%{opacity:1;transform:translateY(0)}1.5%{opacity:.2;transform:translateY(-3px)}3%{opacity:1;transform:translateY(0)}}
+.sigdots.live i{animation:tdotbounce 1s infinite}
+.sigdots.live i:nth-child(2){animation-delay:.15s}.sigdots.live i:nth-child(3){animation-delay:.3s}
 .sigdots i{display:inline-block}
 .setup-card .lede{font-size:13.5px;color:var(--ink2);line-height:1.6;margin-bottom:22px}
 .field{margin-bottom:14px}
