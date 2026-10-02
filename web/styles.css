@@ -154,9 +154,11 @@ input,select,textarea{font-family:inherit}
 /* Cue-dot indicator: rendered ONLY while feed.working is non-empty.
    Driven by real working-on-reply events — never a decorative loop, never inferred. */
 .tdots{display:inline-flex;gap:4px;align-items:center;flex:none}
-.tdots span{width:7px;height:7px;border-radius:50%;background:var(--red);animation:tdotpulse 1.2s ease-in-out infinite}
-.tdots span:nth-child(2){animation-delay:.2s}.tdots span:nth-child(3){animation-delay:.4s}
-@keyframes tdotpulse{0%,60%,100%{opacity:.25}30%{opacity:1}}
+.tdots span{width:8px;height:8px;border-radius:50%;background:var(--red);animation:tdotbounce 1s infinite}
+.tdots span:nth-child(2){animation-delay:.15s}.tdots span:nth-child(3){animation-delay:.3s}
+@keyframes tdotbounce{0%,100%{transform:translateY(-25%);animation-timing-function:cubic-bezier(.8,0,1,1)}50%{transform:none;animation-timing-function:cubic-bezier(0,0,.2,1)}}
+.working{animation:workfade .3s ease-out}
+@keyframes workfade{from{opacity:0}to{opacity:1}}
 .working{align-self:flex-start;display:flex;align-items:center;gap:9px;flex-wrap:wrap;background:var(--bg2);
   border:1.5px solid var(--line);border-radius:14px;padding:10px 15px;font-size:13px;color:var(--ink2);margin-top:6px;max-width:100%}
 .working .wlabel{flex:1 1 auto;min-width:0}
@@ -371,3 +373,15 @@ select{width:100%;min-height:var(--tap);border:1.5px solid var(--line);border-ra
 .rxn{font-size:.75rem;font-weight:700;color:var(--ink2)}
 .rxbar{display:flex;justify-content:space-between;gap:4px;padding:6px 2px}
 .rxpick{flex:1;min-height:var(--tap);border:0;border-radius:12px;background:var(--bg2);font-size:1.5rem;cursor:pointer}
+.actrow{max-width:88%}
+.actcard{background:var(--bubble-in);border:1.5px solid var(--line);border-radius:var(--radius);border-top-left-radius:7px;padding:11px 14px;display:flex;flex-direction:column;gap:4px;min-width:210px}
+.acthead{display:flex;align-items:center;gap:8px;font-weight:700;font-size:14.5px;color:var(--ink)}
+.acticon{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;background:var(--bg2);color:var(--ink2);flex:none}
+.actcard[data-state="running"] .acticon{color:var(--accent,#f05a28)}
+.actcard[data-state="failed"] .acticon{color:var(--red)}
+.actstate{font-size:.78rem;font-weight:600;color:var(--ink3);display:flex;align-items:center;gap:6px}
+.actel{font-variant-numeric:tabular-nums}
+.actspin{width:11px;height:11px;border-radius:50%;border:2px solid var(--line);border-top-color:var(--accent,#f05a28);animation:actspin .9s linear infinite}
+@keyframes actspin{to{transform:rotate(360deg)}}
+.actsum{font-size:14px;line-height:1.5;color:var(--ink);margin-top:2px}
+@media (prefers-reduced-motion:reduce){.actspin{animation:none}}

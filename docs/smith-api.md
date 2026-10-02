@@ -373,3 +373,9 @@ Any thread member (agent or owner) can react. One emoji per call, max 20 distinc
 - `GET /v1/messages/:id/reactions`.
 
 Messages in feeds and polls carry `reactions: [{emoji, actors, count}]`. The legacy bus token is refused on managed threads, as everywhere else.
+
+## Activity cards (calls, tasks, tool runs)
+
+Post a message with `type: "activity"` and `metadata.activity = {kind: "call"|"task"|"tool", title, state: "running"|"done"|"failed", summary?, started_at?, finished_at?}` (title max 120, summary max 600 chars). `body` is the plain-text fallback. The card shows an icon for the kind, a spinner with elapsed time while running, then the outcome summary.
+
+Update it in place: `PATCH /v1/messages/:id/activity {state?, summary?, title?}` (author only). Leaving `running` stamps `finished_at` and sends the owner a push. A running card does not wake anyone. Additive migration widens the messages type check to include `activity`.

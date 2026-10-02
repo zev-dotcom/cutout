@@ -210,7 +210,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-02.7";
+var SMITH_BUILD = "2026-10-02.8";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -511,6 +511,48 @@ function openReactBar(mid){
   });
   document.body.appendChild(sh);
 }
+var ACT_ICONS = {
+  call: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 1.9.7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.8.7a2 2 0 0 1 1.7 2z"/></svg>',
+  task: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11l3 3 8-8"/><path d="M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg>',
+  tool: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/></svg>'
+};
+function fmtElapsed(ms){
+  var t = Math.max(0, Math.round(ms / 1000)), m = Math.floor(t / 60), h = Math.floor(m / 60);
+  var ss = ("0" + (t % 60)).slice(-2);
+  return h ? h + ":" + ("0" + (m % 60)).slice(-2) + ":" + ss : m + ":" + ss;
+}
+function actStateLabel(a){
+  var st = a.started_at ? Date.parse(a.started_at) : 0, fin = a.finished_at ? Date.parse(a.finished_at) : 0;
+  if (a.state === "running") return '<span class="actspin" aria-hidden="true"></span>Running <span class="actel">' + fmtElapsed(Date.now() - st) + "</span>";
+  var d = st && fin ? " \u00b7 " + fmtElapsed(fin - st) : "";
+  return (a.state === "failed" ? "Failed" : "Done") + d;
+}
+function actInner(a){
+  var kind = ACT_ICONS[a.kind] ? a.kind : "task";
+  return '<div class="acthead"><span class="acticon">' + ACT_ICONS[kind] + '</span><span class="acttitle">' + esc(a.title || "Activity") + "</span></div>" +
+    '<div class="actstate">' + actStateLabel(a) + "</div>" +
+    (a.summary ? '<div class="actsum">' + esc(a.summary) + "</div>" : "");
+}
+function actCard(a){
+  return '<div class="actcard" data-state="' + esc(a.state || "") + '" data-start="' + esc(a.started_at || "") + '">' + actInner(a) + "</div>";
+}
+function applyActivities(map){
+  var box = $("threadMsgs"); if (!box || !map) return;
+  Object.keys(map).forEach(function(id){
+    var a = map[id]; if (!a) return;
+    var row = box.querySelector('[data-mid="' + id.replace(/"/g, "") + '"]'); if (!row) return;
+    var c = row.querySelector(".actcard"); if (!c) return;
+    var sig = (a.state || "") + "|" + (a.summary || "") + "|" + (a.title || "") + "|" + (a.finished_at || "");
+    if (c.getAttribute("data-sig") === sig) return;
+    c.setAttribute("data-sig", sig); c.setAttribute("data-state", a.state || ""); c.setAttribute("data-start", a.started_at || ""); c.innerHTML = actInner(a);
+  });
+}
+setInterval(function(){
+  document.querySelectorAll('.actcard[data-state="running"]').forEach(function(c){
+    var el = c.querySelector(".actel"), st = Date.parse(c.getAttribute("data-start") || "");
+    if (el && st) el.textContent = fmtElapsed(Date.now() - st);
+  });
+}, 1000);
 function msgHtml(msg){
   var mine = msg.from === "owner";
   if (isRenameNote(msg)){
@@ -522,6 +564,11 @@ function msgHtml(msg){
   }
   if (msg.type === "receipt-info"){
     return '<div class="sysmsg">' + esc(msg.body || "") + "</div>";
+  }
+  if (msg.type === "activity" && msg.metadata && msg.metadata.activity){
+    var aa = msg.metadata.activity;
+    return '<div class="msgrow them actrow" data-mid="' + esc(msg.id) + '"><div class="who">' + esc(agentLabel(msg.from)) + "</div>" + actCard(aa) +
+      (msg.created_at ? '<div class="rcpt">' + esc(fmtClock(msg.created_at)) + "</div>" : "") + "</div>";
   }
   if (mine){
     var lbl = metaLine(msg);
@@ -713,7 +760,7 @@ function startThreadStream(tid, gen){
               markRead(tid, d.messages || []);
               refreshThreadsQuiet();
             } else if (ev === "state"){
-              setWorking(d.working); applyPresence(d.presence); applyMarks(d.marks); applyReactions(d.reactions);
+              setWorking(d.working); applyPresence(d.presence); applyMarks(d.marks); applyReactions(d.reactions); applyActivities(d.activities);
             }
           });
         }

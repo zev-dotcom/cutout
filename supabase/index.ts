@@ -26,7 +26,8 @@ const TYPES = [
   "task",
   "link",
   "receipt-info",
-  "resolve"
+  "resolve",
+  "activity"
 ];
 const RECEIPT_STATUSES = [
   "received",
@@ -374,6 +375,12 @@ async function postMessage(req, auth) {
       error: err
     });
   }
+  if (body.type === "activity") {
+    const aerr = validActivity(metadata.activity);
+    if (aerr) return jres(422, { error: aerr });
+    if (!metadata.activity.started_at) metadata.activity.started_at = new Date().toISOString();
+    if (metadata.activity.state !== "running" && !metadata.activity.finished_at) metadata.activity.finished_at = new Date().toISOString();
+  }
   const linkErr = validOneTimeLink(metadata.one_time_link);
   if (linkErr) return jres(422, {
     error: linkErr
@@ -497,7 +504,7 @@ async function postMessage(req, auth) {
     if (auth.kind === "agent" || auth.kind === "owner") {
       urgentFlag = false;
       try { urgentFlag = await urgentDecision(from, body.thread_id, body.to, body.urgent === true); } catch (e) { console.error("urgent decision failed", e); }
-      afterPostWake(body.thread_id, from, body.to, urgentFlag, body.body, metadata.mentions);
+      if (!(body.type === "activity" && metadata.activity?.state === "running")) afterPostWake(body.thread_id, from, body.to, urgentFlag, body.body, metadata.mentions);
     }
     // A new agent message brings an archived chat back to the home screen.
     if (auth.kind === "agent" && !String(body.thread_id).startsWith("th_wakecheck_")) timedQuery(sql`update ${S("smith_thread_prefs")} set archived_at = null where thread_id = ${body.thread_id} and archived_at is not null`, "unarchive_on_post").catch(()=>{});
@@ -1214,6 +1221,43 @@ async function listThreadsSmith(auth) {
   };
 }
 // Owner-only per-thread prefs: archive (hide from home) and mute (no push). Agents are unaffected.
+// Activity cards (calls, tasks, tool runs): one message the author posts and later updates in place.
+const ACTIVITY_KINDS = ["call", "task", "tool"];
+const ACTIVITY_STATES = ["running", "done", "failed"];
+function validActivity(a, partial = false) {
+  if (typeof a !== "object" || a === null || Array.isArray(a)) return "metadata.activity must be an object";
+  if (!partial || a.kind !== undefined) if (!ACTIVITY_KINDS.includes(a.kind)) return "activity.kind must be call, task or tool";
+  if (!partial || a.state !== undefined) if (!ACTIVITY_STATES.includes(a.state)) return "activity.state must be running, done or failed";
+  if (!partial || a.title !== undefined) if (typeof a.title !== "string" || !a.title.trim() || a.title.length > 120) return "activity.title is required (max 120 chars)";
+  if (a.summary !== undefined && (typeof a.summary !== "string" || a.summary.length > 600)) return "activity.summary must be a string of at most 600 chars";
+  for (const f of ["started_at", "finished_at"]) if (a[f] !== undefined && (typeof a[f] !== "string" || Number.isNaN(Date.parse(a[f])))) return `activity.${f} must be an ISO timestamp`;
+  return null;
+}
+async function patchActivity(req, auth, mid) {
+  if (auth.kind !== "agent") return jres(403, { error: "agent token required" });
+  let body; try { body = await req.json(); } catch { return jres(400, { error: "invalid JSON" }); }
+  const rows = await timedQuery(sql`select thread_id, from_agent, type, metadata from ${T("messages")} where id = ${mid}`, "activity_msg");
+  if (!rows.length) return jres(404, { error: "message not found" });
+  const m = rows[0];
+  const denied = await threadAccess(auth, m.thread_id);
+  if (denied) return denied;
+  if (m.type !== "activity") return jres(422, { error: "not an activity message" });
+  if (m.from_agent !== auth.agentId) return jres(403, { error: "only the author can update an activity" });
+  const patch = {};
+  for (const f of ["state", "summary", "title"]) if (body[f] !== undefined) patch[f] = body[f];
+  if (!Object.keys(patch).length) return jres(422, { error: "state, summary or title is required" });
+  const err = validActivity(patch, true);
+  if (err) return jres(422, { error: err });
+  const cur = m.metadata?.activity ?? {};
+  const next = { ...cur, ...patch };
+  if (cur.state === "running" && next.state !== "running" && !next.finished_at) next.finished_at = new Date().toISOString();
+  if (next.state === "running") delete next.finished_at;
+  await timedQuery(sql`update ${T("messages")} set metadata = jsonb_set(metadata, '{activity}', ${sql.json(next)}) where id = ${mid}`, "activity_patch");
+  if (cur.state === "running" && next.state !== "running") {
+    pushNotifyOwner(m.thread_id, `${next.title}: ${next.state === "failed" ? "failed" : "done"}${next.summary ? " - " + String(next.summary).slice(0, 120) : ""}`).catch(()=>{});
+  }
+  return jres(200, { id: mid, activity: next });
+}
 // Reactions: one grapheme per reaction, max 20 distinct emoji per message. They never wake an agent.
 const REACTION_WRITES_PER_HOUR = Number(Deno.env.get("SMITH_REACTIONS_PER_HOUR") ?? "60");
 async function reactionsFor(ids) {
@@ -1912,7 +1956,12 @@ async function ownerStream(req, auth, threadId) {
             for (const r of rr) { const m = (tmp[r.message_id] ??= {}); (m[r.emoji] ??= []).push(r.actor); }
             for (const k of Object.keys(tmp)) reactions[k] = Object.entries(tmp[k]).map(([emoji, actors])=>({ emoji, actors, count: actors.length }));
           } catch { /* best effort */ }
-          const state = { working: feed.working, reactions, presence: feed.presence.map((p)=>({ agent_id: p.agent_id, online: p.online })), marks };
+          const activities = {};
+          try {
+            const ar = await timedQuery(sql`select id, metadata->'activity' as a from ${T("messages")} where thread_id = ${threadId} and type = 'activity' order by created_at desc, id desc limit 30`, "stream_activity");
+            for (const r of ar) activities[r.id] = r.a;
+          } catch { /* best effort */ }
+          const state = { working: feed.working, reactions, activities, presence: feed.presence.map((p)=>({ agent_id: p.agent_id, online: p.online })), marks };
           const nsig = JSON.stringify(state);
           if (nsig !== sig) { sig = nsig; send("state", { ...state, presence: feed.presence }); }
           else send("ping", {});
@@ -2068,6 +2117,7 @@ async function route(req, arrivedAt) {
   if (path === "/v1/owner/feed" && req.method === "GET") {
     return done(await ownerFeed(req, auth, new URL(req.url).searchParams.get("thread_id")));
   }
+  { const am = path.match(/^\/v1\/messages\/([^/]+)\/activity$/); if (am && (req.method === "PATCH" || req.method === "PUT")) return done(await patchActivity(req, auth, decodeURIComponent(am[1]))); }
   { const rm = path.match(/^\/v1\/messages\/([^/]+)\/reactions(?:\/([^/]+))?$/);
     if (rm && ((!rm[2] && (req.method === "PUT" || req.method === "GET")) || (rm[2] && req.method === "DELETE"))) return done(await reactionsRoute(req, auth, decodeURIComponent(rm[1]), rm[2] ? decodeURIComponent(rm[2]) : null)); }
   { const pm = path.match(/^\/v1\/owner\/threads\/([^/]+)\/prefs$/); if (pm && req.method === "PUT") return done(await ownerThreadPrefs(req, auth, decodeURIComponent(pm[1]))); }

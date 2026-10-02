@@ -125,3 +125,14 @@ create table if not exists smith.smith_reactions (
 create index if not exists smith_reactions_msg on smith.smith_reactions (message_id);
 alter table smith.smith_reactions enable row level security;
 do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith.smith_reactions from anon, authenticated; end if; end $$;
+
+-- Activity message type (additive): widen the type check so type 'activity' is accepted.
+do $act$ begin
+  if to_regclass('agentcollab.messages') is not null and not exists (
+    select 1 from pg_constraint where conname = 'messages_type_check' and conrelid = to_regclass('agentcollab.messages') and pg_get_constraintdef(oid) ilike '%activity%'
+  ) then
+    alter table agentcollab.messages drop constraint if exists messages_type_check;
+    alter table agentcollab.messages add constraint messages_type_check
+      check (type in ('note','question','decision','task','link','receipt-info','resolve','activity'));
+  end if;
+end $act$;

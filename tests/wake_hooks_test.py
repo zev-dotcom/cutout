@@ -436,4 +436,18 @@ check("reactions are audited", int(sql("select count(*) from smith.smith_audit w
 sql("insert into smith.smith_audit (actor, action, detail) select 'pk-b', 'reaction_add', '{}'::jsonb from generate_series(1, 60)")
 s, r = req("PUT", RP, {"emoji": "\U0001F601"}, PB); check("61st reaction write in an hour -> 429", s == 429, s)
 s, r = req("PUT", RP, {"emoji": "\U0001F600"}, OWN); check("reaction rate limit is per actor (owner unaffected)", s == 200, s)
+# --- activity cards ---
+def act(**a): return {"thread_id": TA, "from": "pk-b", "to": "owner", "type": "activity", "body": "Calling the clinic", "metadata": {"activity": {"kind": "call", "title": "Call Dr. Lee's office", "state": "running", **a}}}
+s, r = req("POST", "/v1/messages", act(), PB); check("activity post ok", s == 201, (s, r)); AID = r.get("id")
+s, r = req("POST", "/v1/messages", {**act(), "metadata": {"activity": {"kind": "bogus", "title": "x", "state": "running"}}}, PB); check("bad kind -> 422", s == 422, s)
+s, r = req("POST", "/v1/messages", {**act(), "metadata": {}}, PB); check("activity without metadata -> 422", s == 422, s)
+s, r = req("POST", "/v1/messages", act(summary="x" * 700), PB); check("summary over 600 -> 422", s == 422, s)
+s, fd = req("GET", "/v1/owner/feed?thread_id=" + TA, tok=OWN); am = [m for m in fd["messages"] if m["id"] == AID][0]
+check("feed shows running activity with started_at", am["metadata"]["activity"]["state"] == "running" and "started_at" in am["metadata"]["activity"] and "finished_at" not in am["metadata"]["activity"], am["metadata"])
+s, r = req("PATCH", "/v1/messages/" + AID + "/activity", {"state": "done", "summary": "Booked Tuesday 3pm. Bring the insurance card."}, PA); check("non-member cannot update (403)", s == 403, s)
+s, r = req("PATCH", "/v1/messages/" + AID + "/activity", {"state": "done", "summary": "Booked Tuesday 3pm."}, OWN); check("owner cannot update an agent's activity (403)", s == 403, s)
+s, r = req("PATCH", "/v1/messages/" + AID + "/activity", {"state": "done", "summary": "Booked Tuesday 3pm. Bring the insurance card."}, PB)
+check("author finishes the activity, finished_at set", s == 200 and r["activity"]["state"] == "done" and "finished_at" in r["activity"] and r["activity"]["kind"] == "call", (s, r))
+s, r = req("PATCH", "/v1/messages/" + AID + "/activity", {"state": "nope"}, PB); check("bad state on update -> 422", s == 422, s)
+s, r = req("PATCH", "/v1/messages/" + mm["id"] + "/activity", {"state": "done"}, PB); check("update on a non-activity message -> 422", s == 422, s)
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)
