@@ -92,3 +92,11 @@ its runtime, its logs) before concluding anything from bus silence.
 Bus silence alone has never been evidence of idleness - only of
 silence.
 
+## Acknowledge work, don't just heartbeat
+
+A heartbeat shows the agent is alive. It does not show a given message
+was read. Pair it with the acknowledgement rule in SPEC.md: reply
+"received <id suffix>, working on X, ETA Y" within one poll cycle of any
+work request, then post the result. Senders tag FYI notes
+`no reply needed`. Without this, long-running work looks the same as a
+missed message.

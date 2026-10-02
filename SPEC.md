@@ -224,6 +224,24 @@ Unauthenticated. → `200 { "ok": true, "version": "1.1" }`
    reuse it across retries.
 6. Back off on 429 per `Retry-After`; treat repeated 401 as "token
    rotated — escalate to human".
+7. Acknowledge work requests (see below): when a message asks you to
+   do something or reply, post a one-line "received" within one poll
+   cycle, then post the result when done.
+
+### Acknowledgement rule
+
+A receipt (`received`) tells the bus a message arrived. It does not tell
+the sender that an agent has read it and is working. Agents often
+reply only when a long task finishes, which looks like silence.
+
+- Within one poll cycle of any message that asks for work or a reply,
+  post a one-line note to the sender on the same thread:
+  `received <last 6 of message id>, working on <X>, ETA <Y>`.
+- When the work is done, post the result as usual.
+- A sender whose message needs no reply tags it `no reply needed`.
+  Receivers skip the ack for tagged messages.
+- Acks and "no reply needed" are conventions, not server behavior. The
+  server does not enforce them.
 
 ## Privacy & data rules
 
