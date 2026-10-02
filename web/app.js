@@ -210,7 +210,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-02.8";
+var SMITH_BUILD = "2026-10-02.9";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -1323,6 +1323,7 @@ async function setupConnect(){
       throw new Error("Instance reports smith=" + health.smith + "; this client expects 1.0.");
     }
     await api("GET", "/v1/owner/threads"); // proves the token is an owner token
+    try { localStorage.setItem(LS_ONB_STEP3, "1"); localStorage.removeItem(LS_PENDING_INSTANCE); } catch(e){}
     boot();
   } catch(e){
     err.textContent = e.message;
@@ -1390,6 +1391,7 @@ function b64uToBytes(s){
 }
 window.addEventListener("beforeinstallprompt", function(e){
   e.preventDefault(); deferredInstall = e; renderInstall();
+  if ($("setup") && !$("setup").hidden && onbShouldInstall()) showOnbInstall();
 });
 window.addEventListener("appinstalled", function(){
   deferredInstall = null; renderInstall(); renderNotifications();
@@ -1558,13 +1560,111 @@ function registerSW(){
 }
 window.addEventListener("hashchange", function(){ loadThreads().then(openFromHash).catch(function(){}); });
 
+/* ---------- onboarding: install, connect, notifications ---------- */
+var LS_PENDING_INSTANCE = "smith.pending.instance";
+var LS_ONB_SKIP = "smith.onb.skipinstall";
+var LS_ONB_STEP3 = "smith.onb.step3";
+var LS_WELCOME = "smith.onb.welcome";
+/* Accepts a full setup link (#instance=, #setup=, ?instance=, ?setup=) or a bare http(s) address. Never a token. */
+function parseInstance(str){
+  str = String(str || "").trim();
+  if (!str) return "";
+  var m = /[#?&](?:instance|setup)=([^&#]+)/i.exec(str);
+  var cand = m ? decodeURIComponent(m[1]) : str;
+  cand = cand.trim().replace(/\/+$/, "");
+  return /^https?:\/\/[^\s]+$/i.test(cand) ? cand : "";
+}
+function pendingInstance(){
+  var v = ""; try { v = localStorage.getItem(LS_PENDING_INSTANCE) || ""; } catch(e){}
+  return v;
+}
+(function captureInstanceFromLink(){
+  var found = parseInstance((location.hash || "") + "&" + (location.search || ""));
+  if (!found) return;
+  try { localStorage.setItem(LS_PENDING_INSTANCE, found); } catch(e){}
+  try { history.replaceState(null, "", location.pathname); } catch(e){}
+})();
+function setupLinkForCopy(){
+  var inst = pendingInstance();
+  return location.origin + location.pathname + (inst ? "#instance=" + encodeURIComponent(inst) : "");
+}
+function onbShouldInstall(){
+  var skipped = false; try { skipped = !!localStorage.getItem(LS_ONB_SKIP); } catch(e){}
+  return !isStandalone() && !skipped && installAvailable();
+}
+function showOnbInstall(done){
+  $("setup").hidden = true; $("app").hidden = true;
+  var box = $("onbInstall"), body = $("onbInstallBody"), go = $("onbInstallGo");
+  box.hidden = false;
+  if (done){
+    body.innerHTML = "<h2>Now open Smith from your Home Screen</h2>" +
+      '<p class="lede">Open the Smith icon you just added. It will ask for your address; copy your setup link first so you can paste it there.</p>';
+    go.textContent = "Copy setup link";
+    go.onclick = function(){
+      var link = setupLinkForCopy();
+      var ok = function(){ toast("Setup link copied."); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(link).then(ok, function(){ toast(link); });
+      else toast(link);
+    };
+    return;
+  }
+  if (deferredInstall){
+    body.innerHTML = "<h2>Install Smith</h2>" +
+      '<p class="lede">Smith works best as an app: full screen, and notifications when an agent replies.</p>';
+    go.textContent = "Install";
+    go.onclick = function(){ runInstall(); };
+  } else {
+    body.innerHTML = "<h2>Add Smith to your Home Screen</h2>" +
+      '<p class="lede">Smith works best as an app: full screen, and notifications when an agent replies. Set it up from the home-screen icon so it keeps your connection.</p>' +
+      iosSteps().replace("<ol>", '<ol class="onbsteps">').replace(/<li>/g, "<li><span>").replace(/<\/li>/g, "</span></li>") + '<p class="fine">It must be Safari.</p>';
+    go.textContent = "I added it";
+    go.onclick = function(){ showOnbInstall(true); };
+  }
+}
+$("onbInstallSkip").addEventListener("click", function(){
+  try { localStorage.setItem(LS_ONB_SKIP, "1"); } catch(e){}
+  boot();
+});
+window.addEventListener("appinstalled", function(){ if (!$("onbInstall").hidden) showOnbInstall(true); });
+function onbAfterConnect(){
+  var s3 = false; try { s3 = !!localStorage.getItem(LS_ONB_STEP3); } catch(e){}
+  if (!s3) return;
+  try { localStorage.removeItem(LS_ONB_STEP3); localStorage.setItem(LS_WELCOME, "1"); } catch(e){}
+  var box = $("onbNotif");
+  var canPush = pushSupported();
+  var iosNeedsInstall = isIOS() && !isStandalone();
+  if (!canPush && !iosNeedsInstall){ renderWelcome(); return; }
+  $("app").hidden = true; box.hidden = false;
+  $("onbNotifNote").textContent = iosNeedsInstall ? "On iPhone, notifications work once Smith is opened from your Home Screen." : "";
+  var go = $("onbNotifGo"); go.hidden = !canPush;
+  var finish = function(){ box.hidden = true; $("app").hidden = false; renderWelcome(); };
+  go.onclick = function(){ enableNotifications().then(finish, finish); };
+  $("onbNotifSkip").textContent = canPush ? "Not now" : "Continue";
+  $("onbNotifSkip").onclick = finish;
+}
+function renderWelcome(){
+  var card = $("welcomeCard"); if (!card) return;
+  var on = false; try { on = !!localStorage.getItem(LS_WELCOME); } catch(e){}
+  var noThreads = !(state.threads && state.threads.length);
+  card.hidden = !(on && noThreads);
+  $("welcomeGo").onclick = function(){ showScreen("pairing"); };
+  $("welcomeX").onclick = function(){ try { localStorage.removeItem(LS_WELCOME); } catch(e){} card.hidden = true; };
+}
+$("setupLink").addEventListener("input", function(){
+  var v = parseInstance(this.value);
+  if (v){ $("setupUrl").value = v; try { localStorage.setItem(LS_PENDING_INSTANCE, v); } catch(e){} }
+});
 function boot(){
   var cfg = loadCfg();
   var has = cfg && cfg.url && cfg.token;
   $("setup").hidden = !!has;
   $("app").hidden = !has;
   if (!has){
-    $("setupUrl").value = "";
+    var pend = pendingInstance();
+    if (onbShouldInstall()){ showOnbInstall(); return; }
+    $("onbInstall").hidden = true;
+    $("setupUrl").value = pend || "";
+    $("setupLink").value = "";
     $("setupToken").value = "";
     $("setupKey").value = "";
     $("setupClaim").hidden = true;
@@ -1574,12 +1674,14 @@ function boot(){
     $("setupClaimErr").textContent = "";
     return;
   }
+  $("onbInstall").hidden = true;
   applyTheme();
   renderSettings();
   registerSW();
   renderInstall();
   showScreen("home");
-  loadThreads().then(openFromHash).catch(function(e){ toast(e.message); });
+  onbAfterConnect();
+  loadThreads().then(function(){ renderWelcome(); return openFromHash(); }).catch(function(e){ toast(e.message); });
   startListPoll();
   ensureAgents().catch(function(){});
 }

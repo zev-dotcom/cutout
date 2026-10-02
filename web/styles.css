@@ -386,3 +386,30 @@ select{width:100%;min-height:var(--tap);border:1.5px solid var(--line);border-ra
 @media (prefers-reduced-motion:reduce){.actspin{animation:none}}
 .updbar{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .updx{padding:8px 4px 8px 12px;opacity:.8;font-size:1rem}
+
+/* onboarding */
+html,body{overflow-x:hidden}
+.setup-card,.onb-card{min-width:0}
+.setup-card .field input{min-width:0;max-width:100%}
+.onb{position:fixed;inset:0;z-index:80;background:var(--bg);display:flex;align-items:flex-start;justify-content:center;padding:24px;overflow-y:auto}
+.onb[hidden],.setup[hidden]{display:none}
+.onb-card{width:100%;max-width:440px;display:flex;flex-direction:column;min-height:calc(100dvh - 48px)}
+.onb-card h1{font-size:28px;font-weight:800;letter-spacing:-.03em;margin-bottom:6px}
+.onb-card h2{font-size:1.5rem;line-height:1.2;margin:6px 0 10px}
+.onbbar{display:flex;gap:6px;margin:8px 0 0}
+.onbbar i{height:4px;flex:1;border-radius:2px;background:var(--line)}
+.onbbar i.on{background:var(--accent,#f05a28)}
+.onbstep{font-size:.75rem;font-weight:800;letter-spacing:.1em;color:var(--ink3);margin:22px 0 8px}
+.onb-card .bigbtn{margin-top:auto}
+.onbnote{font-size:.85rem;color:var(--ink3);line-height:1.5;margin:0 0 12px}
+.onbnote:empty{display:none}
+.ghostbtn{width:100%;min-height:var(--tap);border-radius:14px;border:1.5px solid var(--line);background:transparent;color:var(--ink);font-size:1rem;font-weight:600;cursor:pointer;margin-top:12px}
+.ghostbtn.plain{border-color:transparent;color:var(--ink2);font-weight:500}
+.onbsteps{list-style:none;padding:0;margin:6px 0 14px;counter-reset:s}
+.onbsteps li{counter-increment:s;display:flex;gap:12px;align-items:flex-start;line-height:1.45;margin-bottom:14px}
+.onbsteps li:before{content:counter(s);flex:none;width:28px;height:28px;border-radius:50%;background:var(--ink);color:var(--bg);font-weight:700;display:flex;align-items:center;justify-content:center;font-size:.85rem}
+.welcomecard{margin:0 0 12px;padding:14px 16px;border:1.5px solid var(--accent,#f05a28);border-radius:16px;background:var(--bg2);display:flex;flex-direction:column;gap:6px}
+.welcomecard[hidden]{display:none}
+.welcomecard .ic-h{display:flex;justify-content:space-between;align-items:center;font-weight:700}
+.onb-card .lede{font-size:.95rem;color:var(--ink2);line-height:1.6;margin-bottom:16px}
+.onb-card .fine{font-size:.85rem;color:var(--ink3)}

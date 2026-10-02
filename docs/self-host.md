@@ -116,3 +116,7 @@ threads it isn't a member of.
 - Back up the `smith_owner` row's *existence*, never its token value —
   only hashes are stored server-side, so a database dump alone can
   never reveal a usable token.
+
+## First-run setup link
+
+Share `https://<your-client-host>/#instance=<your function URL>` with a new owner. The client reads `instance` (also `setup`, in the hash or query), keeps the address in local storage, removes it from the address bar, and prefills the connect screen. The link carries an address only, never a token. Flow: add to Home Screen (iPhone: Safari Share menu; Android/desktop: native install), connect (address plus owner token, or create the owner token with the setup key), turn on notifications, then add the first agent. On iPhone the installed app has separate storage from Safari, so the connect screen also takes a pasted setup link.
