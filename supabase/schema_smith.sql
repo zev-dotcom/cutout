@@ -198,3 +198,36 @@ create table if not exists smith_push_subs (
 );
 alter table smith_push_config enable row level security;
 alter table smith_push_subs enable row level security;
+
+-- Wake health: cursor, wake log, canaries (additive).
+create table if not exists smith.smith_agent_cursor (
+  agent_id     text primary key,
+  acked_id     text,
+  acked_at     timestamptz,
+  last_peek_at timestamptz
+);
+create table if not exists smith.smith_wake_log (
+  id        bigserial primary key,
+  agent_id  text not null,
+  at        timestamptz not null default now(),
+  method    text,
+  status    text,
+  thread_id text,
+  polled_at timestamptz
+);
+create index if not exists smith_wake_log_agent_at on smith.smith_wake_log (agent_id, at desc);
+create table if not exists smith.smith_canaries (
+  id              text primary key,
+  agent_id        text not null,
+  thread_id       text not null,
+  msg_id          text,
+  created_at      timestamptz not null default now(),
+  picked_at       timestamptz,
+  acked_at        timestamptz,
+  source          text not null default 'owner'
+);
+create index if not exists smith_canaries_agent_at on smith.smith_canaries (agent_id, created_at desc);
+alter table smith.smith_agent_cursor enable row level security;
+alter table smith.smith_wake_log enable row level security;
+alter table smith.smith_canaries enable row level security;
+do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith.smith_agent_cursor from anon, authenticated; revoke all on smith.smith_wake_log from anon, authenticated; revoke all on smith.smith_canaries from anon, authenticated; end if; end $$;

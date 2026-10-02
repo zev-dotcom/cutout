@@ -210,7 +210,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-02.1";
+var SMITH_BUILD = "2026-10-02.2";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -789,6 +789,11 @@ async function loadAgents(){
     var list = await api("GET", "/v1/owner/agents");
     indexAgents(Array.isArray(list) ? list : (list.agents || []));
     box.innerHTML = "";
+    var health = {};
+    try {
+      var wh = await api("GET", "/v1/owner/wake-health");
+      (wh.agents || []).forEach(function(h){ health[h.agent_id] = h; });
+    } catch(e){ /* older instance without wake-health */ }
     var shown = state.agents.filter(function(a){ return isRegistered(a) || a.revoked_at; });
     var hiddenLegacy = state.agents.length - shown.length;
     if (!shown.length){
@@ -807,6 +812,7 @@ async function loadAgents(){
         var wl = el("div", "asub wakeline", "Wake: loading…");
         row.children[1].appendChild(wl);
         refreshWakeLine(a, wl);
+        if (health[a.agent_id]) row.children[1].appendChild(healthBlock(a, health[a.agent_id]));
         row.querySelector(".revoke").addEventListener("click", function(){
           modal("Revoke " + (a.display_name || a.agent_id) + "?",
             "<p class='fine'>This cuts the agent's token and its future access to threads. Past messages stay.</p>",
@@ -826,6 +832,45 @@ async function loadAgents(){
   } catch(e){
     box.innerHTML = '<p class="fine">Could not load agents: ' + esc(e.message) + "</p>";
   }
+}
+
+/* ---------- wake health ---------- */
+function secs(s){
+  if (s === null || s === undefined) return "never";
+  if (s < 90) return s + "s";
+  if (s < 5400) return Math.round(s / 60) + "m";
+  return Math.round(s / 3600) + "h";
+}
+function healthBlock(a, h){
+  var box = el("div", "healthbox");
+  var label = {ok: "OK", slow: "Slow", stale: "Stale", never: "Not seen"}[h.state] || h.state;
+  var canary = h.last_canary && h.last_canary.pickup_ms !== null && h.last_canary.pickup_ms !== undefined
+    ? " · last test " + (h.last_canary.pickup_ms < 1000 ? h.last_canary.pickup_ms + " ms" : (h.last_canary.pickup_ms / 1000).toFixed(1) + " s") : "";
+  box.innerHTML =
+    '<div class="hline"><span class="hpill h-' + esc(h.state) + '">' + esc(label) + "</span>" +
+    '<span class="hmeta">seen ' + (h.alive_ago_s === null ? "never" : esc(secs(h.alive_ago_s)) + " ago") +
+    " · " + esc(String(h.unread)) + " unread" + (h.unread ? " (oldest " + esc(secs(h.oldest_unread_age_s)) + ")" : "") + "</span></div>" +
+    '<div class="hmeta">' + esc(h.wake_method === "none" ? "no wake hook" : "wake: " + h.wake_method + (h.wake_enabled ? "" : " (off)")) +
+    " · missed " + esc(String(h.missed_wakes_24h)) + " / " + esc(String(h.wakes_24h)) + " in 24h" + esc(canary) + "</div>" +
+    '<div class="hrow"><button class="hbtn" type="button">Send test</button><span class="hmeta hres"></span></div>';
+  var btn = box.querySelector(".hbtn"), res = box.querySelector(".hres");
+  btn.addEventListener("click", async function(){
+    btn.disabled = true; res.textContent = "waiting for pickup…";
+    try {
+      var c = await api("POST", "/v1/owner/agents/" + encodeURIComponent(a.agent_id) + "/canary", {});
+      var t0 = Date.now(), out = null;
+      while (Date.now() - t0 < 60000){
+        await new Promise(function(r){ setTimeout(r, 1500); });
+        var r = await api("GET", "/v1/owner/agents/" + encodeURIComponent(a.agent_id) + "/canary/" + encodeURIComponent(c.canary_id));
+        if (r.pickup_ms !== null){ out = r; break; }
+        res.textContent = "waiting… " + Math.round((Date.now() - t0) / 1000) + "s";
+      }
+      res.textContent = out ? "picked up in " + (out.pickup_ms < 1000 ? out.pickup_ms + " ms" : (out.pickup_ms / 1000).toFixed(1) + " s") +
+        (out.wake_status ? " · wake " + out.wake_status : "") : "not picked up in 60s";
+    } catch(e){ res.textContent = e.message; }
+    btn.disabled = false;
+  });
+  return box;
 }
 
 /* ---------- wake hooks ---------- */

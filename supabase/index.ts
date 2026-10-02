@@ -596,6 +596,7 @@ async function getMessagesInner(req, arrivedAt, auth) {
     rows = await queryOnce();
   }
   console.log(`cutout poll_hold_ms=${Date.now() - holdStarted} requested_wait=${wait} effective_wait=${Math.min(wait, MAX_HOLD_SECONDS)}`);
+  if (auth.kind === "agent") markCanariesPicked(rows).catch(()=>{});
   return getMessagesTail(rows, since);
 }
 // Shared by GET /v1/messages and the Smith thread feeds: stale one-time-link
@@ -752,6 +753,7 @@ async function getThreads(req) {
 // codes for legacy callers. New routes live under the same /v1/ prefix.
 const SMITH_VERSION = "1.0";
 const OWNER_ID = "owner";
+const WAKECHECK_LIKE = "th\\_wakecheck\\_%"; // canary threads: never listed, counted or pushed for the owner
 const MENTION_OWNER_PER_HOUR = Number(Deno.env.get("SMITH_MENTION_OWNER_PER_HOUR") ?? 20);
 const PAIRING_CODE_LEN = 6;
 // Pairing codes default to 10 minutes (short-lived, single-use). The owner
@@ -1088,7 +1090,7 @@ async function postThread(req, auth) {
 }
 async function listThreadsSmith(auth) {
   const aid = auth.agentId;
-  const scope = auth.kind === "owner" ? sql`` : sql`where t.thread_id in (select thread_id from ${S("smith_thread_members")} where agent_id = ${aid})`;
+  const scope = auth.kind === "owner" ? sql`where t.thread_id not like ${WAKECHECK_LIKE}` : sql`where t.thread_id in (select thread_id from ${S("smith_thread_members")} where agent_id = ${aid})`;
   const threads = await timedQuery(sql`
     select t.thread_id, t.name, max(m.created_at) as last_at,
       ${auth.kind === "owner"
@@ -1841,6 +1843,20 @@ async function route(req, arrivedAt) {
     if (req.method === "GET") return done(await getWake(auth, auth.agentId));
     if (req.method === "PUT") return done(await putWake(req, auth, auth.agentId));
   }
+  if (segs[0] === "v1" && segs[1] === "agents" && segs[2] === "me" && auth.kind === "agent") {
+    if (segs.length === 4 && segs[3] === "ack" && req.method === "POST") return done(await ackMessages(req, auth));
+    if (segs.length === 4 && segs[3] === "selftest" && req.method === "POST") {
+      return done(await makeCanary(auth.agentId, auth.agentId));
+    }
+    if (segs.length === 5 && segs[3] === "selftest" && req.method === "GET") return done(await canaryResult(auth.agentId, segs[4]));
+  }
+  if (segs[0] === "v1" && segs[1] === "owner" && segs[2] === "wake-health" && segs.length === 3 && req.method === "GET") return done(await wakeHealth(auth));
+  if (segs[0] === "v1" && segs[1] === "owner" && segs[2] === "agents" && segs[4] === "canary") {
+    if (auth.kind !== "owner") return done(jres(403, { error: "owner token required" }));
+    if (segs.length === 5 && req.method === "POST") return done(await makeCanary(segs[3], OWNER_ID));
+    if (segs.length === 5 && req.method === "GET") return done(await canaryResult(segs[3], null));
+    if (segs.length === 6 && req.method === "GET") return done(await canaryResult(segs[3], segs[5]));
+  }
   if (segs[0] === "v1" && segs[1] === "owner" && segs[2] === "agents" && segs[4] === "wake") {
     if (auth.kind !== "owner") return done(jres(403, { error: "owner token required" }));
     if (segs.length === 5 && req.method === "GET") return done(await getWake(auth, segs[3]));
@@ -2004,6 +2020,12 @@ async function wakeDeliver(h, payload) {
       enabled = ${ok ? sql`enabled` : sql`enabled and fail_count + 1 < ${WAKE_FAIL_DISABLE_AFTER}`}
     where agent_id = ${h.agent_id}`, "wake_status");
   await audit("system", ok ? "wake_sent" : "wake_failed", { agent_id: h.agent_id, method: h.method, status, unread: payload.unread, urgent: !!payload.urgent });
+  if (payload.event === "wake") {
+    try {
+      await sql`insert into ${S("smith_wake_log")} (agent_id, method, status, thread_id) values (${h.agent_id}, ${h.method}, ${status}, ${payload.thread_id ?? null})`;
+      if (Math.random() < 0.02) await sql`delete from ${S("smith_wake_log")} where at < now() - interval '7 days'`;
+    } catch { /* table absent */ }
+  }
   return status;
 }
 async function wakeAttempt(agentId, threadId, urgent, bypass) {
@@ -2147,7 +2169,7 @@ async function ownerUnreadTotals(threadId) {
         where m.thread_id = ${threadId} and m.from_agent <> ${OWNER_ID} and m.created_at > coalesce(orr.last_read_at, 'epoch'::timestamptz)) as thread_unread,
       (select count(*)::int from ${T("messages")} m join ${S("smith_threads")} t on t.thread_id = m.thread_id
         left join ${S("smith_owner_reads")} orr on orr.thread_id = m.thread_id
-        where m.from_agent <> ${OWNER_ID} and m.created_at > coalesce(orr.last_read_at, 'epoch'::timestamptz)) as total_unread,
+        where m.from_agent <> ${OWNER_ID} and m.thread_id not like ${WAKECHECK_LIKE} and m.created_at > coalesce(orr.last_read_at, 'epoch'::timestamptz)) as total_unread,
       (select count(*)::int from ${T("messages")} m left join ${S("smith_owner_reads")} orr on orr.thread_id = m.thread_id
         where m.thread_id = ${threadId} and m.from_agent <> ${OWNER_ID} and jsonb_exists(m.metadata->'mentions', ${OWNER_ID}) and m.created_at > coalesce(orr.last_read_at, 'epoch'::timestamptz)) as mention_unread,
       (select name from ${S("smith_threads")} where thread_id = ${threadId}) as name`, "push_unread");
@@ -2266,7 +2288,7 @@ async function pushRoutes(req, auth, segs) {
 function afterPostWake(threadId, from, to, urgentRequested, pushBodyHint, mentions) {
   const p = wakeAfterPost(threadId, from, to, urgentRequested, mentions).catch((e)=>console.error("wake failed", e));
   try { globalThis.EdgeRuntime?.waitUntil?.(p); } catch { /* local runs just let it float */ }
-  if (from !== OWNER_ID) {
+  if (from !== OWNER_ID && !String(threadId).startsWith("th_wakecheck_")) {
     const q = pushNotifyOwner(threadId, pushBodyHint, false).catch((e)=>console.error("push failed", e));
     try { globalThis.EdgeRuntime?.waitUntil?.(q); } catch { /* local */ }
   }
@@ -2280,8 +2302,156 @@ async function touchPoll(agentId) {
   if (now - (pollTouch.get(agentId) ?? 0) < 3000) return;
   pollTouch.set(agentId, now);
   try { await sql`update ${S("smith_wake_hooks")} set last_poll_at = now() where agent_id = ${agentId}`; } catch { /* hooks table absent: wake not installed */ }
+  markWakeAnswered(agentId).catch(()=>{});
+}
+// A poll, peek or ack after a wake means the agent answered it.
+async function markWakeAnswered(agentId) {
+  try { await sql`update ${S("smith_wake_log")} set polled_at = now() where agent_id = ${agentId} and polled_at is null and at > now() - interval '10 minutes'`; } catch { /* table absent */ }
+}
+// Canary pickup: first time the target agent's poll returns the canary message.
+async function markCanariesPicked(rows) {
+  const ids = rows.filter((r)=> r.metadata && r.metadata.canary).map((r)=> r.id);
+  if (!ids.length) return;
+  try { await sql`update ${S("smith_canaries")} set picked_at = now() where msg_id = any(${ids}) and picked_at is null`; } catch { /* table absent */ }
+}
+async function agentUnreadState(agentId) {
+  const r = await timedQuery(sql`
+    with base as (
+      select coalesce(c.acked_at, h.last_poll_at, a.created_at) as since
+      from ${S("smith_agents")} a
+      left join ${S("smith_agent_cursor")} c on c.agent_id = a.agent_id
+      left join ${S("smith_wake_hooks")} h on h.agent_id = a.agent_id
+      where a.agent_id = ${agentId})
+    select
+      (select count(*)::int from ${T("messages")} m join ${S("smith_thread_members")} tm on tm.thread_id = m.thread_id and tm.agent_id = ${agentId} and tm.legacy_unverified = false and m.created_at >= tm.added_at, base
+        where (m.to_agent = ${agentId} or m.to_agent = '*' or jsonb_exists(m.metadata->'mentions', ${agentId})) and m.from_agent <> ${agentId} and m.created_at > base.since) as unread,
+      (select extract(epoch from now() - min(m.created_at))::int from ${T("messages")} m join ${S("smith_thread_members")} tm on tm.thread_id = m.thread_id and tm.agent_id = ${agentId} and tm.legacy_unverified = false and m.created_at >= tm.added_at, base
+        where (m.to_agent = ${agentId} or m.to_agent = '*' or jsonb_exists(m.metadata->'mentions', ${agentId})) and m.from_agent <> ${agentId} and m.created_at > base.since) as oldest_age_s,
+      (select m.id from ${T("messages")} m join ${S("smith_thread_members")} tm on tm.thread_id = m.thread_id and tm.agent_id = ${agentId} and tm.legacy_unverified = false and m.created_at >= tm.added_at
+        where (m.to_agent = ${agentId} or m.to_agent = '*' or jsonb_exists(m.metadata->'mentions', ${agentId})) and m.from_agent <> ${agentId} order by m.created_at desc, m.id desc limit 1) as newest_id`, "agent_unread_state");
+  return r[0];
+}
+async function unreadStatesFor(ids) {
+  const rows = await timedQuery(sql`
+    select a.agent_id, count(m.id)::int as unread, (extract(epoch from now() - min(m.created_at)))::int as oldest_age_s
+    from ${S("smith_agents")} a
+    left join ${S("smith_agent_cursor")} c on c.agent_id = a.agent_id
+    left join ${S("smith_wake_hooks")} h on h.agent_id = a.agent_id
+    left join ${S("smith_thread_members")} tm on tm.agent_id = a.agent_id and tm.legacy_unverified = false
+    left join ${T("messages")} m on m.thread_id = tm.thread_id and m.created_at >= tm.added_at and m.from_agent <> a.agent_id
+      and (m.to_agent = a.agent_id or m.to_agent = '*' or jsonb_exists(m.metadata->'mentions', a.agent_id))
+      and m.created_at > coalesce(c.acked_at, h.last_poll_at, a.created_at)
+    where a.agent_id = any(${ids}) group by a.agent_id`, "unread_states");
+  return new Map(rows.map((r)=>[r.agent_id, r]));
+}
+async function peekMessages(auth) {
+  // Peek writes are throttled: one upsert per agent per 5 s.
+  const touched = await timedQuery(sql`insert into ${S("smith_agent_cursor")} (agent_id, last_peek_at) values (${auth.agentId}, now())
+    on conflict (agent_id) do update set last_peek_at = now() where ${S("smith_agent_cursor")}.last_peek_at is null or ${S("smith_agent_cursor")}.last_peek_at < now() - interval '5 seconds' returning agent_id`, "peek_touch");
+  if (touched.length) markWakeAnswered(auth.agentId).catch(()=>{});
+  const st = await agentUnreadState(auth.agentId);
+  const cur = await timedQuery(sql`select acked_id, acked_at from ${S("smith_agent_cursor")} where agent_id = ${auth.agentId}`, "peek_cursor");
+  return jres(200, { unread: st.unread, oldest_unread_age_s: st.oldest_age_s ?? 0, newest_id: st.newest_id ?? null, cursor: cur[0]?.acked_id ? { acked_id: cur[0].acked_id, acked_at: iso(cur[0].acked_at) } : null });
+}
+async function ackMessages(req, auth) {
+  let body; try { body = await req.json(); } catch { return jres(400, { error: "invalid JSON" }); }
+  const mid = body?.through_id;
+  if (typeof mid !== "string" || !mid) return jres(422, { error: "through_id required" });
+  const m = await timedQuery(sql`
+    select m.id, m.created_at from ${T("messages")} m join ${S("smith_thread_members")} tm on tm.thread_id = m.thread_id and tm.agent_id = ${auth.agentId} and tm.legacy_unverified = false and m.created_at >= tm.added_at
+    where m.id = ${mid}`, "ack_find");
+  if (!m.length) return jres(404, { error: "message not found for this agent" });
+  // created_at is copied inside the database: a JS Date would truncate the microseconds.
+  await timedQuery(sql`
+    insert into ${S("smith_agent_cursor")} (agent_id, acked_id, acked_at)
+    select ${auth.agentId}, m.id, m.created_at from ${T("messages")} m where m.id = ${m[0].id}
+    on conflict (agent_id) do update set acked_id = case when ${S("smith_agent_cursor")}.acked_at is null or excluded.acked_at > ${S("smith_agent_cursor")}.acked_at then excluded.acked_id else ${S("smith_agent_cursor")}.acked_id end,
+                                         acked_at = greatest(${S("smith_agent_cursor")}.acked_at, excluded.acked_at)`, "ack_upsert");
+  await timedQuery(sql`update ${S("smith_canaries")} set acked_at = now() where agent_id = ${auth.agentId} and acked_at is null and picked_at is not null and msg_id in (select c2.id from ${T("messages")} c2 where c2.created_at <= (select created_at from ${T("messages")} where id = ${m[0].id}))`, "ack_canary");
+  markWakeAnswered(auth.agentId).catch(()=>{});
+  return jres(200, { ok: true, acked_id: m[0].id });
+}
+const CANARY_PER_HOUR = 30;
+const SELFTEST_PER_HOUR = 12;
+async function makeCanary(agentId, actor) {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(agentId)) return jres(422, { error: "bad agent id" });
+  const a = await timedQuery(sql`select 1 from ${S("smith_agents")} where agent_id = ${agentId} and revoked_at is null and token_hash is not null`, "canary_agent");
+  if (!a.length) return jres(404, { error: "agent not registered" });
+  const src = actor === OWNER_ID ? "owner" : "agent";
+  const n = await timedQuery(sql`select count(*)::int as n from ${S("smith_canaries")} where agent_id = ${agentId} and source = ${src} and created_at > now() - interval '1 hour'`, "canary_rate");
+  if (n[0].n >= (src === "owner" ? CANARY_PER_HOUR : SELFTEST_PER_HOUR)) return jres(429, { error: "canary limit reached" }, { "Retry-After": "600" });
+  const tid = "th_wakecheck_" + agentId;
+  const cid = "cn_" + ulid(), mid = "msg_" + ulid();
+  await timedQuery(sql.begin(async (tx)=>{
+    await tx`insert into ${S("smith_threads")} (thread_id, name, created_by) values (${tid}, ${"Wake check · " + agentId}, ${OWNER_ID}) on conflict do nothing`;
+    await tx`insert into ${S("smith_thread_members")} (thread_id, agent_id) values (${tid}, ${agentId}) on conflict do nothing`;
+    await tx`insert into ${T("messages")} (id, thread_id, from_agent, to_agent, type, body, metadata)
+             values (${mid}, ${tid}, ${OWNER_ID}, ${agentId}, 'note', 'Wake check. No action needed beyond a short reply or an ack.', ${sql.json({ canary: cid })})`;
+    await tx`insert into ${S("smith_canaries")} (id, agent_id, thread_id, msg_id, source) values (${cid}, ${agentId}, ${tid}, ${mid}, ${src})`;
+  }), "canary_create", 3500);
+  await audit(actor, "canary", { agent_id: agentId, canary_id: cid });
+  // Same wake path as any owner message; owner pushes never fire for owner posts.
+  afterPostWake(tid, OWNER_ID, agentId, false, null, []);
+  return jres(201, { canary_id: cid, thread_id: tid, message_id: mid });
+}
+async function canaryResult(agentId, cid) {
+  const r = await timedQuery(sql`select c.*, (select status from ${S("smith_wake_log")} w where w.agent_id = c.agent_id and w.at >= c.created_at order by w.at asc limit 1) as wake_status,
+      (select extract(epoch from w.at - c.created_at) * 1000 from ${S("smith_wake_log")} w where w.agent_id = c.agent_id and w.at >= c.created_at order by w.at asc limit 1)::int as wake_sent_ms
+    from ${S("smith_canaries")} c where c.agent_id = ${agentId} ${cid ? sql`and c.id = ${cid}` : sql``} order by c.created_at desc limit 1`, "canary_result");
+  if (!r.length) return jres(404, { error: "no canary" });
+  const c = r[0];
+  return jres(200, {
+    canary_id: c.id, agent_id: c.agent_id, created_at: iso(c.created_at),
+    picked_at: c.picked_at ? iso(c.picked_at) : null,
+    pickup_ms: c.picked_at ? Math.round(new Date(c.picked_at).getTime() - new Date(c.created_at).getTime()) : null,
+    acked_at: c.acked_at ? iso(c.acked_at) : null,
+    wake_status: c.wake_status ?? null, wake_sent_ms: c.wake_sent_ms ?? null
+  });
+}
+async function wakeHealth(auth) {
+  const denied = requireOwner(auth);
+  if (denied) return denied;
+  const rows = await timedQuery(sql`
+    select a.agent_id, a.display_name, a.platform,
+      h.method, h.enabled, h.last_wake_at, h.last_poll_at, h.last_status, h.fail_count,
+      c.last_peek_at, c.acked_at,
+      (select max(at) from ${S("smith_wake_log")} w where w.agent_id = a.agent_id and w.status = 'ok') as last_wake_ok_at,
+      (select count(*)::int from ${S("smith_wake_log")} w where w.agent_id = a.agent_id and w.at > now() - interval '24 hours') as wakes_24h,
+      (select count(*)::int from ${S("smith_wake_log")} w where w.agent_id = a.agent_id and w.at > now() - interval '24 hours' and w.at < now() - interval '90 seconds'
+         and (w.status <> 'ok' or w.polled_at is null or w.polled_at - w.at > interval '90 seconds')) as missed_24h,
+      (select jsonb_build_object('at', k.created_at, 'pickup_ms', (extract(epoch from k.picked_at - k.created_at) * 1000)::int) from ${S("smith_canaries")} k where k.agent_id = a.agent_id order by k.created_at desc limit 1) as canary
+    from ${S("smith_agents")} a
+    left join ${S("smith_wake_hooks")} h on h.agent_id = a.agent_id
+    left join ${S("smith_agent_cursor")} c on c.agent_id = a.agent_id
+    where a.revoked_at is null and a.token_hash is not null
+    order by a.agent_id asc`, "wake_health");
+  const out = [];
+  const states = await unreadStatesFor(rows.map((r)=>r.agent_id));
+  for (const r of rows) {
+    const st = states.get(r.agent_id) ?? { unread: 0, oldest_age_s: 0 };
+    const alive = [r.last_poll_at, r.last_peek_at].filter(Boolean).map((x)=> new Date(x).getTime()).sort((x, y)=> y - x)[0] ?? null;
+    const aliveAgo = alive ? Math.round((Date.now() - alive) / 1000) : null;
+    const oldest = st.oldest_age_s ?? 0;
+    let state = "ok";
+    const hooked = r.enabled === true && (r.method === "webhook" || r.method === "email");
+    if (alive === null && hooked) state = r.missed_24h > 0 ? "slow" : "ok"; // reachable by webhook, never needs to poll
+    else if (alive === null) state = "never";
+    else if (st.unread > 0 && oldest > 180 && aliveAgo > 120) state = "stale";
+    else if (oldest > 60 || (r.canary && r.canary.pickup_ms !== null && r.canary.pickup_ms > 30000) || r.missed_24h > 0) state = "slow";
+    out.push({
+      agent_id: r.agent_id, display_name: r.display_name, platform: r.platform, state,
+      wake_method: r.method ?? "none", wake_enabled: r.enabled ?? false, wake_fail_count: r.fail_count ?? 0, wake_last_status: r.last_status ?? null,
+      last_poll_at: r.last_poll_at ? iso(r.last_poll_at) : null, last_peek_at: r.last_peek_at ? iso(r.last_peek_at) : null,
+      alive_ago_s: aliveAgo, last_wake_at: r.last_wake_at ? iso(r.last_wake_at) : null, last_wake_ok_at: r.last_wake_ok_at ? iso(r.last_wake_ok_at) : null,
+      wakes_24h: r.wakes_24h, missed_wakes_24h: r.missed_24h, unread: st.unread, oldest_unread_age_s: oldest,
+      acked_at: r.acked_at ? iso(r.acked_at) : null,
+      last_canary: r.canary ? { at: iso(r.canary.at), pickup_ms: r.canary.pickup_ms } : null
+    });
+  }
+  return jres(200, { agents: out, generated_at: new Date().toISOString() });
 }
 async function getMessages(req, arrivedAt, auth) {
+  if (auth.kind === "agent" && new URL(req.url).searchParams.get("peek") === "1") return await peekMessages(auth);
   if (auth.kind !== "agent") return await getMessagesInner(req, arrivedAt, auth);
   markPolling(auth.agentId, 1);
   touchPoll(auth.agentId).catch(()=>{});
