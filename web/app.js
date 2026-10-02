@@ -698,10 +698,14 @@ function appendMessages(msgs, opts){
     // Concurrent polls (timer + send) can return the same message twice: render each id once.
     if (m.id && box.querySelector('[data-mid="' + String(m.id).replace(/"/g, "") + '"]')) return;
     if (m.id) indexMsg(m);
-    if (m.from === "owner" && m.body){
-      // The server copy of a message we are still sending (stream or poll beat the POST reply): drop the temporary bubble.
-      var pend = Array.prototype.filter.call(box.querySelectorAll(".msgrow.pending[data-pk]"), function(r){ return r.dataset.pbody === m.body; })[0];
-      if (pend){ delete pendingSends[pend.dataset.pk]; pend.remove(); }
+    if (m.from === "owner"){
+      // The server copy of a message we are still sending (stream or poll beat the POST reply): drop the temporary
+      // bubble. Matched by the client key we put in metadata; body text only for copies that carry no key.
+      var ck = m.metadata && m.metadata.client_key;
+      var pend = Array.prototype.filter.call(box.querySelectorAll(".msgrow[data-pk]"), function(r){
+        return ck ? r.dataset.pk === ck : (r.classList.contains("pending") && r.dataset.pbody === m.body);
+      })[0];
+      if (pend){ delete pendingSends[pend.dataset.pk]; outboxDrop(pend.dataset.pk); pend.remove(); }
     }
     var day = fmtDay(m.created_at);
     if (day !== lastDay){
@@ -778,6 +782,7 @@ function openThread(tid){
       }
       setWorking(feed.working);
       markRead(tid, msgs);
+      resumeOutbox(tid);
       startThreadPoll();
     })
     .catch(function(e){ toast(e.message); });
@@ -940,6 +945,12 @@ function growComposer(){ var i = $("composerInput"); i.style.height = "auto"; i.
    server's id replaces the temporary one. A failed send stays on screen with a tap-to-retry that reuses
    the same idempotency key, so a retry (or a double tap) can never post twice. */
 var pendingSends = {};
+var OUTBOX_KEY = "smith.outbox";
+function loadOutbox(){ try { return JSON.parse(localStorage.getItem(OUTBOX_KEY) || "{}") || {}; } catch(e){ return {}; } }
+function saveOutbox(o){ try { localStorage.setItem(OUTBOX_KEY, JSON.stringify(o)); } catch(e){} }
+function outboxAdd(p){ var o = loadOutbox(); o[p.key] = { key: p.key, tid: p.tid, body: p.body, to: p.to, mentions: p.mentions, at: p.at }; saveOutbox(o); }
+function outboxDrop(key){ var o = loadOutbox(); if (o[key]){ delete o[key]; saveOutbox(o); } }
+var sendChain = {};   // per thread: POSTs go out in tap order
 function pendingRow(p){
   var box = $("threadMsgs");
   var row = box.querySelector('[data-pk="' + CSS.escape(p.key) + '"]');
@@ -958,25 +969,32 @@ function showPending(p){
   box.scrollTop = box.scrollHeight;
 }
 function markFailed(p, text){
+  if (text) toast(text);
   var row = pendingRow(p); if (!row) return;
   row.classList.remove("pending"); row.classList.add("failed");
   var r = row.querySelector(".rcpt"); if (r) r.innerHTML = '<button type="button" class="retrybtn">Not sent. Tap to retry</button>';
   var btn = row.querySelector(".retrybtn");
   if (btn) btn.onclick = function(){ row.classList.remove("failed"); row.classList.add("pending"); r.textContent = "Sending…"; postPending(p); };
-  if (text) toast(text);
 }
-async function postPending(p){
+function postPending(p){
+  // Serialize per thread so a slow first send cannot be overtaken by a quick second one.
+  var prev = sendChain[p.tid] || Promise.resolve();
+  var cur = prev.then(function(){ return doPost(p); });
+  sendChain[p.tid] = cur.catch(function(){});
+  return cur;
+}
+async function doPost(p){
   try {
     var res = await api("POST", "/v1/messages", {
       thread_id: p.tid, from: "owner", to: p.to, type: "note", body: p.body,
-      ...(p.mentions.length ? { metadata: { mentions: p.mentions } } : {}),
+      metadata: { client_key: p.key, ...(p.mentions.length ? { mentions: p.mentions } : {}) },
       idempotency_key: p.key
     });
-    delete pendingSends[p.key];
+    delete pendingSends[p.key]; outboxDrop(p.key);
     var row = pendingRow(p);
     if (p.tid !== state.currentThread){ if (row) row.remove(); return; }
     var real = { id: res.id, from: "owner", to: p.to, type: "note", body: p.body, created_at: res.created_at || p.at,
-      metadata: p.mentions.length ? { mentions: p.mentions } : {} };
+      metadata: { client_key: p.key, ...(p.mentions.length ? { mentions: p.mentions } : {}) } };
     if ($("threadMsgs").querySelector('[data-mid="' + CSS.escape(String(res.id)) + '"]')){ if (row) row.remove(); return; } // the stream got there first
     if (row) row.remove();
     appendMessages([real]);
@@ -985,6 +1003,22 @@ async function postPending(p){
   } catch(e){
     markFailed(p, e.message);
   }
+}
+/* Sends that never got an answer (thread left, reload, app killed): show them again and send once more with
+   the same key. The server treats the key as the same message, so nothing is posted twice and nothing is lost. */
+function resumeOutbox(tid){
+  var o = loadOutbox(), now = Date.now();
+  Object.keys(o).forEach(function(k){
+    var p = o[k];
+    if (now - Date.parse(p.at) > 24 * 3600 * 1000){ outboxDrop(k); return; }
+    if (p.tid !== tid) return;
+    var box = $("threadMsgs");
+    if (box.querySelector('[data-pk="' + CSS.escape(p.key) + '"]')) return;
+    p.mentions = p.mentions || [];
+    pendingSends[p.key] = p;
+    showPending(p);
+    postPending(p);
+  });
 }
 function sendMessage(){
   var tid = state.currentThread;
@@ -997,7 +1031,7 @@ function sendMessage(){
   var mentions = Object.keys(mentionPicks).filter(function(id){ return body.indexOf("@" + mentionPicks[id]) >= 0; });
   var p = { key: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()), tid: tid, body: body, to: to,
     mentions: mentions, at: new Date().toISOString() };
-  pendingSends[p.key] = p;
+  pendingSends[p.key] = p; outboxAdd(p);
   input.value = ""; growComposer(); mentionPicks = {}; closeMentionPop(); draftKey = null;
   showPending(p);
   postPending(p);
