@@ -317,3 +317,19 @@ select{width:100%;min-height:var(--tap);border:1.5px solid var(--line);border-ra
 .msg-out .mention{background:rgba(255,255,255,.2);color:inherit}
 .mention.me{background:rgba(240,90,40,.22)}
 .msgrow.ment-me .bub{border-left:4px solid var(--accent,#f05a28)}
+
+/* wake health */
+.healthbox{margin-top:8px;display:flex;flex-direction:column;gap:5px}
+.hline,.hrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.hmeta{font-size:12.5px;color:var(--ink2);line-height:1.4}
+.hpill{font-size:11.5px;font-weight:700;letter-spacing:.04em;border-radius:999px;padding:3px 10px;border:1.5px solid var(--line);background:var(--bg2);color:var(--ink)}
+.hpill.h-ok{background:#e4f4e6;border-color:#bfe3c4;color:#1d6b2b}
+.hpill.h-slow{background:#fff1d6;border-color:#f1d79a;color:#8a5a00}
+.hpill.h-stale,.hpill.h-never{background:#fde4e0;border-color:#f3bcb4;color:#a8261a}
+.hbtn{min-height:36px;padding:0 14px;border-radius:999px;border:1.5px solid var(--line);background:var(--bg);color:var(--ink);font-size:13px;cursor:pointer}
+.hbtn:disabled{opacity:.5}
+.accrow{align-items:flex-start}
+.accrow>div:nth-child(2){flex:1;min-width:0}
+.accrow .linkbtn{display:inline;padding:0 2px;min-height:0}
+.accrow .revoke,.accrow .revoketag{margin-top:2px}
+.accrow .wakeline{text-align:left}.accrow .wakeline .linkbtn{display:inline-block;vertical-align:baseline}
