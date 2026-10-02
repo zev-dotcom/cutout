@@ -413,6 +413,7 @@ check("re-verify already-verified -> 200 already_verified", s == 200 and vd.get(
 s, au = req("GET", "/v1/owner/audit?limit=20", headers=bearer(OWNER))
 vd_acts = [r for r in au.get("audit", []) if r.get("action") == "verify_member"]
 check("verify_member audit has message_count", any("message_count" in (r.get("detail") or {}) for r in vd_acts), f"{vd_acts[:1]}")
+check("verify_member audit has thread counts", any("thread_message_count" in (r.get("detail") or {}) and "thread_sender_count" in (r.get("detail") or {}) for r in vd_acts), f"{vd_acts[:1]}")
 # P2-b: reserved identities not claimable via legacy credentials.
 s, _ = req("GET", "/v1/threads", headers=legacy_headers("owner"))
 check("legacy X-Agent-Id: owner -> 401", s == 401, f"{s}")

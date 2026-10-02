@@ -395,8 +395,8 @@ async function postMessage(req, auth) {
   // P2-b: legacy callers without X-Agent-Id have no bound identity, so `from`
   // is unchecked above -- but reserved identities are never claimable.
   // (Unmanaged legacy threads have no sender authenticity by design; see
-  // docs/smith-api.md.)
-  if (auth.kind === "legacy" && RESERVED_AGENT_RE.test(body.from)) {
+  // docs/smith-api.md.) I2-5: trim before testing so "owner " cannot slip by.
+  if (auth.kind === "legacy" && RESERVED_AGENT_RE.test(String(body.from || "").trim())) {
     return jres(403, {
       error: "from is reserved"
     });
@@ -741,7 +741,12 @@ const LEGACY_STRICT = (()=>{
   const raw = Deno.env.get("SMITH_LEGACY_STRICT");
   if (raw === undefined) return true;
   const v = raw.toLowerCase();
-  if (v === "0" || v === "false") return false;
+  if (v === "0" || v === "false") {
+    // I2-5 item 3: loud boot warning for the explicit off case, not just
+    // the unrecognized case — strict-off is a deliberate security downgrade.
+    console.error("smith: WARNING — SMITH_LEGACY_STRICT is OFF; legacy credentials are accepted on managed threads");
+    return false;
+  }
   if (v !== "1" && v !== "true") {
     console.error(`smith: unrecognized SMITH_LEGACY_STRICT=${JSON.stringify(raw)} — failing closed (strict ON)`);
   }
@@ -847,7 +852,8 @@ async function resolveAuth(req) {
     const aid = hid && hid.length ? hid : null;
     if (aid) {
       // P2-b: reserved identities cannot be claimed via the legacy header.
-      if (RESERVED_AGENT_RE.test(aid)) {
+      // I2-5: trim before testing so "owner " cannot slip by.
+      if (RESERVED_AGENT_RE.test(aid.trim())) {
         await auditFailedAuth("legacy", {
           reason: "reserved_id",
           agent_id: aid
@@ -1534,30 +1540,41 @@ async function verifyMember(req, auth, threadId, aid) {
     error: "member not found"
   });
   // P2-d: audit the member's message count so the owner sees what history
-  // they are granting access to.
+  // they are granting access to. I2-5: also the thread's total message count
+  // and distinct sender count, since the grant covers the whole thread.
   const mc = await timedQuery(sql`select count(*)::int as c from ${T("messages")} where thread_id = ${threadId} and from_agent = ${aid}`, "member_verify_msgcount");
   const msgCount = mc[0].c;
+  const tc = await timedQuery(sql`select count(*)::int as total, count(distinct from_agent)::int as senders from ${T("messages")} where thread_id = ${threadId}`, "member_verify_threadcount");
+  const threadTotal = tc[0].total, threadSenders = tc[0].senders;
+  const auditDetail = {
+    thread_id: threadId,
+    agent_id: aid,
+    message_count: msgCount,
+    thread_message_count: threadTotal,
+    thread_sender_count: threadSenders,
+    member_since: cur[0].added_at ? String(cur[0].added_at) : null
+  };
   if (!cur[0].legacy_unverified) {
     await audit(OWNER_ID, "verify_member", {
-      thread_id: threadId,
-      agent_id: aid,
-      already_verified: true,
-      message_count: msgCount
+      ...auditDetail,
+      already_verified: true
     });
     return jres(200, {
       ok: true,
       already_verified: true
     });
   }
-  const rows = await timedQuery(sql`update ${S("smith_thread_members")} set legacy_unverified = false where thread_id = ${threadId} and agent_id = ${aid} returning 1`, "member_verify");
-  if (!rows.length) return jres(404, {
-    error: "member not found"
+  // I2-5 item 1: the grant (UPDATE) and its audit row commit atomically.
+  // If the audit insert fails, the verification rolls back too — never grant
+  // access without the audit trail (fail-closed, mirroring owner reads).
+  const updated = await sql.begin(async (tx)=>{
+    const u = await tx`update ${S("smith_thread_members")} set legacy_unverified = false where thread_id = ${threadId} and agent_id = ${aid} returning 1`;
+    if (!u.length) return false;
+    await tx`insert into ${S("smith_audit")} (actor, action, detail) values (${OWNER_ID}, ${"verify_member"}, ${sql.json(auditDetail)})`;
+    return true;
   });
-  await audit(OWNER_ID, "verify_member", {
-    thread_id: threadId,
-    agent_id: aid,
-    message_count: msgCount,
-    member_since: cur[0].added_at ? String(cur[0].added_at) : null
+  if (!updated) return jres(404, {
+    error: "member not found"
   });
   return jres(200, {
     ok: true
