@@ -484,6 +484,12 @@ s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", PNG, PB); check("avatar: 
 s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", b"GIF89a" + b"\x00" * 50, PA); check("avatar: gif rejected -> 415", s == 415, s)
 s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", b"<svg xmlns='http://www.w3.org/2000/svg'/>", PA); check("avatar: svg rejected -> 415", s == 415, s)
 s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", PNG + b"\x00" * 110000, PA); check("avatar: over 100KB -> 413", s == 413, s)
+def rawnl(m, p, data, tok):
+    import http.client, urllib.parse
+    u = urllib.parse.urlparse(BASE); c = http.client.HTTPConnection(u.hostname, u.port, timeout=30)
+    c.putrequest(m, p, skip_accept_encoding=True); c.putheader("authorization", "Bearer " + tok); c.putheader("transfer-encoding", "chunked"); c.endheaders()
+    c.send(("%x\r\n" % len(data)).encode() + data + b"\r\n0\r\n\r\n"); r = c.getresponse(); return r.status
+check("avatar: chunked PUT without content-length rejected", rawnl("PUT", "/v1/threads/" + TAV + "/avatar", PNG, PA) in (411, 413), None)
 s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", PNG, PA); v1 = json.loads(b).get("avatar_version") if s == 200 else None; check("avatar: creator sets png", s == 200 and v1 and len(v1) == 12, (s, b))
 s, b, h = raw("GET", "/v1/threads/" + TAV + "/avatar", tok=PB); check("avatar: member GET returns the bytes with image type", s == 200 and b == PNG and h.get("Content-Type", h.get("content-type")) == "image/png" and "nosniff" in str(h).lower(), (s, h))
 s, b, h = raw("GET", "/v1/threads/" + TAV + "/avatar", tok=PA2) if False else raw("GET", "/v1/threads/" + TAV + "/avatar", tok=OWN); check("avatar: owner can read", s == 200, s)
@@ -493,5 +499,7 @@ s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", b"RIFF\x00\x00\x00\x00WEB
 s, b, h = raw("DELETE", "/v1/threads/" + TAV + "/avatar", tok=PB); check("avatar: member cannot delete -> 403", s == 403, s)
 s, b, h = raw("DELETE", "/v1/threads/" + TAV + "/avatar", tok=OWN); check("avatar: owner deletes", s == 200, s)
 s, b, h = raw("GET", "/v1/threads/" + TAV + "/avatar", tok=PA); check("avatar: gone after delete -> 404", s == 404, s)
+sql("insert into smith.smith_audit (actor, action, detail) select 'pk-a', 'thread_avatar_set', jsonb_build_object('thread_id', '" + TAV + "') from generate_series(1, 20)")
+s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", PNG, PA); check("avatar: over 20 sets/hour per thread -> 429", s == 429, s)
 s, b, h = raw("GET", "/v1/threads/" + T8 + "/avatar", tok=PA); check("avatar: non-member of another thread cannot read", s in (403, 404), s)
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)

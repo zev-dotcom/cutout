@@ -1360,8 +1360,12 @@ async function threadAvatar(req, auth, threadId) {
     await timedQuery(sql`delete from ${S("smith_thread_avatar")} where thread_id = ${threadId}`, "avatar_delete");
     return jres(200, { thread_id: threadId, avatar_version: null });
   }
-  const len = Number(req.headers.get("content-length") ?? "0");
-  if (len > AVATAR_MAX_BYTES) return jres(413, { error: "chat photo exceeds 100 KB" });
+  const lenH = req.headers.get("content-length");
+  if (lenH === null) return jres(411, { error: "content-length required" });
+  const len = Number(lenH);
+  if (!Number.isFinite(len) || len > AVATAR_MAX_BYTES) return jres(413, { error: "chat photo exceeds 100 KB" });
+  const rl = await timedQuery(sql`select count(*)::int as n from ${S("smith_audit")} where action = 'thread_avatar_set' and detail->>'thread_id' = ${threadId} and at > now() - interval '1 hour'`, "avatar_rate");
+  if (rl[0].n >= 20) return jres(429, { error: "chat photo changed too often, try again later" });
   const buf = new Uint8Array(await req.arrayBuffer());
   if (buf.length === 0) return jres(422, { error: "image body required" });
   if (buf.length > AVATAR_MAX_BYTES) return jres(413, { error: "chat photo exceeds 100 KB" });

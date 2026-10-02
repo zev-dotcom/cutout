@@ -214,11 +214,14 @@ function hydrateAvatars(root){
     if (avCache[key]){ n.style.backgroundImage = "url(" + avCache[key] + ")"; return; }
     if (avCache[key] === null) return;
     avCache[key] = null; // fetch once
-    fetch(baseUrl() + "/v1/threads/" + encodeURIComponent(n.dataset.avt) + "/avatar", { headers: { "Authorization": "Bearer " + token() } })
+    fetch(baseUrl() + "/v1/threads/" + encodeURIComponent(n.dataset.avt) + "/avatar?v=" + encodeURIComponent(n.dataset.avv), { headers: { "Authorization": "Bearer " + token() } })
       .then(function(r){ if (!r.ok) throw new Error("avatar " + r.status); return r.blob(); })
       .then(function(bl){
+        Object.keys(avCache).forEach(function(k){
+          if (k.indexOf(n.dataset.avt + ":") === 0 && k !== key && avCache[k]){ URL.revokeObjectURL(avCache[k]); delete avCache[k]; }
+        });
         avCache[key] = URL.createObjectURL(bl);
-        document.querySelectorAll('.avatar.photo[data-avt="' + n.dataset.avt + '"][data-avv="' + n.dataset.avv + '"]').forEach(function(m){ m.style.backgroundImage = "url(" + avCache[key] + ")"; });
+        document.querySelectorAll('.avatar.photo[data-avt="' + CSS.escape(n.dataset.avt) + '"][data-avv="' + CSS.escape(n.dataset.avv) + '"]').forEach(function(m){ m.style.backgroundImage = "url(" + avCache[key] + ")"; });
       })
       .catch(function(){ delete avCache[key]; });
   });
