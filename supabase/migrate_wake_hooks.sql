@@ -28,3 +28,27 @@ create table if not exists smith.smith_owner_reads (
 );
 alter table smith.smith_owner_reads enable row level security;
 do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith.smith_owner_reads from anon, authenticated; end if; end $$;
+
+-- Web Push for the owner's devices. Keys are generated per instance on first opt-in.
+create table if not exists smith.smith_push_config (
+  id           integer primary key check (id = 1),
+  public_key   text not null,
+  private_jwk  jsonb not null,           -- VAPID private key: server-side only, never returned
+  contact      text not null default 'mailto:noreply@example.invalid',
+  include_body boolean not null default false,
+  created_at   timestamptz not null default now()
+);
+create table if not exists smith.smith_push_subs (
+  id           text primary key,
+  endpoint     text not null unique,
+  p256dh       text not null,
+  auth         text not null,
+  label        text not null default 'device',
+  created_at   timestamptz not null default now(),
+  last_ok_at   timestamptz,
+  last_push_at timestamptz,
+  fail_count   integer not null default 0
+);
+alter table smith.smith_push_config enable row level security;
+alter table smith.smith_push_subs enable row level security;
+do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith.smith_push_config from anon, authenticated; revoke all on smith.smith_push_subs from anon, authenticated; end if; end $$;

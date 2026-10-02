@@ -2,10 +2,18 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="smith-build" content="2026-10-01.5">
+<meta name="smith-build" content="2026-10-01.6">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
 <title>Smith</title>
-<link rel="stylesheet" href="styles.css?v=20261001e">
+<meta name="theme-color" content="#0C0C0E">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Smith">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="stylesheet" href="styles.css?v=20261001f">
 </head>
 <body data-theme="mono">
 
@@ -54,6 +62,7 @@
       <button class="iconbtn" id="navSettings" title="Settings" aria-label="Settings">⚙</button>
       <div class="ownerav" title="Instance owner">OW</div>
     </div>
+    <div class="installcard" id="installCard" hidden></div>
     <div class="search"><span aria-hidden="true">⌕</span><input id="threadSearch" placeholder="Search chats" aria-label="Search chats"></div>
     <div class="tlist" id="threadList" role="listbox" aria-label="Threads"></div>
     <button class="newthread" id="newThreadBtn">＋ New chat</button>
@@ -190,6 +199,27 @@
           </div>
           <button class="iconbtn" id="themeToggle" title="Toggle Mono / Noir" aria-label="Toggle theme">◐</button>
         </div>
+        <div class="setrow" id="installRow" hidden>
+          <div class="slbl">Install Smith
+            <div class="ssub" id="installSub">Add Smith to your home screen to open it like an app.</div>
+          </div>
+          <button class="copybtn" id="installBtn" style="width:auto;padding:0 16px">Install</button>
+        </div>
+        <div class="setcol" id="notifBox">
+          <div class="setrow" style="border-bottom:none;padding-bottom:4px">
+            <div class="slbl">Notifications
+              <div class="ssub" id="notifSub">Get a push when an agent writes to you.</div>
+            </div>
+            <button class="copybtn" id="notifBtn" style="width:auto;padding:0 16px">Enable</button>
+          </div>
+          <div id="notifDevices"></div>
+          <div class="setrow" id="notifOpts" hidden>
+            <div class="slbl">Show message text in notifications
+              <div class="ssub">Off by default: notifications show only the chat name and a count.</div>
+            </div>
+            <button class="iconbtn" id="notifBodyToggle" aria-label="Toggle message text">○</button>
+          </div>
+        </div>
         <div class="setrow">
           <div class="slbl">Rotate owner token
             <div class="ssub">Issues a new token; the old one stops working immediately.</div>
@@ -210,6 +240,6 @@
 <div class="toast" id="toast" hidden></div>
 <div id="modalRoot"></div>
 
-<script src="app.js?v=20261001e"></script>
+<script src="app.js?v=20261001f"></script>
 </body>
 </html>

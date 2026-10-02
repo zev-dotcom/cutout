@@ -472,7 +472,7 @@ async function postMessage(req, auth) {
     if (auth.kind === "agent" || auth.kind === "owner") {
       urgentFlag = false;
       try { urgentFlag = await urgentDecision(from, body.thread_id, body.to, body.urgent === true); } catch (e) { console.error("urgent decision failed", e); }
-      afterPostWake(body.thread_id, from, body.to, urgentFlag);
+      afterPostWake(body.thread_id, from, body.to, urgentFlag, body.body);
     }
     return jres(201, {
       id: rows[0].id,
@@ -1794,6 +1794,7 @@ async function route(req, arrivedAt) {
       error: "invalid path encoding"
     }));
   }
+  if (segs[0] === "v1" && segs[1] === "owner" && segs[2] === "push") return done(await pushRoutes(req, auth, segs));
   // Owner read marker: the badge on the thread list counts others' messages after this.
   if (segs[0] === "v1" && segs[1] === "owner" && segs[2] === "threads" && segs.length === 5 && segs[4] === "read" && req.method === "PUT") {
     const denied = requireOwner(auth);
@@ -2031,9 +2032,215 @@ async function wakeAfterPost(threadId, from, to, urgentRequested) {
   await Promise.allSettled(recips.map((r)=>wakeFlow(r.agent_id, threadId, urgent)));
   return { urgent };
 }
-function afterPostWake(threadId, from, to, urgentRequested) {
+// ---- Web Push (owner devices) ----------------------------------------------
+// Per-instance VAPID keys live in smith_push_config (RLS-locked, never returned). Payloads are
+// encrypted per RFC 8291 (aes128gcm) with WebCrypto; no third-party service or dependency.
+const PUSH_DEBOUNCE_MS = Number(Deno.env.get("SMITH_PUSH_DEBOUNCE_MS") ?? 10000);
+const PUSH_PER_HOUR = Number(Deno.env.get("SMITH_PUSH_PER_HOUR") ?? 60);
+const PUSH_MAX_DEVICES = 10;
+const b64u = (u8)=>btoa(String.fromCharCode(...u8)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = (s)=>{
+  const p = String(s).replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(p + "=".repeat((4 - p.length % 4) % 4));
+  return Uint8Array.from(bin, (c)=>c.charCodeAt(0));
+};
+const cat = (...a)=>{ const o = new Uint8Array(a.reduce((n, x)=>n + x.length, 0)); let i = 0; for (const x of a){ o.set(x, i); i += x.length; } return o; };
+async function pushConfig(create) {
+  let rows = await timedQuery(sql`select public_key, private_jwk, contact, include_body from ${S("smith_push_config")} where id = 1`, "push_cfg");
+  if (!rows.length && create) {
+    const kp = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    const jwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+    const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+    await timedQuery(sql`insert into ${S("smith_push_config")} (id, public_key, private_jwk) values (1, ${b64u(pub)}, ${sql.json(jwk)}) on conflict (id) do nothing`, "push_cfg_create");
+    rows = await timedQuery(sql`select public_key, private_jwk, contact, include_body from ${S("smith_push_config")} where id = 1`, "push_cfg2");
+  }
+  return rows[0] ?? null;
+}
+async function vapidAuth(cfg, endpoint) {
+  const aud = new URL(endpoint).origin;
+  const enc = (o)=>b64u(new TextEncoder().encode(JSON.stringify(o)));
+  const unsigned = enc({ typ: "JWT", alg: "ES256" }) + "." + enc({ aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: cfg.contact });
+  const key = await crypto.subtle.importKey("jwk", cfg.private_jwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(unsigned)));
+  return `vapid t=${unsigned}.${b64u(sig)}, k=${cfg.public_key}`;
+}
+async function hkdf(salt, ikm, info, len) {
+  const k = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
+  return new Uint8Array(await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt, info }, k, len * 8));
+}
+// RFC 8291 aes128gcm content coding for one record.
+async function pushEncrypt(p256dh, authSecret, plaintext) {
+  const uaPub = unb64u(p256dh), auth = unb64u(authSecret);
+  if (uaPub.length !== 65 || uaPub[0] !== 4 || auth.length !== 16) throw new Error("bad_subscription_keys");
+  const eph = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const asPub = new Uint8Array(await crypto.subtle.exportKey("raw", eph.publicKey));
+  const uaKey = await crypto.subtle.importKey("raw", uaPub, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: uaKey }, eph.privateKey, 256));
+  const te = new TextEncoder();
+  const ikm = await hkdf(auth, shared, cat(te.encode("WebPush: info\0"), uaPub, asPub), 32);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const cek = await hkdf(salt, ikm, te.encode("Content-Encoding: aes128gcm\0"), 16);
+  const nonce = await hkdf(salt, ikm, te.encode("Content-Encoding: nonce\0"), 12);
+  const aes = await crypto.subtle.importKey("raw", cek, "AES-GCM", false, ["encrypt"]);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, aes, cat(plaintext, new Uint8Array([2]))));
+  const rs = new Uint8Array([0, 0, 16, 0]); // record size 4096
+  return cat(salt, rs, new Uint8Array([65]), asPub, ct);
+}
+// Browsers hand out endpoints on their vendor push services. Only those hosts are accepted
+// by default. Set SMITH_PUSH_HOSTS (comma list, "*.example.com" suffix patterns, or "*" for any
+// public host) for other push services.
+const PUSH_HOSTS = (Deno.env.get("SMITH_PUSH_HOSTS") ?? "fcm.googleapis.com,updates.push.services.mozilla.com,*.push.services.mozilla.com,*.push.apple.com,*.notify.windows.com").split(",").map((x)=>x.trim().toLowerCase()).filter(Boolean);
+function pushHostAllowed(host) {
+  const h = String(host).toLowerCase();
+  return PUSH_HOSTS.some((p)=> p === "*" || (p.startsWith("*.") ? h.endsWith(p.slice(1)) : h === p));
+}
+function pushEndpointError(raw) {
+  const e = webhookUrlError(raw);
+  if (e) return e.replace("url", "endpoint");
+  try { if (!pushHostAllowed(new URL(raw).hostname)) return "endpoint host is not a known push service"; } catch { return "invalid endpoint"; }
+  return null;
+}
+async function sendPush(cfg, sub, payloadObj) {
+  const err = pushEndpointError(sub.endpoint);
+  if (err) throw new Error("blocked_endpoint");
+  await assertPublicHost(new URL(sub.endpoint).hostname);
+  const body = await pushEncrypt(sub.p256dh, sub.auth, new TextEncoder().encode(JSON.stringify(payloadObj)));
+  const res = await fetch(sub.endpoint, {
+    method: "POST", redirect: "manual", signal: AbortSignal.timeout(5000),
+    headers: { Authorization: await vapidAuth(cfg, sub.endpoint), "Content-Encoding": "aes128gcm", "Content-Type": "application/octet-stream", TTL: "3600", Urgency: "normal" },
+    body
+  });
+  await res.body?.cancel();
+  return res.status;
+}
+async function ownerUnreadTotals(threadId) {
+  const r = await timedQuery(sql`
+    select
+      (select count(*)::int from ${T("messages")} m left join ${S("smith_owner_reads")} orr on orr.thread_id = m.thread_id
+        where m.thread_id = ${threadId} and m.from_agent <> ${OWNER_ID} and m.created_at > coalesce(orr.last_read_at, 'epoch'::timestamptz)) as thread_unread,
+      (select count(*)::int from ${T("messages")} m join ${S("smith_threads")} t on t.thread_id = m.thread_id
+        left join ${S("smith_owner_reads")} orr on orr.thread_id = m.thread_id
+        where m.from_agent <> ${OWNER_ID} and m.created_at > coalesce(orr.last_read_at, 'epoch'::timestamptz)) as total_unread,
+      (select name from ${S("smith_threads")} where thread_id = ${threadId}) as name`, "push_unread");
+  return r[0];
+}
+const pushTrailing = new Set();
+async function pushNotifyOwner(threadId, msgBody, force) {
+  const cfg = await pushConfig(false);
+  if (!cfg) return "not_configured";
+  const subs = await timedQuery(sql`select id from ${S("smith_push_subs")}`, "push_subs_any");
+  if (!subs.length) return "no_devices";
+  // Debounce per device: claim atomically, or one trailing send per thread after the window.
+  const claimed = await timedQuery(sql`
+    update ${S("smith_push_subs")} set last_push_at = now()
+    where (last_push_at is null or last_push_at < now() - make_interval(secs => ${PUSH_DEBOUNCE_MS / 1000}))
+    returning id, endpoint, p256dh, auth`, "push_claim");
+  const skipped = claimed.length < subs.length;
+  if (skipped && !pushTrailing.has(threadId)) {
+    pushTrailing.add(threadId);
+    (async ()=>{ try { await sleep(PUSH_DEBOUNCE_MS + 300); await pushNotifyOwner(threadId, msgBody, false); } finally { pushTrailing.delete(threadId); } })().catch(()=>{});
+  }
+  if (!claimed.length) return "debounced";
+  const u = await ownerUnreadTotals(threadId);
+  if (!u || u.thread_unread <= 0) return "nothing_unread";
+  const payload = {
+    v: 1, thread_id: threadId, title: u.name || "Smith", count: u.thread_unread, total: u.total_unread,
+    ...(cfg.include_body && msgBody ? { body: String(msgBody).slice(0, 140) } : {})
+  };
+  for (const s of claimed){
+    const n = await timedQuery(sql`select count(*)::int as n from ${S("smith_audit")} where action = 'push_sent' and detail->>'sub_id' = ${s.id} and at > now() - interval '1 hour'`, "push_rate");
+    if (n[0].n >= PUSH_PER_HOUR) continue;
+    let status = "ok";
+    try {
+      const code = await sendPush(cfg, s, payload);
+      if (code === 404 || code === 410) {
+        await timedQuery(sql`delete from ${S("smith_push_subs")} where id = ${s.id}`, "push_gone");
+        status = "gone";
+      } else if (code < 200 || code >= 300) status = "http_" + code;
+    } catch (e) { status = "error:" + String(e?.message ?? e).slice(0, 60); }
+    if (status === "ok") await timedQuery(sql`update ${S("smith_push_subs")} set last_ok_at = now(), fail_count = 0 where id = ${s.id}`, "push_ok");
+    else if (status !== "gone") await timedQuery(sql`update ${S("smith_push_subs")} set fail_count = fail_count + 1 where id = ${s.id}`, "push_fail");
+    await audit("system", status === "ok" ? "push_sent" : "push_failed", { sub_id: s.id, status, thread_id: threadId, count: payload.count });
+  }
+  await timedQuery(sql`delete from ${S("smith_push_subs")} where fail_count >= 20`, "push_prune");
+  return "sent";
+}
+function pushView(r) { return { id: r.id, label: r.label, host: new URL(r.endpoint).hostname, created_at: iso(r.created_at), last_ok_at: r.last_ok_at ? iso(r.last_ok_at) : null, fail_count: r.fail_count }; }
+async function pushRoutes(req, auth, segs) {
+  const denied = requireOwner(auth);
+  if (denied) return denied;
+  const method = req.method;
+  const sub = segs[3];
+  if (segs.length === 3 && method === "GET") {
+    const cfg = await pushConfig(false);
+    const devs = cfg ? await timedQuery(sql`select id, label, endpoint, created_at, last_ok_at, fail_count from ${S("smith_push_subs")} order by created_at asc`, "push_list") : [];
+    return jres(200, { enabled: !!cfg, public_key: cfg?.public_key ?? null, include_body: !!cfg?.include_body, contact: cfg?.contact ?? null, devices: devs.map(pushView) });
+  }
+  if (segs.length === 4 && sub === "setup" && method === "POST") {
+    const had = !!await pushConfig(false);
+    const cfg = await pushConfig(true);
+    if (!had) await audit(OWNER_ID, "push_setup", {});
+    return jres(200, { enabled: true, public_key: cfg.public_key });
+  }
+  let body = {};
+  if (method === "PUT" || method === "POST") { try { body = await req.json(); } catch { body = {}; } }
+  if (segs.length === 4 && sub === "settings" && method === "PUT") {
+    const cfg = await pushConfig(false);
+    if (!cfg) return jres(409, { error: "push is not set up" });
+    const contact = body.contact === undefined ? cfg.contact : String(body.contact);
+    if (!/^(mailto:[^\s@]+@[^\s@]+|https:\/\/[^\s]+)$/.test(contact) || contact.length > 200) return jres(422, { error: "contact must be a mailto: or https: URL" });
+    const ib = body.include_body === undefined ? cfg.include_body : body.include_body === true;
+    await timedQuery(sql`update ${S("smith_push_config")} set contact = ${contact}, include_body = ${ib} where id = 1`, "push_settings");
+    await audit(OWNER_ID, "push_settings", { include_body: ib });
+    return jres(200, { include_body: ib, contact });
+  }
+  if (segs.length === 4 && sub === "subscription" && method === "PUT") {
+    const cfg = await pushConfig(false);
+    if (!cfg) return jres(409, { error: "push is not set up" });
+    const ep = String(body.endpoint ?? ""), p = String(body.keys?.p256dh ?? ""), a = String(body.keys?.auth ?? "");
+    const e = pushEndpointError(ep);
+    if (e) return jres(422, { error: e });
+    if (ep.length > 800) return jres(422, { error: "endpoint too long" });
+    try { await pushEncrypt(p, a, new Uint8Array([1])); } catch { return jres(422, { error: "invalid subscription keys" }); }
+    const label = String(body.label ?? "device").slice(0, 60) || "device";
+    const cnt = await timedQuery(sql`select count(*)::int as n from ${S("smith_push_subs")} where endpoint <> ${ep}`, "push_count");
+    if (cnt[0].n >= PUSH_MAX_DEVICES) return jres(409, { error: `device limit reached (${PUSH_MAX_DEVICES}); remove one first` });
+    const id = "ps_" + randomHexBytes(8);
+    const row = (await timedQuery(sql`insert into ${S("smith_push_subs")} (id, endpoint, p256dh, auth, label) values (${id}, ${ep}, ${p}, ${a}, ${label})
+      on conflict (endpoint) do update set p256dh = excluded.p256dh, auth = excluded.auth, label = excluded.label, fail_count = 0
+      returning id, label, endpoint, created_at, last_ok_at, fail_count`, "push_sub_put"))[0];
+    await audit(OWNER_ID, "push_subscribe", { sub_id: row.id, host: new URL(ep).hostname });
+    return jres(200, pushView(row));
+  }
+  if (segs.length === 5 && sub === "subscription" && method === "DELETE") {
+    const r = await timedQuery(sql`delete from ${S("smith_push_subs")} where id = ${segs[4]} returning id`, "push_del");
+    if (!r.length) return jres(404, { error: "device not found" });
+    await audit(OWNER_ID, "push_unsubscribe", { sub_id: segs[4] });
+    return jres(200, { id: segs[4], removed: true });
+  }
+  if (segs.length === 4 && sub === "test" && method === "POST") {
+    const cfg = await pushConfig(false);
+    if (!cfg) return jres(409, { error: "push is not set up" });
+    const subs = await timedQuery(sql`select id, endpoint, p256dh, auth from ${S("smith_push_subs")}`, "push_test_subs");
+    if (!subs.length) return jres(409, { error: "no devices subscribed" });
+    const out = [];
+    for (const s of subs){
+      let status = "ok";
+      try { const code = await sendPush(cfg, s, { v: 1, test: true, title: "Smith", count: 0, total: 0, body: "Notifications are working." }); if (code === 404 || code === 410) { await timedQuery(sql`delete from ${S("smith_push_subs")} where id = ${s.id}`, "push_gone_t"); status = "gone"; } else if (code < 200 || code >= 300) status = "http_" + code; }
+      catch (e) { status = "error:" + String(e?.message ?? e).slice(0, 60); }
+      out.push({ id: s.id, status });
+    }
+    return jres(200, { results: out });
+  }
+  return jres(404, { error: "not found" });
+}
+function afterPostWake(threadId, from, to, urgentRequested, pushBodyHint) {
   const p = wakeAfterPost(threadId, from, to, urgentRequested).catch((e)=>console.error("wake failed", e));
   try { globalThis.EdgeRuntime?.waitUntil?.(p); } catch { /* local runs just let it float */ }
+  if (from !== OWNER_ID) {
+    const q = pushNotifyOwner(threadId, pushBodyHint, false).catch((e)=>console.error("push failed", e));
+    try { globalThis.EdgeRuntime?.waitUntil?.(q); } catch { /* local */ }
+  }
 }
 function markPolling(agentId, d) {
   const n = (pollingAgents.get(agentId) ?? 0) + d;
@@ -2135,11 +2342,14 @@ async function testWake(auth, agentId) {
 }
 
 // CORS: exact-origin allowlist for the hosted Smith web client. No wildcard.
-const CORS_ORIGIN = "https://zev-dotcom.github.io";
+// SMITH_CORS_ORIGINS (comma list of exact https origins) adds your own hosted client; the default keeps the public one.
+const CORS_ORIGINS = (Deno.env.get("SMITH_CORS_ORIGINS") ?? Deno.env.get("SMITH_CORS_ORIGIN") ?? "https://zev-dotcom.github.io")
+  .split(",").map((x)=>x.trim()).filter((x)=>/^https?:\/\/[^/*\s]+$/.test(x));
 function corsHeaders(req) {
-  if (req.headers.get("origin") !== CORS_ORIGIN) return null;
+  const o = req.headers.get("origin");
+  if (!o || !CORS_ORIGINS.includes(o)) return null;
   return {
-    "access-control-allow-origin": CORS_ORIGIN,
+    "access-control-allow-origin": o,
     "access-control-allow-headers": "Authorization, X-Agent-Id, Content-Type",
     "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
     "access-control-max-age": "600",

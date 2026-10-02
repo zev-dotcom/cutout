@@ -3,7 +3,7 @@
 Server must run with: SMITH_SCHEMA=agentcollab SMITH_TABLES_SCHEMA=smith SMITH_SETUP_KEY=test-setup-key-001
 SMITH_WAKE_DEBOUNCE_MS=1500 SMITH_WAKE_RECHECK_MS=3000 SMITH_WAKE_URGENT_PER_HOUR=3
 and --preload tests/wake_preload.ts (fake DNS/fetch for *.test.example)."""
-import hashlib, hmac, json, os, subprocess, sys, time, urllib.request, urllib.error
+import re, hashlib, hmac, json, os, subprocess, sys, time, urllib.request, urllib.error
 BASE = sys.argv[1]; PSQL = sys.argv[2:]
 HITS = os.environ.get("WAKE_HITS_FILE", "/tmp/wake-hits.jsonl")
 fails = 0
@@ -137,4 +137,75 @@ _p(OWN, "owner", "mine2"); check("owner's own message does not add unread", _unr
 import time; time.sleep(0.05); _p(A, "wk-a", "three"); check("new message from others adds unread (1)", _unread(_tid) == 1, _unread(_tid))
 s_, _ = req("PUT", f"/v1/owner/threads/{_tid}/read", {}, A); check("agent cannot set owner read marker (403)", s_ == 403, s_)
 s_, _ = req("PUT", "/v1/owner/threads/nope/read", {}, OWN); check("read marker on unknown thread 404", s_ == 404, s_)
+
+# ---- Web Push ----
+import base64, time as _t
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+def _b(x): return base64.urlsafe_b64encode(x).rstrip(b"=").decode()
+def _ub(x): return base64.urlsafe_b64decode(x + "=" * (-len(x) % 4))
+s_, r_ = req("GET", "/v1/owner/push", tok=OWN); check("push not enabled by default", s_ == 200 and r_["enabled"] is False and r_["public_key"] is None, r_)
+s_, _ = req("GET", "/v1/owner/push", tok=A); check("agent cannot read push settings (403)", s_ == 403, s_)
+s_, _ = req("PUT", "/v1/owner/push/subscription", {"endpoint": "https://push.test.example/a", "keys": {}}, OWN); check("subscribe before setup is 409", s_ == 409, s_)
+s_, r_ = req("POST", "/v1/owner/push/setup", {}, OWN); PUB = r_.get("public_key"); check("setup returns public VAPID key (65 bytes)", s_ == 200 and len(_ub(PUB)) == 65, r_)
+s_, r2 = req("POST", "/v1/owner/push/setup", {}, OWN); check("setup is idempotent (same key)", r2.get("public_key") == PUB)
+check("private key never returned", "private" not in json.dumps(r_) and "private" not in json.dumps(req("GET", "/v1/owner/push", tok=OWN)[1]))
+dev = ec.generate_private_key(ec.SECP256R1()); devpub = dev.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+auths = os.urandom(16)
+for bad in ["http://push.test.example/x", "https://127.0.0.1/x", "https://localhost/x", "https://[::ffff:7f00:1]/x", "https://169.254.169.254/x", "https://u:p@push.test.example/x", "https://push.not-allowed.example.org/x"]:
+    s_, _ = req("PUT", "/v1/owner/push/subscription", {"endpoint": bad, "keys": {"p256dh": _b(devpub), "auth": _b(auths)}}, OWN); check("push endpoint rejected: " + bad, s_ == 422, s_)
+s_, _ = req("PUT", "/v1/owner/push/subscription", {"endpoint": "https://push.test.example/a", "keys": {"p256dh": "AAAA", "auth": "BBBB"}}, OWN); check("bad keys rejected", s_ == 422, s_)
+s_, _ = req("PUT", "/v1/agents/me/push", {}, A)
+s_, sub = req("PUT", "/v1/owner/push/subscription", {"endpoint": "https://push.test.example/dev1", "label": "Test phone", "keys": {"p256dh": _b(devpub), "auth": _b(auths)}}, OWN); check("subscribe ok", s_ == 200 and sub["id"].startswith("ps_") and sub["host"] == "push.test.example", sub)
+_ptid = req("POST", "/v1/threads", {"name": "Push thread", "member_ids": ["wk-a"]}, OWN)[1]["thread_id"]
+open(HITS, "w").close()
+req("POST", "/v1/messages", {"thread_id": _ptid, "from": "wk-a", "to": "*", "type": "note", "body": "SECRETBODY one"}, A)
+_t.sleep(0.6)
+ph = [h for h in hits() if "push.test.example/dev1" in h["url"]]
+check("push sent on agent message", len(ph) == 1, len(ph))
+def decrypt(h):
+    body = _ub(h["body"][4:].replace("+", "-").replace("/", "_"))
+    salt, rs, idl = body[:16], body[16:20], body[20]; asp = body[21:21 + idl]; ct = body[21 + idl:]
+    shared = dev.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), asp))
+    ikm = HKDF(hashes.SHA256(), 32, auths, b"WebPush: info\0" + devpub + asp).derive(shared)
+    cek = HKDF(hashes.SHA256(), 16, salt, b"Content-Encoding: aes128gcm\0").derive(ikm)
+    nonce = HKDF(hashes.SHA256(), 12, salt, b"Content-Encoding: nonce\0").derive(ikm)
+    pt = AESGCM(cek).decrypt(nonce, ct, None)
+    assert pt[-1] == 2
+    return json.loads(pt[:-1])
+if ph:
+    pl = decrypt(ph[0]); check("payload decrypts (RFC 8291) with title and count", pl["title"] == "Push thread" and pl["count"] == 1 and pl["thread_id"] == _ptid and pl["total"] >= 1, pl)
+    check("payload has no message body by default", "body" not in pl and "SECRETBODY" not in json.dumps(pl))
+    hd = ph[0]["headers"]; check("content-encoding aes128gcm + TTL", hd.get("content-encoding") == "aes128gcm" and hd.get("ttl") == "3600", hd)
+    m_ = re.match(r"vapid t=([^,]+), k=(\S+)", hd.get("authorization", "")); check("VAPID header present with the instance key", bool(m_) and m_.group(2) == PUB, hd.get("authorization", "")[:40])
+    if m_:
+        hdr, clm, sg = m_.group(1).split("."); sgb = _ub(sg)
+        pk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), _ub(PUB))
+        try: pk.verify(encode_dss_signature(int.from_bytes(sgb[:32], "big"), int.from_bytes(sgb[32:], "big")), (hdr + "." + clm).encode(), ec.ECDSA(hashes.SHA256())); ok = True
+        except Exception as e: ok = False
+        cl = json.loads(_ub(clm)); check("VAPID JWT verifies (ES256), aud + sub + exp", ok and cl["aud"] == "https://push.test.example" and cl["sub"].startswith("mailto:") and cl["exp"] > _t.time(), cl)
+req("POST", "/v1/messages", {"thread_id": _ptid, "from": "wk-a", "to": "*", "type": "note", "body": "two"}, A)
+_t.sleep(0.5)
+check("second message inside debounce is not sent immediately", len([h for h in hits() if "push.test.example/dev1" in h["url"]]) == 1)
+_t.sleep(float(os.environ.get("SMITH_PUSH_DEBOUNCE_MS", "1500")) / 1000 + 2)
+ph = [h for h in hits() if "push.test.example/dev1" in h["url"]]
+check("trailing push coalesces the burst", len(ph) == 2 and decrypt(ph[1])["count"] == 2, len(ph))
+req("PUT", "/v1/owner/push/settings", {"include_body": True}, OWN)
+_t.sleep(float(os.environ.get("SMITH_PUSH_DEBOUNCE_MS", "1500")) / 1000 + 1)
+req("POST", "/v1/messages", {"thread_id": _ptid, "from": "wk-a", "to": "*", "type": "note", "body": "visible body"}, A); _t.sleep(1.5)
+ph = [h for h in hits() if "push.test.example/dev1" in h["url"]]
+check("body included only after owner opt-in", len(ph) >= 3 and decrypt(ph[-1]).get("body") == "visible body", len(ph))
+req("PUT", "/v1/owner/push/settings", {"include_body": False}, OWN)
+s_, _ = req("PUT", "/v1/owner/push/settings", {"contact": "javascript:alert(1)"}, OWN); check("bad contact rejected", s_ == 422, s_)
+req("POST", "/v1/owner/threads/%s/read" % _ptid, {}, OWN)
+s_, r_ = req("POST", "/v1/owner/push/test", {}, OWN); check("push test ok", s_ == 200 and r_["results"][0]["status"] == "ok", r_)
+s_, g = req("PUT", "/v1/owner/push/subscription", {"endpoint": "https://gone.test.example/x", "keys": {"p256dh": _b(devpub), "auth": _b(auths)}}, OWN)
+req("POST", "/v1/owner/push/test", {}, OWN)
+s_, r_ = req("GET", "/v1/owner/push", tok=OWN); check("410 endpoint auto-removed", all(d["host"] != "gone.test.example" for d in r_["devices"]), r_["devices"])
+s_, r_ = req("DELETE", "/v1/owner/push/subscription/" + sub["id"], None, OWN); check("revoke device", s_ == 200, (s_, r_))
+s_, r_ = req("GET", "/v1/owner/push", tok=OWN); check("device list empty after revoke", r_["devices"] == [], r_)
+_ = sql("select count(*) from smith.smith_audit where action like 'push%' and (detail::text like '%private%' or detail::text like '%p256dh%' or detail::text like '%auth%')"); check("audit holds no keys", _ == "0", _)
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)

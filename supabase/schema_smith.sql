@@ -185,3 +185,16 @@ create table if not exists smith_owner_reads (
   last_read_at timestamptz not null default now()
 );
 alter table smith_owner_reads enable row level security;
+
+create table if not exists smith_push_config (
+  id integer primary key check (id = 1), public_key text not null, private_jwk jsonb not null,
+  contact text not null default 'mailto:noreply@example.invalid', include_body boolean not null default false,
+  created_at timestamptz not null default now()
+);
+create table if not exists smith_push_subs (
+  id text primary key, endpoint text not null unique, p256dh text not null, auth text not null,
+  label text not null default 'device', created_at timestamptz not null default now(),
+  last_ok_at timestamptz, last_push_at timestamptz, fail_count integer not null default 0
+);
+alter table smith_push_config enable row level security;
+alter table smith_push_subs enable row level security;
