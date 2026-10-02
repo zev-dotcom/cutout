@@ -143,6 +143,12 @@ if len(sys.argv) > 4 and sys.argv[4] == "no-setup-key":
 # 1. health
 s, h = req("GET", "/health")
 check("health 200 + smith field", s == 200 and h.get("smith") == "1.0", f"{s} {h}")
+# 1b. function-slug prefixes: the deployed function may sit behind /cutout or
+# /agentcollab; both prefixes must route to the same handlers.
+s, h = req("GET", "/agentcollab/health")
+check("prefixed /agentcollab/health 200", s == 200 and h.get("smith") == "1.0", f"{s} {h}")
+s, h = req("GET", "/cutout/health")
+check("prefixed /cutout/health 200", s == 200 and h.get("smith") == "1.0", f"{s} {h}")
 
 # 2. owner claim: separate setup key, checked first, no oracle
 s, wrong_body = req("POST", "/v1/owner/claim", {"setup_key": "wrong-key"})
@@ -616,6 +622,8 @@ if SCHEMA == "agentcollab":
     check("thread_id stays nullable (legacy v15 compat)", ok and rows.strip() == "YES", rows.strip() if ok else rows)
     ok, rows = psql(f"select count(*) from pg_constraint where conrelid = '{SCHEMA}.idempotency_keys'::regclass and contype = 'p'")
     check("old PK idempotency_keys_pkey is gone", ok and rows.strip() == "0", rows.strip() if ok else rows)
+    ok, rows = psql(f"select indexname from pg_indexes where schemaname = '{SCHEMA}' and tablename = 'idempotency_keys' and indexname = 'idempotency_keys_legacy_uniq'")
+    check("partial legacy unique index exists", ok and rows.strip() == "idempotency_keys_legacy_uniq", rows.strip() if ok else rows)
     p = subprocess.run([f"{_pg}/psql", "-h", "127.0.0.1", "-p", "5433", "-U", "smithtest",
                         "-d", "smithtest", "-v", "ON_ERROR_STOP=1", "-f", "supabase/migrate_smith_onto_agentcollab.sql"],
                        env=_env, capture_output=True, text=True)

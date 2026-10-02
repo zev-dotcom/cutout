@@ -1399,7 +1399,7 @@ async function redeemPairing(req) {
   const u = new URL(req.url);
   // P2-10: prefer a pinned instance URL from config; the request origin is
   // attacker-influenced behind a proxy (Host header), so it is only a fallback.
-  const instanceUrl = CONFIG_INSTANCE_URL || u.origin + u.pathname.replace(/\/v1\/.*$/, "").replace(/\/cutout$/, "");
+  const instanceUrl = CONFIG_INSTANCE_URL || u.origin + u.pathname.replace(/\/v1\/.*$/, "").replace(/\/(cutout|agentcollab)$/, "");
   return jres(200, {
     agent_token: token,
     agent_id: redeemed.agent_id,
@@ -1615,7 +1615,7 @@ async function ownerAudit(req, auth) {
 // ---- router -----------------------------------------------------------------
 async function route(req, arrivedAt) {
   let path = new URL(req.url).pathname;
-  path = path.replace(/^\/cutout(?=\/|$)/, ""); // strip function slug prefix
+  path = path.replace(/^\/(cutout|agentcollab)(?=\/|$)/, ""); // strip function slug prefix (either deploy name)
   if (path === "/health" && req.method === "GET") {
     return {
       res: jres(200, {

@@ -305,6 +305,13 @@ do $$ begin
   end if;
 end $$;
 commit;
+-- Legacy double-post guard: NULL thread_id never conflicts in the unique
+-- constraint above, which would regress the old PK's rejection of a legacy
+-- double-post (same key inserted twice with no thread). This partial index
+-- restores it for legacy rows only; Smith rows always carry thread_id.
+create unique index if not exists idempotency_keys_legacy_uniq
+  on agentcollab.idempotency_keys (from_agent, idem_key)
+  where thread_id is null;
 
 -- P2-D: per-identity rate-limit buckets. The base agentcollab.rate_log only has
 -- (at); add an identity column so the limiter can enforce a per-credential
