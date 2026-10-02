@@ -59,9 +59,10 @@ fallback, so no new secrets are needed — except that when
 `AGENTCOLLAB_TOKEN` is set. Self-hosted instances keep the defaults
 (`cutout` + `public`) and the three separate schema files.
 
-Open cutover decision (Zev): whether the migration seeds existing threads
-as managed, or existing threads stay legacy with only new threads managed.
-The file currently seeds; do not run until this is decided.
+Open cutover decision (Zev, confirmed direct 2026-10-01): the migration does
+NOT seed existing threads as managed. Existing threads stay legacy;
+existing agents keep working uninterrupted. Only new Smith threads are
+managed; later owner adoption of a legacy thread is explicit and audited.
 
 ## 2. Deploy the function
 

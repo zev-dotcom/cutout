@@ -12,7 +12,9 @@
 --   - Smith tables (smith.*): created IF NOT EXISTS in a DEDICATED `smith`
 --     schema, never in `public` (the live `public` schema belongs to
 --     another app and is PostgREST-exposed)
---   - seeds: INSERT ... ON CONFLICT DO NOTHING from agentcollab.messages
+--   - seeds: INSERT ... ON CONFLICT DO NOTHING of agent ids from
+--     agentcollab.messages (no thread/member seeding -- cutover decision:
+--     existing threads stay legacy)
 -- Untouched: archive triggers, existing cron jobs (no pg_cron statements
 -- below), existing data. No DROP of live objects EXCEPT the
 -- idempotency_keys PK swap documented below.
@@ -253,30 +255,18 @@ create table if not exists smith.smith_audit (
 );
 create index if not exists smith_audit_at_idx on smith.smith_audit (at desc);
 
--- Migrate every pre-existing thread into managed threads, seeding members
--- from the agent ids already seen on each thread (excluding broadcasts).
--- Seeded rows are marked legacy_unverified: the owner reviews them (see the
--- verify_member owner route) before treating membership as authoritative.
--- Strict (P1-2): unverified seeded members get no thread access until verified.
--- added_at '-infinity' marks pre-existing participants: they see full history
--- (P1-3); explicitly added members default to now() and see history from join.
-insert into smith.smith_threads (thread_id, created_by)
-select distinct thread_id, null from agentcollab.messages
-on conflict (thread_id) do nothing;
-
-insert into smith.smith_thread_members (thread_id, agent_id, legacy_unverified, added_at)
-select distinct thread_id, from_agent, true, '-infinity'::timestamptz from agentcollab.messages
-where from_agent is not null and from_agent <> '*'
-on conflict do nothing;
-
-insert into smith.smith_thread_members (thread_id, agent_id, legacy_unverified, added_at)
-select distinct thread_id, to_agent, true, '-infinity'::timestamptz from agentcollab.messages
-where to_agent is not null and to_agent <> '*'
-on conflict do nothing;
-
+-- Cutover (Zev, direct): the seed EXCLUDES existing live threads. Only new
+-- Smith threads are managed; existing threads stay legacy and existing
+-- agents keep working on legacy uninterrupted. Later owner adoption of a
+-- legacy thread is explicit and audited. (Seeding every thread as managed
+-- would, with LEGACY_STRICT on, lock every current agent out of the live
+-- bus -- i2's live-bus-lockout blocker.)
+--
 -- Seed agent rows for ids already on the bus so re-pairing is a rotation,
 -- not a duplicate. token_hash stays null until the owner issues a pairing
--- code; null means "known id, no Smith token yet".
+-- code; null means "known id, no Smith token yet". This seed does not grant
+-- thread access (that comes from smith_thread_members, which is only written
+-- for new Smith threads).
 insert into smith.smith_agents (agent_id, display_name, platform, token_hash, legacy_unverified)
 select distinct from_agent, from_agent, 'unknown', null, true from agentcollab.messages
 where from_agent is not null and from_agent <> '*'
