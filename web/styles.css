@@ -337,3 +337,6 @@ select{width:100%;min-height:var(--tap);border:1.5px solid var(--line);border-ra
 .pdot{display:inline-block;width:7px;height:7px;border-radius:50%;margin:0 2px 1px 3px;vertical-align:middle}
 .pdot.on{background:#2fb562}.pdot.off{background:var(--ink3);opacity:.5}
 .mem{white-space:nowrap}
+.rcpt.mtgrp{display:none}
+.rcpt .mt.full{color:var(--ink2)}
+.msgrow.them .rcpt{margin-left:6px;margin-top:3px}

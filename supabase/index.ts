@@ -556,12 +556,24 @@ async function getMessagesInner(req, arrivedAt, auth) {
       error: "limit must be between 1 and 100"
     });
   }
-  let cursor = null;
+  let cursor = null, cursorFallback = false;
   if (since) {
     cursor = decodeCursor(since);
     if (!cursor) return jres(422, {
       error: "invalid since cursor"
     });
+  }
+  // ?unacked=1 (agent tokens): re-serve everything after the server-side ack cursor until it is acked.
+  // Without a cursor this behaves like a normal poll. An explicit `since` always wins.
+  if (!cursor && auth.kind === "agent" && u.searchParams.get("unacked") === "1") {
+    const ac = await timedQuery(sql`select c.acked_id, (extract(epoch from c.acked_at) * 1000000)::bigint as at_us, (extract(epoch from m.created_at) * 1000000)::bigint as us
+      from ${S("smith_agent_cursor")} c left join ${T("messages")} m on m.id = c.acked_id where c.agent_id = ${auth.agentId} and c.acked_id is not null`, "unacked_cursor");
+    if (ac.length && ac[0].us !== null) cursor = { us: Number(ac[0].us), id: ac[0].acked_id };
+    else if (ac.length && ac[0].at_us !== null) {
+      // The acked message row is gone: fall back to its recorded time and say so (never silent).
+      cursor = { us: Number(ac[0].at_us), id: "" };
+      cursorFallback = true;
+    }
   }
   const queryOnce = async ()=>{
     const q = sql`
@@ -597,7 +609,7 @@ async function getMessagesInner(req, arrivedAt, auth) {
   }
   console.log(`cutout poll_hold_ms=${Date.now() - holdStarted} requested_wait=${wait} effective_wait=${Math.min(wait, MAX_HOLD_SECONDS)}`);
   if (auth.kind === "agent") { markCanariesPicked(rows).catch(()=>{}); recordSeen(auth.agentId, rows).catch(()=>{}); }
-  return getMessagesTail(rows, since);
+  return getMessagesTail(rows, since, cursorFallback ? { cursor_fallback: true } : {});
 }
 // Shared by GET /v1/messages and the Smith thread feeds: stale one-time-link
 // redaction plus per-message receipts. Behavior is identical everywhere it is used.
@@ -656,12 +668,13 @@ async function threadPresence(threadId) {
     return r.map((x)=>({ agent_id: x.agent_id, online: !!x.alive && Date.now() - new Date(x.alive).getTime() < 90000, seen_ago_s: x.alive ? Math.round((Date.now() - new Date(x.alive).getTime()) / 1000) : null }));
   } catch { return []; }
 }
-async function getMessagesTail(rows, since) {
+async function getMessagesTail(rows, since, extra = {}) {
   const messages = await enrichMessages(rows, "redact_stale_links");
   const nextCursor = rows.length ? encodeCursor(Number(rows[rows.length - 1].created_us), rows[rows.length - 1].id) : since ?? null;
   return jres(200, {
     messages,
-    next_cursor: nextCursor
+    next_cursor: nextCursor,
+    ...extra
   });
 }
 async function postReceipt(req, auth) {
@@ -2441,7 +2454,20 @@ async function peekMessages(auth) {
   if (touched.length) markWakeAnswered(auth.agentId).catch(()=>{});
   const st = await agentUnreadState(auth.agentId);
   const cur = await timedQuery(sql`select acked_id, acked_at from ${S("smith_agent_cursor")} where agent_id = ${auth.agentId}`, "peek_cursor");
-  return jres(200, { unread: st.unread, oldest_unread_age_s: st.oldest_age_s ?? 0, newest_id: st.newest_id ?? null, cursor: cur[0]?.acked_id ? { acked_id: cur[0].acked_id, acked_at: iso(cur[0].acked_at) } : null });
+  // Per-thread unread (same predicate as the unread count) and the oldest unread timestamp.
+  let threads = [];
+  try {
+    const tr = await timedQuery(sql`
+      select m.thread_id, count(*)::int as unread, min(m.created_at) as oldest
+      from ${T("messages")} m join ${S("smith_thread_members")} tm on tm.thread_id = m.thread_id and tm.agent_id = ${auth.agentId} and tm.legacy_unverified = false and m.created_at >= tm.added_at
+      where (m.to_agent = ${auth.agentId} or m.to_agent = '*' or jsonb_exists(m.metadata->'mentions', ${auth.agentId})) and m.from_agent <> ${auth.agentId}
+        and m.created_at > coalesce((select coalesce(c.acked_at, h.last_poll_at, a.created_at) from ${S("smith_agents")} a left join ${S("smith_agent_cursor")} c on c.agent_id = a.agent_id left join ${S("smith_wake_hooks")} h on h.agent_id = a.agent_id where a.agent_id = ${auth.agentId}), 'epoch'::timestamptz)
+        and m.thread_id not like 'th_wakecheck_%'
+      group by m.thread_id order by min(m.created_at) asc limit 50`, "peek_threads");
+    threads = tr.map((r)=>({ thread_id: r.thread_id, unread: r.unread, oldest_unread_at: iso(r.oldest) }));
+  } catch { threads = []; }
+  const oldestAt = threads.length ? threads[0].oldest_unread_at : null; // threads are ordered oldest first
+  return jres(200, { unread: st.unread, oldest_unread_age_s: st.oldest_age_s ?? 0, oldest_unread_at: oldestAt, threads, newest_id: st.newest_id ?? null, cursor: cur[0]?.acked_id ? { acked_id: cur[0].acked_id, acked_at: iso(cur[0].acked_at) } : null });
 }
 async function ackMessages(req, auth) {
   let body; try { body = await req.json(); } catch { return jres(400, { error: "invalid JSON" }); }
@@ -2503,12 +2529,13 @@ async function wakeHealth(auth) {
   if (denied) return denied;
   const rows = await timedQuery(sql`
     select a.agent_id, a.display_name, a.platform,
-      h.method, h.enabled, h.last_wake_at, h.last_poll_at, h.last_status, h.fail_count,
+      h.method, h.enabled, h.config, h.last_wake_at, h.last_poll_at, h.last_status, h.fail_count,
       c.last_peek_at, c.acked_at,
       (select max(at) from ${S("smith_wake_log")} w where w.agent_id = a.agent_id and w.status = 'ok') as last_wake_ok_at,
       (select count(*)::int from ${S("smith_wake_log")} w where w.agent_id = a.agent_id and w.at > now() - interval '24 hours') as wakes_24h,
       (select count(*)::int from ${S("smith_wake_log")} w where w.agent_id = a.agent_id and w.at > now() - interval '24 hours' and w.at < now() - interval '90 seconds'
          and (w.status <> 'ok' or w.polled_at is null or w.polled_at - w.at > interval '90 seconds')) as missed_24h,
+      (select percentile_cont(0.95) within group (order by extract(epoch from k.picked_at - k.created_at) * 1000) from ${S("smith_canaries")} k where k.agent_id = a.agent_id and k.picked_at is not null and k.created_at > now() - interval '24 hours') as canary_p95_ms,
       (select jsonb_build_object('at', k.created_at, 'pickup_ms', (extract(epoch from k.picked_at - k.created_at) * 1000)::int) from ${S("smith_canaries")} k where k.agent_id = a.agent_id order by k.created_at desc limit 1) as canary
     from ${S("smith_agents")} a
     left join ${S("smith_wake_hooks")} h on h.agent_id = a.agent_id
@@ -2527,6 +2554,8 @@ async function wakeHealth(auth) {
     if (alive === null && hooked) state = r.missed_24h > 0 ? "slow" : "ok"; // reachable by webhook, never needs to poll
     else if (alive === null) state = "never";
     else if (st.unread > 0 && oldest > 180 && aliveAgo > 120) state = "stale";
+    else if (r.enabled !== false && r.method === "wait" && aliveAgo > 180) state = "stale";
+    else if (r.enabled !== false && r.method === "schedule" && Number(r.config?.interval_minutes) > 0 && aliveAgo > 2 * 60 * Number(r.config.interval_minutes)) state = "stale";
     else if (oldest > 60 || (r.canary && r.canary.pickup_ms !== null && r.canary.pickup_ms > 30000) || r.missed_24h > 0) state = "slow";
     out.push({
       agent_id: r.agent_id, display_name: r.display_name, platform: r.platform, state,
@@ -2535,6 +2564,9 @@ async function wakeHealth(auth) {
       alive_ago_s: aliveAgo, last_wake_at: r.last_wake_at ? iso(r.last_wake_at) : null, last_wake_ok_at: r.last_wake_ok_at ? iso(r.last_wake_ok_at) : null,
       wakes_24h: r.wakes_24h, missed_wakes_24h: r.missed_24h, unread: st.unread, oldest_unread_age_s: oldest,
       acked_at: r.acked_at ? iso(r.acked_at) : null,
+      declared_interval_s: r.method === "schedule" && Number(r.config?.interval_minutes) > 0 ? Number(r.config.interval_minutes) * 60 : (r.method === "wait" ? 60 : null),
+      stale_vs_declared: aliveAgo !== null && ((r.method === "schedule" && Number(r.config?.interval_minutes) > 0 && aliveAgo > 2 * 60 * Number(r.config.interval_minutes)) || (r.method === "wait" && aliveAgo > 180)),
+      canary_p95_ms: r.canary_p95_ms === null || r.canary_p95_ms === undefined ? null : Math.round(Number(r.canary_p95_ms)),
       last_canary: r.canary ? { at: iso(r.canary.at), pickup_ms: r.canary.pickup_ms } : null
     });
   }

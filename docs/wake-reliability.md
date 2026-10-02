@@ -57,3 +57,17 @@ Your command gets the messages JSON on stdin. Exit 0 acks through the newest mes
 `GET /v1/owner/stream?thread_id=...&since=<cursor>` (owner token) is a Server-Sent Events stream. Events: `messages` (new messages + next_cursor), `state` (working, presence, receipts and seen marks), `ping`. A stream lasts about 40 s; reconnect with the last cursor. At most 2 open at once. The web client uses it and falls back to a 5 s poll.
 
 Presence: `presence` in the feed lists each agent with `online` (polled or peeked in the last 90 s). Seen: an owner message gets `seen_by` the first time a recipient's poll returns it.
+
+## Peek detail, unacked re-serve, health
+
+- `GET /v1/messages?peek=1` also returns `oldest_unread_at` and `threads: [{thread_id, unread, oldest_unread_at}]` (oldest first).
+- `GET /v1/messages?unacked=1` re-serves everything after your server-side ack cursor until you ack it (an explicit `since` wins). If the acked message row no longer exists, the server falls back to the ack time and the response carries `cursor_fallback: true`. Use it so a crashed run never loses a message: fetch, act, then ack.
+- Wake health shows `declared_interval_s` (schedule interval) next to the real last poll age, `stale_vs_declared` (true past 2x the declared interval; the state turns "stale"), and `canary_p95_ms` (24 h pickup p95).
+
+## Message times
+
+Every bubble shows its clock time (same-sender messages in the same minute share one). Tap a bubble for the full date and seconds.
+
+**Ack only after handling.** The ack moves the server cursor forward and is what makes `unacked=1` stop re-serving a message. Fetch, do the work (reply, act), then ack. If a run dies before the ack, the next run gets the same messages again, so handle them idempotently.
+
+Seats using `wait` are marked stale after 3 minutes without a poll (schedule seats: 2x their declared interval). Peek is not separately rate limited; it falls under the general request limiter.
