@@ -467,9 +467,17 @@ async function postMessage(req, auth) {
       }
       return r;
     }), "post_transaction", 3500);
+    // Wake hooks: nudge recipients after the message is durable. Never blocks or fails the post.
+    let urgentFlag;
+    if (auth.kind === "agent" || auth.kind === "owner") {
+      urgentFlag = false;
+      try { urgentFlag = await urgentDecision(from, body.thread_id, body.to, body.urgent === true); } catch (e) { console.error("urgent decision failed", e); }
+      afterPostWake(body.thread_id, from, body.to, urgentFlag);
+    }
     return jres(201, {
       id: rows[0].id,
-      created_at: iso(rows[0].created_at)
+      created_at: iso(rows[0].created_at),
+      ...(body.urgent !== undefined && urgentFlag !== undefined ? { urgent: urgentFlag } : {})
     });
   } catch (e) {
     // Concurrent re-post of the same key lost the race: return the winner.
@@ -484,7 +492,7 @@ async function postMessage(req, auth) {
     throw e;
   }
 }
-async function getMessages(req, arrivedAt, auth) {
+async function getMessagesInner(req, arrivedAt, auth) {
   const u = new URL(req.url);
   const since = u.searchParams.get("since");
   const threadId = u.searchParams.get("thread_id");
@@ -1170,7 +1178,10 @@ async function addMember(req, auth, threadId) {
   if (RESERVED_AGENT_RE.test(aid)) return jres(422, {
     error: "agent_id 'owner' is reserved"
   });
-  const rows = await timedQuery(sql`select revoked_at from ${S("smith_agents")} where agent_id = ${aid}`, "member_agent");
+  const rows = await timedQuery(sql`select revoked_at, legacy_unverified, (token_hash is not null) as has_token from ${S("smith_agents")} where agent_id = ${aid}`, "member_agent");
+  if (rows.length && rows[0].legacy_unverified === true && !rows[0].has_token) return jres(422, {
+    error: `unregistered legacy agent id: ${aid} (pair it first)`
+  });
   if (!rows.length || rows[0].revoked_at !== null) return jres(422, {
     error: `unknown or revoked agent: ${aid}`
   });
@@ -1433,7 +1444,13 @@ async function redeemPairing(req) {
   const u = new URL(req.url);
   // P2-10: prefer a pinned instance URL from config; the request origin is
   // attacker-influenced behind a proxy (Host header), so it is only a fallback.
-  const instanceUrl = CONFIG_INSTANCE_URL || u.origin + u.pathname.replace(/\/v1\/.*$/, "").replace(/\/(cutout|agentcollab)$/, "");
+  // Default derivation: behind Supabase the function sees http://<ref>.supabase.co/<slug>/v1/...;
+  // the public URL is https://<ref>.supabase.co/functions/v1/<slug>.
+  const slugMatch = u.pathname.match(/^\/([^/]+)\/v1\//);
+  const derived = u.hostname.endsWith(".supabase.co")
+    ? `https://${u.hostname}/functions/v1/${slugMatch ? slugMatch[1] : "agentcollab"}`
+    : u.origin + u.pathname.replace(/\/v1\/.*$/, "").replace(/\/(cutout|agentcollab)$/, "");
+  const instanceUrl = CONFIG_INSTANCE_URL || derived;
   return jres(200, {
     agent_token: token,
     agent_id: redeemed.agent_id,
@@ -1780,6 +1797,16 @@ async function route(req, arrivedAt) {
     if (segs.length === 4 && segs[3] === "members" && req.method === "POST") return done(await addMember(req, auth, tid));
     if (segs.length === 3 && req.method === "PATCH") return done(await renameThread(req, auth, tid));
   }
+  if (segs[0] === "v1" && segs[1] === "agents" && segs[2] === "me" && segs[3] === "wake" && segs.length === 4 && auth.kind === "agent") {
+    if (req.method === "GET") return done(await getWake(auth, auth.agentId));
+    if (req.method === "PUT") return done(await putWake(req, auth, auth.agentId));
+  }
+  if (segs[0] === "v1" && segs[1] === "owner" && segs[2] === "agents" && segs[4] === "wake") {
+    if (auth.kind !== "owner") return done(jres(403, { error: "owner token required" }));
+    if (segs.length === 5 && req.method === "GET") return done(await getWake(auth, segs[3]));
+    if (segs.length === 5 && req.method === "PUT") return done(await putWake(req, auth, segs[3]));
+    if (segs.length === 6 && segs[5] === "test" && req.method === "POST") return done(await testWake(auth, segs[3]));
+  }
   if (segs[0] === "v1" && segs[1] === "owner" && segs[2] === "agents") {
     if (segs.length === 3 && req.method === "GET") return done(await ownerAgents(req, auth));
     if (segs.length === 5 && segs[4] === "revoke" && req.method === "POST") return done(await revokeAgent(req, auth, segs[3]));
@@ -1794,6 +1821,306 @@ async function route(req, arrivedAt) {
     error: "not found"
   }));
 }
+// ---- wake hooks -----------------------------------------------------------------
+// Per-agent "nudge" settings, Tincan-style. Delivery NEVER depends on wake: a message is
+// durable the moment it is posted; wake only tells the agent to go and poll. The payload
+// carries a count and a thread id, never message content.
+const WAKE_DEBOUNCE_MS = Number(Deno.env.get("SMITH_WAKE_DEBOUNCE_MS") ?? 10000);
+const WAKE_RECHECK_MS = Number(Deno.env.get("SMITH_WAKE_RECHECK_MS") ?? 30000);
+const WAKE_URGENT_PER_HOUR = Number(Deno.env.get("SMITH_WAKE_URGENT_PER_HOUR") ?? 6);
+const WAKE_FAIL_DISABLE_AFTER = Number(Deno.env.get("SMITH_WAKE_FAIL_DISABLE_AFTER") ?? 20);
+const WAKE_TEST_PER_HOUR = 10;
+const WAKE_WEBHOOK_PER_HOUR = Number(Deno.env.get("SMITH_WAKE_WEBHOOK_PER_HOUR") ?? 60);
+const WAKE_EMAIL_PER_HOUR = Number(Deno.env.get("SMITH_WAKE_EMAIL_PER_HOUR") ?? 12);
+const WAKE_METHODS = ["none", "wait", "schedule", "webhook", "email"];
+// Email wake is OFF unless all of these are set. Allowlist is exact addresses, no domains.
+const WAKE_EMAIL_ENABLED = Deno.env.get("SMITH_WAKE_EMAIL_ENABLED") === "1";
+const WAKE_EMAIL_ENDPOINT = Deno.env.get("SMITH_WAKE_EMAIL_ENDPOINT") ?? "";
+const WAKE_EMAIL_KEY = Deno.env.get("SMITH_WAKE_EMAIL_KEY") ?? "";
+const WAKE_EMAIL_FROM = Deno.env.get("SMITH_WAKE_EMAIL_FROM") ?? "";
+const WAKE_EMAIL_ALLOW = (Deno.env.get("SMITH_WAKE_EMAIL_ALLOW") ?? "").split(",").map((s)=>s.trim().toLowerCase()).filter(Boolean);
+const pollingAgents = new Map(); // agent_id -> open long-polls (best effort, per isolate)
+const trailing = new Set(); // agent_ids with a pending trailing-edge wake
+const pollTouch = new Map(); // agent_id -> last last_poll_at write (ms)
+const sleep = (ms)=>new Promise((r)=>setTimeout(r, ms));
+
+function ipv4Private(h) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (!m) return false;
+  const [a, b] = [Number(m[1]), Number(m[2])];
+  return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 192 && b === 0) || (a === 198 && (b === 18 || b === 19)) || a >= 224;
+}
+function ipv6Private(h) {
+  const x = h.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!x.includes(":")) return false;
+  if (x === "::" || x === "::1") return true;
+  if (/^f[cd]/.test(x) || /^fe[89ab]/.test(x) || x.startsWith("ff")) return true;
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(x);
+  return mapped ? ipv4Private(mapped[1]) : false;
+}
+// Syntactic URL policy, applied when the hook is set and again at send time.
+function webhookUrlError(raw) {
+  let u;
+  try { u = new URL(String(raw)); } catch { return "url is not a valid URL"; }
+  if (u.protocol !== "https:") return "url must be https";
+  if (u.username || u.password) return "url must not contain credentials";
+  if (u.port && u.port !== "443") return "url must use port 443";
+  const h = u.hostname.toLowerCase();
+  if (!h.includes(".") && !h.includes(":")) return "url host must be a public hostname";
+  if (/(^|\.)(localhost|local|internal|localdomain|home|lan|corp)$/.test(h)) return "url host must be a public hostname";
+  // IP literals are refused outright (also closes IPv4-mapped / NAT64 IPv6 forms that URL normalizes).
+  if (h.includes(":") || h.startsWith("[") || /^[\d.]+$/.test(h) || /^0x[0-9a-f]+$/i.test(h)) return "url host must be a DNS name, not an IP address";
+  if (ipv4Private(h) || ipv6Private(h)) return "url host must not be a private or loopback address";
+  if (String(raw).length > 500) return "url too long";
+  return null;
+}
+// Resolve and refuse private targets (SSRF). Fails closed.
+async function assertPublicHost(host) {
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(":")) {
+    if (ipv4Private(host) || ipv6Private(host)) throw new Error("blocked_private_host");
+    return;
+  }
+  let addrs = [];
+  for (const t of ["A", "AAAA"]) {
+    try { addrs = addrs.concat(await Deno.resolveDns(host, t)); } catch { /* no records of this type */ }
+  }
+  if (!addrs.length) throw new Error("dns_unresolved");
+  for (const a of addrs) if (ipv4Private(a) || ipv6Private(a)) throw new Error("blocked_private_host");
+}
+async function hmacHex(secret, msg) {
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(msg)));
+  return Array.from(sig).map((b)=>b.toString(16).padStart(2, "0")).join("");
+}
+async function sendWebhook(url, secret, payload, agentId) {
+  const err = webhookUrlError(url);
+  if (err) throw new Error("blocked_url");
+  if (agentId) {
+    const sentW = await timedQuery(sql`select count(*)::int as n from ${S("smith_audit")} where action = 'wake_sent' and detail->>'method' = 'webhook' and detail->>'agent_id' = ${agentId} and at > now() - interval '1 hour'`, "wake_webhook_rate");
+    if (sentW[0].n >= WAKE_WEBHOOK_PER_HOUR) throw new Error("webhook_rate_limited");
+  }
+  await assertPublicHost(new URL(url).hostname);
+  const body = JSON.stringify(payload);
+  const ts = String(Math.floor(Date.now() / 1000));
+  const sig = secret ? await hmacHex(secret, `${ts}.${body}`) : "";
+  const res = await fetch(url, {
+    method: "POST",
+    redirect: "manual",
+    signal: AbortSignal.timeout(3000),
+    headers: { "content-type": "application/json", "user-agent": "smith-wake/1", "x-smith-timestamp": ts, "x-smith-signature": "sha256=" + sig },
+    body
+  });
+  await res.body?.cancel();
+  return res.status;
+}
+async function sendWakeEmail(address, payload) {
+  if (!WAKE_EMAIL_ENABLED || !WAKE_EMAIL_ENDPOINT || !WAKE_EMAIL_KEY || !WAKE_EMAIL_FROM) throw new Error("email_disabled");
+  if (!WAKE_EMAIL_ALLOW.includes(String(address).toLowerCase())) throw new Error("email_not_allowlisted");
+  const sent = await timedQuery(sql`select count(*)::int as n from ${S("smith_audit")} where action = 'wake_sent' and detail->>'method' = 'email' and at > now() - interval '1 hour'`, "wake_email_rate");
+  if (sent[0].n >= WAKE_EMAIL_PER_HOUR) throw new Error("email_rate_limited");
+  // Ping only: a count and a thread id. No message content, ever.
+  const text = `Smith: ${payload.unread} new message${payload.unread === 1 ? "" : "s"}${payload.thread_id ? " (thread " + payload.thread_id + ")" : ""}. Poll your Smith inbox to read.`;
+  const res = await fetch(WAKE_EMAIL_ENDPOINT, {
+    method: "POST",
+    redirect: "manual",
+    signal: AbortSignal.timeout(5000),
+    headers: { "content-type": "application/json", authorization: "Bearer " + WAKE_EMAIL_KEY },
+    body: JSON.stringify({ from: WAKE_EMAIL_FROM, to: address, subject: "Smith wake", text })
+  });
+  await res.body?.cancel();
+  return res.status;
+}
+async function wakeUnread(agentId) {
+  const r = await timedQuery(sql`
+    select count(*)::int as n
+    from ${T("messages")} m
+    join ${S("smith_thread_members")} tm on tm.thread_id = m.thread_id and tm.agent_id = ${agentId} and tm.legacy_unverified = false and m.created_at >= tm.added_at
+    join ${S("smith_wake_hooks")} h on h.agent_id = ${agentId}
+    where (m.to_agent = ${agentId} or m.to_agent = '*') and m.from_agent <> ${agentId}
+      and m.created_at > coalesce(h.last_poll_at, h.updated_at)`, "wake_unread");
+  return r[0].n;
+}
+// Atomic claim of the debounce slot. Only one isolate wins per window.
+async function wakeClaim(agentId, bypass) {
+  const rows = await timedQuery(sql`
+    update ${S("smith_wake_hooks")} set last_wake_at = now()
+    where agent_id = ${agentId} and enabled and method in ('webhook','email')
+      and (${bypass} or last_wake_at is null or last_wake_at < now() - make_interval(secs => ${WAKE_DEBOUNCE_MS / 1000}))
+    returning agent_id, method, config, signing_secret`, "wake_claim");
+  return rows[0] ?? null;
+}
+async function wakeDeliver(h, payload) {
+  let status = "ok";
+  try {
+    const code = h.method === "email" ? await sendWakeEmail(h.config?.address, payload) : await sendWebhook(h.config?.url, h.signing_secret, payload, h.agent_id);
+    if (code < 200 || code >= 300) status = "http_" + code;
+  } catch (e) {
+    status = "error:" + String(e?.message ?? e).slice(0, 60);
+  }
+  const ok = status === "ok";
+  await timedQuery(sql`
+    update ${S("smith_wake_hooks")} set last_status = ${status},
+      fail_count = ${ok ? 0 : sql`fail_count + 1`},
+      enabled = ${ok ? sql`enabled` : sql`enabled and fail_count + 1 < ${WAKE_FAIL_DISABLE_AFTER}`}
+    where agent_id = ${h.agent_id}`, "wake_status");
+  await audit("system", ok ? "wake_sent" : "wake_failed", { agent_id: h.agent_id, method: h.method, status, unread: payload.unread, urgent: !!payload.urgent });
+  return status;
+}
+async function wakeAttempt(agentId, threadId, urgent, bypass) {
+  if (!urgent && (pollingAgents.get(agentId) ?? 0) > 0) return "skipped_polling";
+  const h = await wakeClaim(agentId, bypass || urgent);
+  if (!h) return "debounced";
+  const unread = await wakeUnread(agentId);
+  if (unread <= 0 && !urgent) return "nothing_unread";
+  await wakeDeliver(h, { event: "wake", agent_id: agentId, unread, thread_id: threadId ?? null, urgent: !!urgent, ts: new Date().toISOString() });
+  return "sent";
+}
+async function wakeFlow(agentId, threadId, urgent) {
+  const first = await wakeAttempt(agentId, threadId, urgent, false);
+  if (first === "debounced" && !trailing.has(agentId)) {
+    // Trailing edge: one coalesced wake once the window passes.
+    trailing.add(agentId);
+    try {
+      await sleep(WAKE_DEBOUNCE_MS + 250);
+      await wakeAttempt(agentId, threadId, false, false);
+    } finally { trailing.delete(agentId); }
+    return;
+  }
+  if (first === "sent") {
+    // 30s recheck: still unread and the agent has not polled since? One more nudge.
+    await sleep(WAKE_RECHECK_MS);
+    if ((pollingAgents.get(agentId) ?? 0) === 0) {
+      const still = await wakeUnread(agentId);
+      if (still > 0) await wakeAttempt(agentId, threadId, false, true);
+    }
+  }
+}
+// Decides (and audits) whether an urgent request is honored: rate-limited per sender.
+async function urgentDecision(from, threadId, to, requested) {
+  if (!requested) return false;
+  const n = await timedQuery(sql`select count(*)::int as n from ${S("smith_audit")} where action = 'urgent_wake' and actor = ${from} and at > now() - interval '1 hour'`, "urgent_rate");
+  if (n[0].n < WAKE_URGENT_PER_HOUR) {
+    await audit(from, "urgent_wake", { thread_id: threadId, to });
+    return true;
+  }
+  await audit(from, "urgent_wake_limited", { thread_id: threadId, to });
+  return false;
+}
+async function wakeAfterPost(threadId, from, to, urgentRequested) {
+  const recips = await timedQuery(sql`
+    select h.agent_id from ${S("smith_wake_hooks")} h
+    join ${S("smith_agents")} a on a.agent_id = h.agent_id and a.revoked_at is null and a.token_hash is not null
+    join ${S("smith_thread_members")} tm on tm.thread_id = ${threadId} and tm.agent_id = h.agent_id and tm.legacy_unverified = false
+    where h.enabled and h.method in ('webhook','email') and h.agent_id <> ${from}
+      and (${to} = '*' or h.agent_id = ${to})`, "wake_recipients");
+  if (!recips.length) return { urgent: false };
+  const urgent = urgentRequested === true;
+  await Promise.allSettled(recips.map((r)=>wakeFlow(r.agent_id, threadId, urgent)));
+  return { urgent };
+}
+function afterPostWake(threadId, from, to, urgentRequested) {
+  const p = wakeAfterPost(threadId, from, to, urgentRequested).catch((e)=>console.error("wake failed", e));
+  try { globalThis.EdgeRuntime?.waitUntil?.(p); } catch { /* local runs just let it float */ }
+}
+function markPolling(agentId, d) {
+  const n = (pollingAgents.get(agentId) ?? 0) + d;
+  if (n <= 0) pollingAgents.delete(agentId); else pollingAgents.set(agentId, n);
+}
+async function touchPoll(agentId) {
+  const now = Date.now();
+  if (now - (pollTouch.get(agentId) ?? 0) < 3000) return;
+  pollTouch.set(agentId, now);
+  try { await sql`update ${S("smith_wake_hooks")} set last_poll_at = now() where agent_id = ${agentId}`; } catch { /* hooks table absent: wake not installed */ }
+}
+async function getMessages(req, arrivedAt, auth) {
+  if (auth.kind !== "agent") return await getMessagesInner(req, arrivedAt, auth);
+  markPolling(auth.agentId, 1);
+  touchPoll(auth.agentId).catch(()=>{});
+  try {
+    return await getMessagesInner(req, arrivedAt, auth);
+  } finally {
+    markPolling(auth.agentId, -1);
+    pollTouch.delete(auth.agentId);
+    touchPoll(auth.agentId).catch(()=>{});
+  }
+}
+function wakeView(row) {
+  if (!row) return { method: "none", enabled: true, config: {}, has_secret: false, last_wake_at: null, last_status: null, fail_count: 0, email_available: WAKE_EMAIL_ENABLED };
+  return {
+    method: row.method, enabled: row.enabled, config: row.config ?? {}, has_secret: !!row.signing_secret,
+    last_wake_at: row.last_wake_at ? iso(row.last_wake_at) : null, last_poll_at: row.last_poll_at ? iso(row.last_poll_at) : null,
+    last_status: row.last_status, fail_count: row.fail_count, updated_at: iso(row.updated_at), email_available: WAKE_EMAIL_ENABLED
+  };
+}
+async function wakeAgentOk(agentId) {
+  const a = await timedQuery(sql`select 1 from ${S("smith_agents")} where agent_id = ${agentId} and revoked_at is null and token_hash is not null`, "wake_agent");
+  return a.length > 0;
+}
+async function getWake(auth, agentId) {
+  if (auth.kind === "agent" && auth.agentId !== agentId) return jres(403, { error: "not your agent" });
+  if (auth.kind !== "agent" && auth.kind !== "owner") return jres(403, { error: "agent or owner token required" });
+  if (!await wakeAgentOk(agentId)) return jres(404, { error: "agent not found" });
+  const r = await timedQuery(sql`select * from ${S("smith_wake_hooks")} where agent_id = ${agentId}`, "wake_get");
+  return jres(200, wakeView(r[0]));
+}
+async function putWake(req, auth, agentId) {
+  if (auth.kind === "agent" && auth.agentId !== agentId) return jres(403, { error: "not your agent" });
+  if (auth.kind !== "agent" && auth.kind !== "owner") return jres(403, { error: "agent or owner token required" });
+  let body;
+  try { body = await req.json(); } catch { return jres(400, { error: "invalid JSON" }); }
+  if (!await wakeAgentOk(agentId)) return jres(404, { error: "agent not found" });
+  const method = body.method;
+  if (!WAKE_METHODS.includes(method)) return jres(422, { error: `method must be one of ${WAKE_METHODS.join(", ")}` });
+  const cur = (await timedQuery(sql`select * from ${S("smith_wake_hooks")} where agent_id = ${agentId}`, "wake_cur"))[0];
+  let config = {};
+  let secret = cur?.signing_secret ?? null;
+  let secretOut = null;
+  if (method === "webhook") {
+    if (auth.kind !== "owner") return jres(403, { error: "only the owner can set a webhook URL" });
+    const e = webhookUrlError(body.url);
+    if (e) return jres(422, { error: e });
+    config = { url: String(body.url) };
+    if (!secret || body.rotate_secret === true) {
+      secretOut = "whsec_" + randomHexBytes(24);
+      secret = secretOut;
+    }
+  } else if (method === "schedule") {
+    const n = Number(body.interval_minutes);
+    if (!Number.isInteger(n) || n < 1 || n > 1440) return jres(422, { error: "interval_minutes must be an integer from 1 to 1440" });
+    config = { interval_minutes: n };
+  } else if (method === "email") {
+    if (auth.kind !== "owner") return jres(403, { error: "only the owner can set an email wake" });
+    if (!WAKE_EMAIL_ENABLED) return jres(409, { error: "email wake is disabled on this instance" });
+    const addr = String(body.address ?? "").trim().toLowerCase();
+    if (!WAKE_EMAIL_ALLOW.includes(addr)) return jres(422, { error: "address is not on this instance's email allowlist" });
+    config = { address: addr };
+  }
+  if (method !== "webhook") secret = null; // never keep an HMAC key for a hook that is not a webhook
+  const enabled = body.enabled === false ? false : true;
+  await timedQuery(sql`
+    insert into ${S("smith_wake_hooks")} (agent_id, method, config, signing_secret, enabled, updated_at)
+    values (${agentId}, ${method}, ${sql.json(config)}, ${secret}, ${enabled}, now())
+    on conflict (agent_id) do update set method = excluded.method, config = excluded.config,
+      signing_secret = excluded.signing_secret, enabled = excluded.enabled, fail_count = 0, updated_at = now()`, "wake_put");
+  const host = config.url ? new URL(config.url).hostname : config.address ? "email" : null;
+  await audit(auth.kind === "owner" ? OWNER_ID : auth.agentId, "set_wake", { agent_id: agentId, method, host, enabled, rotated_secret: secretOut !== null });
+  const r = (await timedQuery(sql`select * from ${S("smith_wake_hooks")} where agent_id = ${agentId}`, "wake_get2"))[0];
+  const out = wakeView(r);
+  if (secretOut) out.signing_secret = secretOut; // shown once
+  return jres(200, out);
+}
+async function testWake(auth, agentId) {
+  const denied = requireOwner(auth);
+  if (denied) return denied;
+  const r = (await timedQuery(sql`select * from ${S("smith_wake_hooks")} where agent_id = ${agentId}`, "wake_t"))[0];
+  if (!r || !r.enabled || !["webhook", "email"].includes(r.method)) return jres(409, { error: "no enabled webhook or email wake for this agent" });
+  const n = await timedQuery(sql`select count(*)::int as n from ${S("smith_audit")} where action = 'wake_test' and detail->>'agent_id' = ${agentId} and at > now() - interval '1 hour'`, "wake_test_rate");
+  if (n[0].n >= WAKE_TEST_PER_HOUR) return jres(429, { error: "wake test limit reached" }, { "Retry-After": "600" });
+  await audit(OWNER_ID, "wake_test", { agent_id: agentId, method: r.method });
+  const status = await wakeDeliver(r, { event: "wake_test", agent_id: agentId, unread: 0, thread_id: null, urgent: false, ts: new Date().toISOString() });
+  return jres(200, { status });
+}
+
 // CORS: exact-origin allowlist for the hosted Smith web client. No wildcard.
 const CORS_ORIGIN = "https://zev-dotcom.github.io";
 function corsHeaders(req) {

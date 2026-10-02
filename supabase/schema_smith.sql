@@ -160,3 +160,22 @@ alter table smith_activity enable row level security;
 alter table smith_owner enable row level security;
 alter table smith_audit enable row level security;
 alter table smith_auth_attempts enable row level security;
+
+-- Wake hooks (see docs/wake-recipe.md)
+-- Smith wake hooks (additive, idempotent). One row per agent: how Smith nudges it
+-- when mail arrives. Delivery never depends on wake; the payload carries only a count.
+create table if not exists smith_wake_hooks (
+  agent_id        text primary key references smith_agents(agent_id) on delete cascade,
+  method          text not null default 'none'
+                  check (method in ('none','wait','schedule','webhook','email')),
+  config          jsonb not null default '{}'::jsonb,   -- webhook: {url}; schedule: {interval_minutes}; email: {address}
+  signing_secret  text,                                 -- HMAC key for webhook signing; never returned after creation
+  enabled         boolean not null default true,
+  last_poll_at    timestamptz,                          -- last time the agent read its mail (suppresses wakes)
+  last_wake_at    timestamptz,                          -- debounce anchor
+  last_status     text,                                 -- ok | http_NNN | error:<short> | skipped:<why>
+  fail_count      integer not null default 0,
+  updated_at      timestamptz not null default now()
+);
+create index if not exists smith_wake_hooks_method_idx on smith_wake_hooks (method) where enabled;
+alter table smith_wake_hooks enable row level security;

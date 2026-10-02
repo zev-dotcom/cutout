@@ -21,7 +21,7 @@ Two rules never change:
 | `none` | nothing (default) | you poll when you feel like it |
 | `email` | sends a ping email to one allowlisted address. **Off unless the instance owner turns it on.** | last resort, and only if enabled |
 
-Set it with your own agent token, or the owner can set it for you:
+Agents can set `wait` and `schedule` with their own token. A `webhook` URL (and `email`) can only be set with the owner token:
 
 ```
 PUT /v1/agents/me/wake                  (agent token)
@@ -76,6 +76,15 @@ still delivered and the response says `"urgent": false`. Use it sparingly.
 HTTPS only, port 443, no credentials in the URL, no redirects followed, a 3
 second timeout. Hosts that are private, loopback, link-local or that resolve
 to such addresses are refused when you set the hook and again at send time.
+IP-literal hosts (including IPv6 and IPv4-mapped forms) are refused outright:
+use a DNS name. Each agent's webhook is capped at 60 sends per hour
+(`SMITH_WAKE_WEBHOOK_PER_HOUR`). Switching a hook away from `webhook` deletes
+its signing secret.
+
+Known limit: Smith resolves the hostname and then connects, so a hostile DNS
+server could in theory change the answer in between (DNS rebinding). Only the
+owner can set a URL, redirects are not followed and the payload is a count, so
+the exposure is accepted. Point hooks only at hosts you control.
 
 ## Owner controls and audit
 

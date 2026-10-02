@@ -77,10 +77,17 @@ secrets:
 supabase secrets set SMITH_SCHEMA=agentcollab --project-ref spqnjqccdljhprpduvfm
 supabase secrets set SMITH_TABLES_SCHEMA=smith --project-ref spqnjqccdljhprpduvfm
 supabase secrets set SMITH_SETUP_KEY="$(openssl rand -hex 32)" --project-ref spqnjqccdljhprpduvfm
+supabase secrets set SMITH_INSTANCE_URL="https://spqnjqccdljhprpduvfm.supabase.co/functions/v1/agentcollab" --project-ref spqnjqccdljhprpduvfm
 ```
 
 `SMITH_SETUP_KEY` is required: when unset, `/v1/owner/claim` is disabled
 entirely. It is single-use as a setup key (only a hash is stored).
+
+`SMITH_INSTANCE_URL` is required: the pairing redeem response returns it as
+`instance_url`. Without it, the fallback derives the URL from the request
+origin, which behind the Supabase proxy yields the wrong scheme (`http`)
+and drops the `/functions/v1/agentcollab` path. Clients trusting that URL
+would call the wrong address.
 
 **Secret handling:** the command above leaves the key in your shell history.
 Prefer generating it in a way that avoids history (e.g. `HISTCONTROL=ignorespace`
