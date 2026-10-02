@@ -210,7 +210,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-01.5";
+var SMITH_BUILD = "2026-10-01.6";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -235,6 +235,7 @@ async function loadThreads(){
   state.threads.forEach(function(t){ state.threadById[t.thread_id] = t; });
   indexAgents(state.agents);
   renderThreadList();
+  syncAppBadge();
 }
 function threadSnippet(t){
   if (t.working && t.working.length){
@@ -875,6 +876,8 @@ async function loadAudit(){
 function renderSettings(){
   $("settingsInstance").textContent = baseUrl() || "—";
   if ($("settingsBuild")) $("settingsBuild").textContent = "Build " + SMITH_BUILD;
+  renderInstall();
+  renderNotifications();
 }
 async function rotateToken(){
   modal("Rotate owner token?",
@@ -975,6 +978,194 @@ async function setupClaim(){
 }
 
 /* ---------- boot & wiring ---------- */
+/* ---------- PWA: install guide, push notifications, deep links ---------- */
+var deferredInstall = null;
+var LS_INSTALL_DISMISS = "smith.install.dismissed";
+var LS_PUSH_ID = "smith.push.id";
+function isStandalone(){
+  return (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || window.navigator.standalone === true;
+}
+function isIOS(){
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+function pushSupported(){
+  return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+function b64uToBytes(s){
+  var p = String(s).replace(/-/g, "+").replace(/_/g, "/");
+  var bin = atob(p + "=".repeat((4 - p.length % 4) % 4));
+  return Uint8Array.from(bin, function(c){ return c.charCodeAt(0); });
+}
+window.addEventListener("beforeinstallprompt", function(e){
+  e.preventDefault(); deferredInstall = e; renderInstall();
+});
+window.addEventListener("appinstalled", function(){
+  deferredInstall = null; renderInstall(); renderNotifications();
+  toast("Smith is installed.");
+});
+function iosSteps(){
+  return '<ol><li>Tap the <span class="glyph">Share</span> button (the square with an arrow) in Safari.</li>' +
+    '<li>Scroll down and tap <span class="glyph">Add to Home Screen</span>.</li>' +
+    '<li>Tap <span class="glyph">Add</span>, then open Smith from your home screen.</li></ol>';
+}
+function runInstall(){
+  if (deferredInstall){
+    var d = deferredInstall; deferredInstall = null;
+    d.prompt();
+    if (d.userChoice) d.userChoice.then(function(){ renderInstall(); });
+    return;
+  }
+  if (isIOS()){
+    modal("Add Smith to your Home Screen", '<div class="fine" style="margin:0">' + iosSteps() +
+      "<p>It must be Safari. Notifications work after you open Smith from the home screen.</p></div>", "Got it", function(){});
+    return;
+  }
+  toast("Use your browser menu: Install app / Add to Home screen.");
+}
+function installAvailable(){
+  return !isStandalone() && (!!deferredInstall || isIOS());
+}
+function renderInstall(){
+  var card = $("installCard"), row = $("installRow");
+  var show = installAvailable();
+  if (row){
+    row.hidden = !show;
+    if (show){
+      $("installSub").textContent = deferredInstall ? "Add Smith to your home screen to open it like an app."
+        : "On iPhone: Share, then Add to Home Screen.";
+      $("installBtn").textContent = deferredInstall ? "Install" : "How";
+      $("installBtn").onclick = runInstall;
+    }
+  }
+  if (!card) return;
+  var dismissed = false;
+  try { dismissed = !!localStorage.getItem(LS_INSTALL_DISMISS); } catch(e){}
+  if (!show || dismissed){ card.hidden = true; card.innerHTML = ""; return; }
+  card.hidden = false;
+  card.innerHTML = '<div class="ic-h">Install Smith<button class="ic-x" id="icClose" aria-label="Dismiss">✕</button></div>' +
+    (deferredInstall
+      ? '<div>Open it like an app, and get notifications.</div><div class="ic-b"><button class="copybtn" id="icInstall" style="width:auto;min-height:44px;padding:0 18px">Install Smith</button></div>'
+      : "<div>Add it to your home screen to open it like an app and get notifications.</div>" + iosSteps());
+  $("icClose").onclick = function(){ try { localStorage.setItem(LS_INSTALL_DISMISS, String(Date.now())); } catch(e){} renderInstall(); };
+  var b = $("icInstall"); if (b) b.onclick = runInstall;
+}
+function deviceLabel(){
+  var ua = navigator.userAgent;
+  var os = /iPhone|iPad|iPod/.test(ua) ? "iPhone/iPad" : /Android/.test(ua) ? "Android" : /Mac/.test(ua) ? "Mac" : /Windows/.test(ua) ? "Windows" : /Linux/.test(ua) ? "Linux" : "Device";
+  var br = /Edg\//.test(ua) ? "Edge" : /Firefox\//.test(ua) ? "Firefox" : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "Browser";
+  return os + " " + br + (isStandalone() ? " (app)" : "");
+}
+async function renderNotifications(){
+  var sub = $("notifSub"), btn = $("notifBtn"), list = $("notifDevices"), opts = $("notifOpts");
+  if (!sub) return;
+  list.innerHTML = ""; opts.hidden = true;
+  if (!pushSupported()){
+    btn.hidden = true;
+    sub.textContent = isIOS() && !isStandalone()
+      ? "On iPhone, notifications work once Smith is added to your Home Screen (Share, Add to Home Screen), then opened from there."
+      : "This browser does not support push notifications.";
+    return;
+  }
+  if (isIOS() && !isStandalone()){
+    btn.hidden = true;
+    sub.textContent = "Add Smith to your Home Screen first (Share, Add to Home Screen). Then open it from there and turn notifications on.";
+    return;
+  }
+  btn.hidden = false;
+  var info = null;
+  try { info = await api("GET", "/v1/owner/push"); } catch(e){ sub.textContent = "Notifications are unavailable on this instance."; btn.hidden = true; return; }
+  var mine = null;
+  try { var reg = await navigator.serviceWorker.getRegistration(); mine = reg ? await reg.pushManager.getSubscription() : null; } catch(e){}
+  var myId = null; try { myId = localStorage.getItem(LS_PUSH_ID); } catch(e){}
+  var onHere = !!mine && (info.devices || []).some(function(d){ return d.id === myId; });
+  if (Notification.permission === "denied"){
+    sub.textContent = "Notifications are blocked for this site. Allow them in your browser or phone settings, then come back.";
+    btn.hidden = true;
+  } else if (onHere){
+    sub.textContent = "On for this device. You get a push when an agent writes to you (chat name and count only).";
+    btn.textContent = "Turn off"; btn.onclick = disableNotifications;
+  } else {
+    sub.textContent = "Get a push when an agent writes to you.";
+    btn.textContent = "Enable"; btn.onclick = enableNotifications;
+  }
+  (info.devices || []).forEach(function(d){
+    var row = el("div", "devrow");
+    row.innerHTML = '<div class="dl"><b>' + esc(d.label) + (d.id === myId ? " · this device" : "") + '</b><div class="ds">' +
+      esc(d.host) + (d.last_ok_at ? " · last ok " + esc(fmtListTime(d.last_ok_at)) : "") + (d.fail_count ? " · " + d.fail_count + " failed" : "") + "</div></div>" +
+      '<button class="dangerbtn">Revoke</button>';
+    row.querySelector("button").onclick = function(){
+      api("DELETE", "/v1/owner/push/subscription/" + encodeURIComponent(d.id)).then(function(){
+        if (d.id === myId){ navigator.serviceWorker.getRegistration().then(function(r){ return r && r.pushManager.getSubscription(); }).then(function(s){ if (s) s.unsubscribe(); }); try { localStorage.removeItem(LS_PUSH_ID); } catch(e){} }
+        renderNotifications();
+      }).catch(function(e){ toast(e.message); });
+    };
+    list.appendChild(row);
+  });
+  if ((info.devices || []).length){
+    var t = el("div", "devrow");
+    t.innerHTML = '<div class="dl ds">Send a test notification to every device.</div><button class="copybtn" style="width:auto;min-height:36px;padding:0 14px">Send test</button>';
+    t.querySelector("button").onclick = function(){
+      api("POST", "/v1/owner/push/test", {}).then(function(r){
+        var bad = (r.results || []).filter(function(x){ return x.status !== "ok"; });
+        toast(bad.length ? "Test failed on " + bad.length + " device(s)." : "Test sent.");
+        renderNotifications();
+      }).catch(function(e){ toast(e.message); });
+    };
+    list.appendChild(t);
+    opts.hidden = false;
+    $("notifBodyToggle").textContent = info.include_body ? "●" : "○";
+    $("notifBodyToggle").onclick = function(){
+      api("PUT", "/v1/owner/push/settings", {include_body: !info.include_body}).then(renderNotifications).catch(function(e){ toast(e.message); });
+    };
+  }
+}
+async function enableNotifications(){
+  try {
+    var perm = await Notification.requestPermission();
+    if (perm !== "granted"){ toast("Notifications were not allowed."); renderNotifications(); return; }
+    var setup = await api("POST", "/v1/owner/push/setup", {});
+    var reg = await navigator.serviceWorker.ready;
+    var sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({userVisibleOnly: true, applicationServerKey: b64uToBytes(setup.public_key)});
+    var j = sub.toJSON();
+    var res = await api("PUT", "/v1/owner/push/subscription", {endpoint: j.endpoint, keys: j.keys, label: deviceLabel()});
+    try { localStorage.setItem(LS_PUSH_ID, res.id); } catch(e){}
+    toast("Notifications are on for this device.");
+  } catch(e){ toast("Could not enable notifications: " + (e.message || e)); }
+  renderNotifications();
+}
+async function disableNotifications(){
+  try {
+    var id = null; try { id = localStorage.getItem(LS_PUSH_ID); } catch(e){}
+    if (id) await api("DELETE", "/v1/owner/push/subscription/" + encodeURIComponent(id));
+    var reg = await navigator.serviceWorker.getRegistration();
+    var s = reg ? await reg.pushManager.getSubscription() : null;
+    if (s) await s.unsubscribe();
+    try { localStorage.removeItem(LS_PUSH_ID); } catch(e){}
+  } catch(e){ toast(e.message); }
+  renderNotifications();
+}
+function syncAppBadge(){
+  var total = (state.threads || []).reduce(function(n, t){ return n + (t.unread || 0); }, 0);
+  try {
+    if (navigator.setAppBadge) (total > 0 ? navigator.setAppBadge(total) : navigator.clearAppBadge()).catch(function(){});
+  } catch(e){}
+}
+function openFromHash(){
+  var m = /^#t=(.+)$/.exec(location.hash || "");
+  if (!m) return;
+  var tid = decodeURIComponent(m[1]);
+  if (state.threadById && state.threadById[tid]){ openThread(tid); history.replaceState(null, "", location.pathname + location.search); }
+}
+function registerSW(){
+  if (!("serviceWorker" in navigator)) return;
+  navigator.serviceWorker.register("sw.js?v=" + encodeURIComponent(SMITH_BUILD)).catch(function(){});
+  navigator.serviceWorker.addEventListener("message", function(e){
+    if (e.data && e.data.type === "open-thread"){ location.hash = "#t=" + encodeURIComponent(e.data.thread_id); loadThreads().then(openFromHash).catch(function(){}); }
+  });
+}
+window.addEventListener("hashchange", function(){ loadThreads().then(openFromHash).catch(function(){}); });
+
 function boot(){
   var cfg = loadCfg();
   var has = cfg && cfg.url && cfg.token;
@@ -993,8 +1184,10 @@ function boot(){
   }
   applyTheme();
   renderSettings();
+  registerSW();
+  renderInstall();
   showScreen("home");
-  loadThreads().catch(function(e){ toast(e.message); });
+  loadThreads().then(openFromHash).catch(function(e){ toast(e.message); });
   startListPoll();
   ensureAgents().catch(function(){});
 }
@@ -1018,7 +1211,7 @@ $("navAgents").addEventListener("click", function(){ showScreen("agents"); });
 $("agentsPairBtn").addEventListener("click", function(){ showScreen("pairing"); });
 $("homePairBtn").addEventListener("click", function(){ showScreen("pairing"); });
 $("navAudit").addEventListener("click", function(){ showScreen("audit"); });
-$("navSettings").addEventListener("click", function(){ showScreen("settings"); });
+$("navSettings").addEventListener("click", function(){ renderSettings(); showScreen("settings"); });
 $("themeToggle").addEventListener("click", toggleTheme);
 $("renameBtn").addEventListener("click", renameThread);
 $("addMemberBtn").addEventListener("click", addMember);

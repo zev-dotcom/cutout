@@ -288,3 +288,17 @@ select{width:100%;min-height:var(--tap);border:1.5px solid var(--line);border-ra
 /* flex children must be allowed to shrink or the message list grows past the viewport and can't scroll */
 .main-col,.threads-col,.screen{min-height:0}
 .app{min-height:0}
+
+/* install card + notifications */
+.installcard{margin:0 14px 10px;padding:12px 14px;border:1.5px solid var(--line);border-radius:16px;background:var(--bg2);font-size:13.5px;line-height:1.5}
+.installcard .ic-h{display:flex;align-items:center;gap:8px;font-weight:800}
+.installcard .ic-x{margin-left:auto;background:none;border:none;color:var(--ink3);font-size:18px;min-width:36px;min-height:36px;cursor:pointer}
+.installcard .ic-b{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap}
+.installcard ol{margin:8px 0 2px 18px;padding:0;color:var(--ink2)}
+.installcard li{margin:4px 0}
+.installcard .glyph{display:inline-block;border:1.5px solid var(--line);border-radius:6px;padding:0 6px;font-weight:800;color:var(--ink)}
+.setcol{border-bottom:1.5px solid var(--line);padding:0 0 8px}
+.devrow{display:flex;align-items:center;gap:10px;padding:8px 0;font-size:13.5px}
+.devrow .dl{flex:1;min-width:0;overflow-wrap:anywhere}
+.devrow .ds{font-size:12px;color:var(--ink2)}
+.devrow button{min-height:36px}
