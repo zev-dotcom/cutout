@@ -210,7 +210,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-01.3";
+var SMITH_BUILD = "2026-10-01.4";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -317,7 +317,18 @@ function memberSubHtml(t){
 }
 function renderThreadHeader(t){
   $("threadName").textContent = t.name || t.thread_id;
-  $("threadSub").innerHTML = memberSubHtml(t);
+  var vm = visibleMembers(t.members || []);
+  var sub = $("threadSub");
+  if (vm.length > 2){
+    var open = !!state.membersOpen;
+    sub.className = "hsub" + (open ? " open" : "");
+    sub.innerHTML = '<button class="mtoggle" type="button" aria-expanded="' + open + '">' + vm.length + " members " + (open ? "▴" : "▾") + "</button>" +
+      (open ? '<div style="width:100%">' + memberSubHtml(t) + "</div>" : "");
+    sub.querySelector(".mtoggle").onclick = function(){ state.membersOpen = !state.membersOpen; renderThreadHeader(t); };
+  } else {
+    sub.className = "hsub";
+    sub.innerHTML = memberSubHtml(t);
+  }
   var ms = t.members || [];
   $("threadAvatar").innerHTML = visibleMembers(ms).length > 1 ? stackHtml(visibleMembers(ms))
     : avatarHtml(ms[0] || {display_name: t.name});

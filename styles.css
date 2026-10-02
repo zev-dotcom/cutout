@@ -32,7 +32,11 @@ input,select,textarea{font-family:inherit}
 /* Wordmark dots: decorative signature only. Ripple every 30s, still under reduced-motion.
    In chat the same dots are the incoming-response indicator, rendered only from feed.working. */
 @keyframes sigripple{0%,95.5%,100%{opacity:1}97.5%{opacity:.45}}
-.sigdots.live{animation:sigripple 30s ease-in-out infinite}
+.sigdots i{font-style:normal}
+.sigdots.live i{animation:sigwave 30s ease-in-out infinite}
+.sigdots.live i:nth-child(2){animation-delay:.3s}.sigdots.live i:nth-child(3){animation-delay:.6s}
+@keyframes sigwave{0%,5%,100%{opacity:1;transform:translateY(0)}1.5%{opacity:.2;transform:translateY(-3px)}3%{opacity:1;transform:translateY(0)}}
+.sigdots i{display:inline-block}
 .setup-card .lede{font-size:13.5px;color:var(--ink2);line-height:1.6;margin-bottom:22px}
 .field{margin-bottom:14px}
 .field label{display:block;font-size:0.75rem;font-weight:800;letter-spacing:.1em;color:var(--ink3);margin-bottom:8px}
@@ -245,7 +249,7 @@ input,select,textarea{font-family:inherit}
 /* ============ RESPONSIVE ============ */
 @media (max-width:899px){
   body{padding:0}
-  .app{flex-direction:column;height:100vh;height:var(--vvh,100dvh);min-height:0;max-height:none;border:none;border-radius:0;margin-top:0}
+  .app{flex-direction:column;position:fixed;top:0;left:0;right:0;bottom:0;height:auto;min-height:0;max-height:none;border:none;border-radius:0;margin:0;max-width:none}
   .app[data-view="threads"] .threads-col{display:flex;width:100%;border-right:none}
   .app[data-view="threads"] .main-col{display:none}
   .app:not([data-view="threads"]) .threads-col{display:none}
@@ -259,7 +263,7 @@ input,select,textarea{font-family:inherit}
 /* ============ REDUCED MOTION ============ */
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
-  .sigdots.live{animation:none!important}
+  .sigdots.live i{animation:none!important}
   .tdots span{animation:none!important;opacity:.7}
 }
 
@@ -276,3 +280,11 @@ select{width:100%;min-height:var(--tap);border:1.5px solid var(--line);border-ra
 .field[hidden]{display:none}
 .wakeline{display:flex;flex-wrap:wrap;align-items:center;gap:2px 6px}
 .wakeline .linkbtn{margin:0;padding:6px 0}
+
+/* members collapse in the thread header */
+.hsub .mtoggle{background:none;border:none;padding:4px 0;font:inherit;font-weight:700;color:var(--ink2);cursor:pointer;min-height:32px}
+.hsub.open{max-height:30vh;overflow-y:auto}
+.msgs{-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+/* flex children must be allowed to shrink or the message list grows past the viewport and can't scroll */
+.main-col,.threads-col,.screen{min-height:0}
+.app{min-height:0}
