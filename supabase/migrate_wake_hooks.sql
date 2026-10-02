@@ -104,3 +104,12 @@ create table if not exists smith.smith_owner_live (
 );
 alter table smith.smith_owner_live enable row level security;
 do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith.smith_owner_live from anon, authenticated; end if; end $$;
+
+-- Owner per-thread prefs (additive): archive and mute.
+create table if not exists smith.smith_thread_prefs (
+  thread_id   text primary key,
+  archived_at timestamptz,
+  muted_until timestamptz
+);
+alter table smith.smith_thread_prefs enable row level security;
+do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith.smith_thread_prefs from anon, authenticated; end if; end $$;

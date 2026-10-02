@@ -499,6 +499,8 @@ async function postMessage(req, auth) {
       try { urgentFlag = await urgentDecision(from, body.thread_id, body.to, body.urgent === true); } catch (e) { console.error("urgent decision failed", e); }
       afterPostWake(body.thread_id, from, body.to, urgentFlag, body.body, metadata.mentions);
     }
+    // A new agent message brings an archived chat back to the home screen.
+    if (auth.kind === "agent" && !String(body.thread_id).startsWith("th_wakecheck_")) timedQuery(sql`update ${S("smith_thread_prefs")} set archived_at = null where thread_id = ${body.thread_id} and archived_at is not null`, "unarchive_on_post").catch(()=>{});
     // The agent answered: clear its dots in this thread right away.
     if (auth.kind === "agent") timedQuery(sql`delete from ${S("smith_activity")} where thread_id = ${body.thread_id} and agent_id = ${auth.agentId}`, "activity_clear_on_post").catch(()=>{});
     return jres(201, {
@@ -1186,16 +1188,57 @@ async function listThreadsSmith(auth) {
       workingBy.set(r.thread_id, list);
     }
   }
+  const prefsBy = new Map();
+  if (auth.kind === "owner" && tids.length) {
+    try {
+      const pr = await timedQuery(sql`select thread_id, archived_at, muted_until from ${S("smith_thread_prefs")} where thread_id = any(${tids})`, "thread_prefs");
+      for (const r of pr) prefsBy.set(r.thread_id, r);
+    } catch { /* table absent */ }
+  }
   return {
-    threads: threads.map((t)=>({
+    threads: threads.map((t)=>{
+      const pf = prefsBy.get(t.thread_id);
+      const muted = !!pf && pf.muted_until !== null && new Date(pf.muted_until).getTime() > Date.now();
+      return {
         thread_id: t.thread_id,
         name: t.name,
         last_at: t.last_at ? iso(t.last_at) : null,
         unread: t.unread,
         members: membersBy.get(t.thread_id) ?? [],
-        working: workingBy.get(t.thread_id) ?? []
-      }))
+        working: workingBy.get(t.thread_id) ?? [],
+        ...(auth.kind === "owner" ? { archived: !!pf && pf.archived_at !== null, muted, muted_until: muted ? iso(pf.muted_until) : null } : {})
+      };
+    })
   };
+}
+// Owner-only per-thread prefs: archive (hide from home) and mute (no push). Agents are unaffected.
+async function ownerThreadPrefs(req, auth, threadId) {
+  const denied = requireOwner(auth);
+  if (denied) return denied;
+  if (!await isManagedThread(threadId)) return jres(404, { error: "thread not found" });
+  let body; try { body = await req.json(); } catch { return jres(400, { error: "invalid JSON" }); }
+  const hasA = body.archived !== undefined, hasM = body.muted !== undefined;
+  if (!hasA && !hasM) return jres(422, { error: "archived or muted is required" });
+  if (hasA && typeof body.archived !== "boolean") return jres(422, { error: "archived must be a boolean" });
+  let mutedUntil = null, setMute = false;
+  if (hasM) {
+    setMute = true;
+    const m = body.muted;
+    const hours = { "1h": 1, "8h": 8, "24h": 24 };
+    if (m === false || m === null) mutedUntil = null;
+    else if (m === true) mutedUntil = new Date(Date.now() + 10 * 365 * 86400000);
+    else if (typeof m === "string" && hours[m]) mutedUntil = new Date(Date.now() + hours[m] * 3600000);
+    else return jres(422, { error: "muted must be false, true, '1h', '8h' or '24h'" });
+  }
+  const arch = hasA ? (body.archived ? new Date() : null) : undefined;
+  await timedQuery(sql`
+    insert into ${S("smith_thread_prefs")} (thread_id, archived_at, muted_until)
+    values (${threadId}, ${hasA ? arch : null}, ${setMute ? mutedUntil : null})
+    on conflict (thread_id) do update set
+      archived_at = ${hasA ? sql`excluded.archived_at` : sql`${S("smith_thread_prefs")}.archived_at`},
+      muted_until = ${setMute ? sql`excluded.muted_until` : sql`${S("smith_thread_prefs")}.muted_until`}`, "thread_prefs_set");
+  await audit(OWNER_ID, "thread_prefs", { thread_id: threadId, ...(hasA ? { archived: body.archived } : {}), ...(setMute ? { muted: body.muted } : {}) });
+  return jres(200, { thread_id: threadId, ...(hasA ? { archived: body.archived } : {}), ...(setMute ? { muted_until: mutedUntil ? iso(mutedUntil) : null } : {}) });
 }
 async function renameThread(req, auth, threadId) {
   const denied = await threadAccess(auth, threadId);
@@ -1965,6 +2008,7 @@ async function route(req, arrivedAt) {
   if (path === "/v1/owner/feed" && req.method === "GET") {
     return done(await ownerFeed(req, auth, new URL(req.url).searchParams.get("thread_id")));
   }
+  { const pm = path.match(/^\/v1\/owner\/threads\/([^/]+)\/prefs$/); if (pm && req.method === "PUT") return done(await ownerThreadPrefs(req, auth, decodeURIComponent(pm[1]))); }
   if (path === "/v1/owner/typing" && req.method === "POST") return done(await ownerTyping(req, auth));
   if (path === "/v1/owner/stream" && req.method === "GET") return done(await ownerStream(req, auth, new URL(req.url).searchParams.get("thread_id")));
   if (path === "/v1/owner/threads" && req.method === "GET") return done(await ownerThreads(req, auth));
@@ -2332,6 +2376,12 @@ async function ownerUnreadTotals(threadId) {
 }
 const pushTrailing = new Set();
 async function pushNotifyOwner(threadId, msgBody, force) {
+  if (!force) {
+    try {
+      const mu = await timedQuery(sql`select 1 from ${S("smith_thread_prefs")} where thread_id = ${threadId} and muted_until > now()`, "push_muted");
+      if (mu.length) return "muted";
+    } catch { /* table absent */ }
+  }
   const cfg = await pushConfig(false);
   if (!cfg) return "not_configured";
   const subs = await timedQuery(sql`select id from ${S("smith_push_subs")}`, "push_subs_any");

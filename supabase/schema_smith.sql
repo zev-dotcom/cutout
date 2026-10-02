@@ -249,3 +249,11 @@ create table if not exists smith_owner_live (
   typing_at timestamptz
 );
 alter table smith_owner_live enable row level security;
+
+-- Owner per-thread prefs (additive): archive and mute.
+create table if not exists smith_thread_prefs (
+  thread_id   text primary key,
+  archived_at timestamptz,
+  muted_until timestamptz
+);
+alter table smith_thread_prefs enable row level security;

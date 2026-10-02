@@ -397,4 +397,20 @@ s, fd = req("GET", "/v1/owner/feed?thread_id=" + TX, tok=OWN); check("a new mess
 s, r = req("POST", "/v1/owner/typing", {"thread_id": "no-such-thread"}, OWN); check("owner typing on an unmanaged thread -> 404", s == 404, s)
 s, r = req("POST", "/v1/threads/" + T7 + "/members", {"agent_id": "stub-unreg"}, OWN)
 s, r2 = req("POST", "/v1/threads/" + T7 + "/members", {"agent_id": "stub-unreg"}, PA); check("creator cannot add an unregistered stub id", s == 422, (s, r2))
+# --- archive + mute ---
+s, thA = req("POST", "/v1/threads", {"name": "arch", "member_ids": ["pk-b"]}, OWN); TA = thA["thread_id"]
+def row(tid):
+    s, l = req("GET", "/v1/owner/threads", tok=OWN); return [t for t in l["threads"] if t["thread_id"] == tid][0]
+check("thread starts not archived, not muted", row(TA)["archived"] is False and row(TA)["muted"] is False, row(TA))
+s, r = req("PUT", "/v1/owner/threads/" + TA + "/prefs", {"archived": True}, OWN); check("archive ok", s == 200, (s, r))
+check("thread list shows archived", row(TA)["archived"] is True, None)
+s, r = req("PUT", "/v1/owner/threads/" + TA + "/prefs", {"muted": "1h"}, OWN)
+check("mute 1h sets muted_until, archive kept", s == 200 and row(TA)["muted"] is True and row(TA)["archived"] is True, row(TA))
+s, r = req("PUT", "/v1/owner/threads/" + TA + "/prefs", {"muted": "bogus"}, OWN); check("bad mute value -> 422", s == 422, s)
+s, r = req("PUT", "/v1/owner/threads/" + TA + "/prefs", {"archived": False}, PB); check("agent cannot set prefs (403)", s == 403, s)
+s, r = req("PUT", "/v1/owner/threads/" + TA + "/prefs", {"archived": True}, OWN)
+req("POST", "/v1/messages", {"thread_id": TA, "from": "pk-b", "to": "owner", "type": "note", "body": "ping"}, PB); time.sleep(0.4)
+check("a new agent message unarchives", row(TA)["archived"] is False and row(TA)["muted"] is True, row(TA))
+s, r = req("PUT", "/v1/owner/threads/" + TA + "/prefs", {"muted": False}, OWN); check("unmute", row(TA)["muted"] is False, None)
+s, r = req("GET", "/v1/threads", tok=PB); check("agents never see prefs fields", all("archived" not in x for x in r), None)
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)
