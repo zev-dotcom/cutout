@@ -471,4 +471,27 @@ req("POST", "/v1/messages", {"thread_id": TA, "from": "owner", "to": "*", "type"
 s, pa = req("GET", "/v1/messages?peek=1", tok=PA); check("peek: non-member sees no thread it is not in", all(x["thread_id"] != TA for x in pa["threads"]), pa["threads"])
 s, pb = req("GET", "/v1/messages?peek=1", tok=PB); check("peek: member sees the thread", any(x["thread_id"] == TA for x in pb["threads"]), pb["threads"])
 check("peek: sum of per-thread unread matches total unread", sum(x["unread"] for x in pb["threads"]) == pb["unread"], (pb["unread"], pb["threads"]))
+# --- chat photo ---
+def raw(m, p, data=None, tok=None, ct="application/octet-stream"):
+    r = urllib.request.Request(BASE + p, data=data, method=m, headers={"content-type": ct, **({"authorization": "Bearer " + tok} if tok else {})})
+    try:
+        with urllib.request.urlopen(r, timeout=70) as x: return x.status, x.read(), dict(x.headers)
+    except urllib.error.HTTPError as e: return e.code, e.read(), dict(e.headers)
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 200
+s, thav = req("POST", "/v1/threads", {"name": "avatar-t", "member_ids": ["pk-b"]}, PA); TAV = thav["thread_id"]
+s, b, h = raw("GET", "/v1/threads/" + TAV + "/avatar", tok=PB); check("avatar: none yet -> 404", s == 404, s)
+s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", PNG, PB); check("avatar: non-creator member cannot set -> 403", s == 403, s)
+s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", b"GIF89a" + b"\x00" * 50, PA); check("avatar: gif rejected -> 415", s == 415, s)
+s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", b"<svg xmlns='http://www.w3.org/2000/svg'/>", PA); check("avatar: svg rejected -> 415", s == 415, s)
+s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", PNG + b"\x00" * 110000, PA); check("avatar: over 100KB -> 413", s == 413, s)
+s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", PNG, PA); v1 = json.loads(b).get("avatar_version") if s == 200 else None; check("avatar: creator sets png", s == 200 and v1 and len(v1) == 12, (s, b))
+s, b, h = raw("GET", "/v1/threads/" + TAV + "/avatar", tok=PB); check("avatar: member GET returns the bytes with image type", s == 200 and b == PNG and h.get("Content-Type", h.get("content-type")) == "image/png" and "nosniff" in str(h).lower(), (s, h))
+s, b, h = raw("GET", "/v1/threads/" + TAV + "/avatar", tok=PA2) if False else raw("GET", "/v1/threads/" + TAV + "/avatar", tok=OWN); check("avatar: owner can read", s == 200, s)
+s, ls = req("GET", "/v1/owner/threads", tok=OWN); row = [t for t in ls["threads"] if t["thread_id"] == TAV]
+check("avatar: owner thread list carries avatar_version", row and row[0].get("avatar_version") == v1, row)
+s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 40, OWN); check("avatar: owner can replace with webp", s == 200 and json.loads(b)["avatar_version"] != v1, (s, b))
+s, b, h = raw("DELETE", "/v1/threads/" + TAV + "/avatar", tok=PB); check("avatar: member cannot delete -> 403", s == 403, s)
+s, b, h = raw("DELETE", "/v1/threads/" + TAV + "/avatar", tok=OWN); check("avatar: owner deletes", s == 200, s)
+s, b, h = raw("GET", "/v1/threads/" + TAV + "/avatar", tok=PA); check("avatar: gone after delete -> 404", s == 404, s)
+s, b, h = raw("GET", "/v1/threads/" + T8 + "/avatar", tok=PA); check("avatar: non-member of another thread cannot read", s in (403, 404), s)
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)

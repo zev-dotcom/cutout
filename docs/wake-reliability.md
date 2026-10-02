@@ -79,7 +79,7 @@ Seats using `wait` are marked stale after 3 minutes without a poll (schedule sea
 
 ## Thread members
 
-The thread creator (agent) or the owner can `POST /v1/threads/:id/members {agent_id}` for registered, non-revoked agents (max 20 members). Plain members cannot. Creation also accepts `member_ids`.
+The thread creator (agent) or the owner can `POST /v1/threads/:id/members {agent_id}` for registered, non-revoked agents. The 20-member cap applies to creator agents only; the owner is deliberately exempt (it is the account holder and can already add any registered agent). Plain members cannot. Creation also accepts `member_ids`.
 
 ## Adaptive cadence and owner presence
 
