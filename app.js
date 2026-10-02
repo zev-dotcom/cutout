@@ -286,7 +286,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-02.10";
+var SMITH_BUILD = "2026-10-02.11";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -521,6 +521,13 @@ function bodyHtml(msg){
 }
 /* Who a message is addressed to, and what it replies to. */
 var msgIndex = {};
+var MSG_INDEX_MAX = 2000;
+function indexMsg(m){
+  // Only what a reply chip needs: sender and the first 140 characters. Oldest entries drop at the cap.
+  msgIndex[m.id] = { from: m.from, body: String(m.body || "").slice(0, 140) };
+  var ks = Object.keys(msgIndex);
+  if (ks.length > MSG_INDEX_MAX) ks.slice(0, ks.length - MSG_INDEX_MAX).forEach(function(k){ delete msgIndex[k]; });
+}
 function toChip(msg){
   var to = msg.to;
   if (!to || to === "*") return "";
@@ -584,10 +591,8 @@ function openReactBar(mid){
   sh.addEventListener("click", function(e){
     if (e.target === sh || e.target.classList.contains("cancel")) return closeSheet();
     var b = e.target.closest(".rxpick"); if (!b) return;
-    var row = $("threadMsgs").querySelector('[data-mid="' + String(mid).replace(/"/g, "") + '"]');
-    var have = row && Array.prototype.some.call(row.querySelectorAll(".rx.mine"), function(c){ return c.dataset.e === b.dataset.e; });
     closeSheet();
-    if (!have) toggleRx(mid, b.dataset.e); else toggleRx(mid, b.dataset.e);
+    toggleRx(mid, b.dataset.e);
   });
   document.body.appendChild(sh);
 }
@@ -692,7 +697,7 @@ function appendMessages(msgs, opts){
   msgs.forEach(function(m){
     // Concurrent polls (timer + send) can return the same message twice: render each id once.
     if (m.id && box.querySelector('[data-mid="' + String(m.id).replace(/"/g, "") + '"]')) return;
-    if (m.id) msgIndex[m.id] = { from: m.from, body: m.body };
+    if (m.id) indexMsg(m);
     var day = fmtDay(m.created_at);
     if (day !== lastDay){
       box.insertAdjacentHTML("beforeend", '<div class="day">' + esc(day) + "</div>");
