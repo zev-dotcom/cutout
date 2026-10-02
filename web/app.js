@@ -584,10 +584,8 @@ function openReactBar(mid){
   sh.addEventListener("click", function(e){
     if (e.target === sh || e.target.classList.contains("cancel")) return closeSheet();
     var b = e.target.closest(".rxpick"); if (!b) return;
-    var row = $("threadMsgs").querySelector('[data-mid="' + String(mid).replace(/"/g, "") + '"]');
-    var have = row && Array.prototype.some.call(row.querySelectorAll(".rx.mine"), function(c){ return c.dataset.e === b.dataset.e; });
     closeSheet();
-    if (!have) toggleRx(mid, b.dataset.e); else toggleRx(mid, b.dataset.e);
+    toggleRx(mid, b.dataset.e);
   });
   document.body.appendChild(sh);
 }

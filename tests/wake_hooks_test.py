@@ -503,4 +503,10 @@ s, b, h = raw("GET", "/v1/threads/" + TAV + "/avatar", tok=PA); check("avatar: g
 sql("insert into smith.smith_audit (actor, action, detail) select 'pk-a', 'thread_avatar_set', jsonb_build_object('thread_id', '" + TAV + "') from generate_series(1, 20)")
 s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", PNG, PA); check("avatar: over 20 sets/hour per thread -> 429", s == 429, s)
 s, b, h = raw("GET", "/v1/threads/" + T8 + "/avatar", tok=PA); check("avatar: non-member of another thread cannot read", s in (403, 404), s)
+# --- malformed path escape and member cap ---
+s, r = req("GET", "/v1/threads/%E0/avatar", tok=OWN); check("malformed %-escape in path -> 404, not 500", s == 404, s)
+s, thc = req("POST", "/v1/threads", {"name": "cap-t", "member_ids": []}, PA); TCAP = thc["thread_id"]
+sql("insert into smith.smith_thread_members (thread_id, agent_id) select '" + TCAP + "', 'fx' || g from generate_series(1, 20) g")
+s, r = req("POST", "/v1/threads/" + TCAP + "/members", {"agent_id": "pk-b"}, PA); check("member cap: creator agent at 20 -> 422", s == 422, (s, r))
+s, r = req("POST", "/v1/threads/" + TCAP + "/members", {"agent_id": "pk-b"}, OWN); check("member cap: owner is exempt (21st member -> 200)", s == 200, (s, r))
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)

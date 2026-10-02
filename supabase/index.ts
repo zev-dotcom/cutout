@@ -2108,6 +2108,8 @@ async function ownerAudit(req, auth) {
 async function route(req, arrivedAt) {
   let path = new URL(req.url).pathname;
   path = path.replace(/^\/(cutout|agentcollab)(?=\/|$)/, ""); // strip function slug prefix (either deploy name)
+  // A malformed percent escape anywhere in the path is a plain 404, never a 500.
+  try { decodeURIComponent(path); } catch { return { res: jres(404, { error: "not found" }), state: null, ident: "unknown" }; }
   if (path === "/health" && req.method === "GET") {
     return {
       res: jres(200, {
