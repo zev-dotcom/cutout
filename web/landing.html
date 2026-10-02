@@ -1,0 +1,54 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Smith: your agents, one chat away</title>
+<meta name="description" content="Smith is a private inbox for your AI agents. Install it, connect it once, and message them like any contact.">
+<meta name="theme-color" content="#0C0C0E"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icons/icon-192.png"><link rel="apple-touch-icon" href="icons/apple-touch-icon.png"><link rel="stylesheet" href="styles.css"><style>
+body{min-height:0}
+.ld{max-width:520px;margin:0 auto;padding:22px 20px 40px}
+.ld h1.wm{font-size:26px;font-weight:800;letter-spacing:-.03em}
+.ld .big{font-size:34px;line-height:1.08;font-weight:800;letter-spacing:-.035em;margin:26px 0 12px}
+.ld p.sub{font-size:17px;line-height:1.5;color:var(--ink2);margin-bottom:22px}
+.ld .cta{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;min-height:54px;border-radius:16px;border:0;background:var(--ink);color:var(--bg);font-size:17px;font-weight:700;text-decoration:none}
+.ld .cta2{display:flex;align-items:center;justify-content:center;width:100%;min-height:48px;border-radius:14px;border:1.5px solid var(--line);color:var(--ink);font-size:15.5px;font-weight:600;text-decoration:none;margin-top:10px;background:transparent}
+.ld .fine{font-size:13px;color:var(--ink3);line-height:1.5;margin-top:12px;text-align:center}
+.ld h2{font-size:13px;letter-spacing:.09em;font-weight:700;color:var(--ink3);margin:32px 0 12px;text-transform:uppercase}
+.ld ol.st{list-style:none;counter-reset:s;padding:0}
+.ld ol.st li{counter-increment:s;display:flex;gap:14px;align-items:flex-start;padding:14px 0;border-top:1px solid var(--line);line-height:1.45;font-size:15.5px}
+.ld ol.st li:first-child{border-top:0}
+.ld ol.st li::before{content:counter(s);flex:none;width:28px;height:28px;border-radius:50%;background:var(--red);color:#fff;font-weight:800;font-size:14px;display:flex;align-items:center;justify-content:center;margin-top:1px}
+.ld ol.st b{display:block;font-size:16px;margin-bottom:2px}
+.ld ol.st span{color:var(--ink2)}
+.ld .glyph{display:inline-block;padding:0 6px;border-radius:6px;background:var(--pill-bg);font-weight:600;font-size:.92em}
+.ld .card{background:var(--bg2);border:1.5px solid var(--line);border-radius:20px;padding:18px}
+.ld .after{display:flex;gap:12px;align-items:flex-start;padding:16px;border:1.5px solid var(--line);border-radius:18px;background:var(--bg2);margin-top:26px}
+.ld .after b{display:block;font-size:16px;margin-bottom:3px}.ld .after span{color:var(--ink2);font-size:14.5px;line-height:1.45}
+.ld .after .ico{font-size:22px;flex:none}
+</style></head><body data-theme="mono"><div class="ld">
+<h1 class="wm">Smith<span class="sigdots live" aria-hidden="true"><i>●</i><i>●</i><i>●</i></span></h1>
+<div class="big">Your agents, one chat away.</div>
+<p class="sub">Smith is a private inbox for your AI agents. Install it, connect it once, and message them like any contact.</p>
+<a class="cta" id="ldInstall" href="./">Install Smith</a><p class="fine" id="ldMsg" role="status" hidden></p>
+<a class="cta2" href="./">Already set up? Open Smith</a>
+<p class="fine">Takes about a minute. First time? You will create your owner token in step 2.</p>
+<h2>Three steps</h2><ol class="st"><li><div><b>Add Smith to your home screen</b><span>It opens like an app and can send you notifications.</span></div></li>
+<li><div><b>Connect it to your address</b><span>Open your setup link, or paste your Smith address and owner token.</span></div></li>
+<li><div><b>Start chatting and turn on notifications</b><span>Message your agents from one inbox and hear back right away.</span></div></li></ol><h2 id="ldIosH">On iPhone</h2><div class="card" id="ldIos"><ol class="st"><li><div><b>Tap Share in Safari</b><span>The square with an arrow.</span></div></li><li><div><b>Choose <span class="glyph" style="color:var(--ink)">Add to Home Screen</span></b><span>Scroll down in the share sheet.</span></div></li><li><div><b>Tap Add, then open Smith</b><span>Use the home-screen icon from now on.</span></div></li></ol></div><div class="after"><div class="ico">&#8962;</div><div><b>Already set up?</b><span>Open Smith from your home screen. Your chats, notifications and settings live there.</span></div></div></div>
+<script>
+(function(){
+var inst=null,btn=document.getElementById("ldInstall"),msg=document.getElementById("ldMsg"),ios=document.getElementById("ldIos"),iosH=document.getElementById("ldIosH");
+var isIOS=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
+var standalone=(window.matchMedia&&window.matchMedia("(display-mode: standalone)").matches)||navigator.standalone===true;
+if(standalone){location.replace("./");return;}
+function say(t){msg.textContent=t;msg.hidden=false;}
+window.addEventListener("beforeinstallprompt",function(e){e.preventDefault();inst=e;ios.hidden=true;iosH.hidden=true;});
+window.addEventListener("appinstalled",function(){location.replace("./");});
+btn.addEventListener("click",function(ev){
+  if(inst){ev.preventDefault();var d=inst;inst=null;d.prompt();
+    if(d.userChoice)d.userChoice.then(function(c){if(c&&c.outcome==="accepted")say("Installed. Open Smith from your home screen or app list.");else{inst=d;say("Install cancelled. Tap Install Smith to try again.");}});
+    return;}
+  ev.preventDefault();
+  if(isIOS){ios.hidden=false;iosH.hidden=false;iosH.scrollIntoView({behavior:"smooth",block:"start"});say("Follow the three iPhone steps below, in Safari.");return;}
+  say("Use your browser menu and choose Install app (or Add to Home screen). Then open Smith from there.");
+});
+if(!isIOS){iosH.textContent="On iPhone or iPad";}
+})();
+</script></body></html>
