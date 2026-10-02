@@ -82,6 +82,11 @@ supabase secrets set SMITH_SETUP_KEY="$(openssl rand -hex 32)" --project-ref spq
 `SMITH_SETUP_KEY` is required: when unset, `/v1/owner/claim` is disabled
 entirely. It is single-use as a setup key (only a hash is stored).
 
+**Secret handling:** the command above leaves the key in your shell history.
+Prefer generating it in a way that avoids history (e.g. `HISTCONTROL=ignorespace`
+with a leading space, or your password manager), and mint the owner token
+via the vault link rather than pasting secrets into chat.
+
 ## 3. Mint the owner token
 
 Two ways (both single-use; only a hash is stored):

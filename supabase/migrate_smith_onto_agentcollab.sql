@@ -40,9 +40,12 @@
 -- and a Smith row (from, key, thread) do not conflict with each other --
 -- the partial index only guards NULL-vs-NULL, the unique constraint only
 -- guards equal non-null threads. Smith's dedup query filters by thread_id,
--- so it never sees legacy NULL rows; the two scopes are independent. No
--- duplicate messages result: the legacy double-post case (same key twice,
--- both NULL) is still rejected by the partial index.
+-- so it never sees legacy NULL rows; the two scopes are independent.
+-- Duplicate messages are possible during the rollout window only: if v15
+-- inserts (from, key) after the migration while Smith inserts (from, key,
+-- thread) for the same logical key, both rows exist. The legacy
+-- double-post case (same key twice, both NULL) is still rejected by the
+-- partial index.
 --
 -- Builder: verify the real agentcollab tables/columns match the assumed v1.1
 -- shape before running (especially idempotency_keys PK and messages.type).
