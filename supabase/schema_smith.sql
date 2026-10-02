@@ -270,13 +270,20 @@ create index if not exists smith_reactions_msg on smith_reactions (message_id);
 alter table smith_reactions enable row level security;
 do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith_reactions from anon, authenticated; end if; end $$;
 
--- Activity message type (additive): widen the type check so type 'activity' is accepted.
-do $act$ begin
-  if to_regclass('messages') is not null and not exists (
-    select 1 from pg_constraint where conname = 'messages_type_check' and conrelid = to_regclass('messages') and pg_get_constraintdef(oid) ilike '%activity%'
-  ) then
-    alter table messages drop constraint if exists messages_type_check;
-    alter table messages add constraint messages_type_check
-      check (type in ('note','question','decision','task','link','receipt-info','resolve','activity'));
+-- Activity message type (additive): extend the existing type check with 'activity'. The list is read from the
+-- current constraint; the migration fails (changing nothing) if that constraint is not the expected shape.
+do $act$
+declare def text; lits text[]; newdef text;
+begin
+  if to_regclass('messages') is null then return; end if;
+  select pg_get_constraintdef(oid) into def from pg_constraint where conname = 'messages_type_check' and conrelid = to_regclass('messages');
+  if def is null then raise exception 'messages_type_check not found'; end if;
+  if def ilike '%''activity''%' then return; end if;
+  select array_agg(m[1]) into lits from regexp_matches(def, '''([a-z-]+)''', 'g') as m;
+  if lits is null or not (lits @> array['note','question','decision','task','link','receipt-info']) then
+    raise exception 'messages_type_check has an unexpected shape: %', def;
   end if;
+  newdef := 'check (type in (' || (select string_agg(quote_literal(x), ',') from unnest(array_append(lits, 'activity')) as x) || '))';
+  alter table messages drop constraint messages_type_check;
+  execute 'alter table messages add constraint messages_type_check ' || newdef;
 end $act$;

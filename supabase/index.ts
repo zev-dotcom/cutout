@@ -378,6 +378,14 @@ async function postMessage(req, auth) {
   if (body.type === "activity") {
     const aerr = validActivity(metadata.activity);
     if (aerr) return jres(422, { error: aerr });
+    const clean = {};
+    for (const k of ["kind", "state", "title", "summary", "started_at", "finished_at"]) if (metadata.activity[k] !== undefined) clean[k] = metadata.activity[k];
+    metadata.activity = clean;
+    if (auth.kind === "agent") {
+      const rl = await activityRate(auth.agentId);
+      if (rl) return rl;
+      await audit(auth.agentId, "activity_post", { thread_id: body.thread_id });
+    }
     if (!metadata.activity.started_at) metadata.activity.started_at = new Date().toISOString();
     if (metadata.activity.state !== "running" && !metadata.activity.finished_at) metadata.activity.finished_at = new Date().toISOString();
   }
@@ -1233,6 +1241,11 @@ function validActivity(a, partial = false) {
   for (const f of ["started_at", "finished_at"]) if (a[f] !== undefined && (typeof a[f] !== "string" || Number.isNaN(Date.parse(a[f])))) return `activity.${f} must be an ISO timestamp`;
   return null;
 }
+const ACTIVITY_WRITES_PER_HOUR = Number(Deno.env.get("SMITH_ACTIVITY_PER_HOUR") ?? "30");
+async function activityRate(agentId) {
+  const rl = await timedQuery(sql`select count(*)::int as n from ${S("smith_audit")} where actor = ${agentId} and action in ('activity_post', 'activity_finish') and at > now() - interval '1 hour'`, "activity_rate");
+  return rl[0].n >= ACTIVITY_WRITES_PER_HOUR ? jres(429, { error: "too many activity updates, try again later", retry_after_s: 60 }, { "Retry-After": "60" }) : null;
+}
 async function patchActivity(req, auth, mid) {
   if (auth.kind !== "agent") return jres(403, { error: "agent token required" });
   let body; try { body = await req.json(); } catch { return jres(400, { error: "invalid JSON" }); }
@@ -1252,10 +1265,15 @@ async function patchActivity(req, auth, mid) {
   const next = { ...cur, ...patch };
   if (cur.state === "running" && next.state !== "running" && !next.finished_at) next.finished_at = new Date().toISOString();
   if (next.state === "running") delete next.finished_at;
-  await timedQuery(sql`update ${T("messages")} set metadata = jsonb_set(metadata, '{activity}', ${sql.json(next)}) where id = ${mid}`, "activity_patch");
-  if (cur.state === "running" && next.state !== "running") {
-    pushNotifyOwner(m.thread_id, `${next.title}: ${next.state === "failed" ? "failed" : "done"}${next.summary ? " - " + String(next.summary).slice(0, 120) : ""}`).catch(()=>{});
+  const finishing = cur.state === "running" && next.state !== "running";
+  if (finishing) {
+    const rl = await activityRate(auth.agentId);
+    if (rl) return rl;
+    await audit(auth.agentId, "activity_finish", { thread_id: m.thread_id, message_id: mid, state: next.state });
   }
+  await timedQuery(sql`update ${T("messages")} set metadata = jsonb_set(metadata, '{activity}', ${sql.json(next)}) where id = ${mid}`, "activity_patch");
+  // Push text is title + done/failed only (never the summary); the push still obeys mute, include_body and the per-device debounce.
+  if (finishing) pushNotifyOwner(m.thread_id, `${next.title}: ${next.state === "failed" ? "failed" : "done"}`).catch(()=>{});
   return jres(200, { id: mid, activity: next });
 }
 // Reactions: one grapheme per reaction, max 20 distinct emoji per message. They never wake an agent.

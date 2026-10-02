@@ -1680,17 +1680,35 @@ function attachPTR(el, onRefresh){
   el.addEventListener("touchcancel", end, {passive: true});
 }
 attachPTR($("threadList"), function(){ return Promise.all([loadThreads(), loadAgents ? loadAgents().catch(function(){}) : null]); });
-attachPTR($("threadMsgs"), function(){ state.feedCursor = null; var box = $("threadMsgs"); box.innerHTML = ""; box.dataset.lastday = ""; return pollThread(); });
+attachPTR($("threadMsgs"), function(){
+  // Fetch the full history first, then swap it in: the stream or a poll can move feedCursor meanwhile, and a
+  // cleared view with a stale cursor would stay blank.
+  var tid = state.currentThread; if (!tid) return Promise.resolve();
+  return api("GET", "/v1/owner/feed?thread_id=" + encodeURIComponent(tid) + "&limit=100").then(function(feed){
+    if (tid !== state.currentThread) return;
+    var msgs = feed.messages || [], box = $("threadMsgs");
+    box.innerHTML = ""; box.dataset.lastday = "";
+    appendMessages(msgs);
+    state.feedCursor = feed.next_cursor || state.feedCursor;
+    box.scrollTop = box.scrollHeight;
+    setWorking(feed.working);
+    markRead(tid, msgs);
+  });
+});
 var updateShown = false;
 function checkForUpdate(){
   if (updateShown || document.hidden) return;
   fetch("app.js?cb=" + Date.now(), {cache: "no-store"}).then(function(r){ return r.text(); }).then(function(t){
     var m = /SMITH_BUILD = "([^"]+)"/.exec(t);
-    if (m && m[1] !== SMITH_BUILD){
+    // Only a NEWER build prompts (builds sort as YYYY-MM-DD.N); a rolled-back older build never does.
+    if (m && m[1] > SMITH_BUILD){
       updateShown = true;
       var b = document.createElement("button"); b.className = "updbar"; b.type = "button";
-      b.textContent = "New version available. Tap to reload";
-      b.addEventListener("click", function(){ location.reload(); });
+      b.innerHTML = '<span>New version available. Tap to reload</span><span class="updx" role="button" aria-label="Dismiss">\u2715</span>';
+      b.addEventListener("click", function(e){
+        if (e.target.classList && e.target.classList.contains("updx")){ b.remove(); return; }
+        location.reload();
+      });
       document.body.appendChild(b);
     }
   }).catch(function(){});
