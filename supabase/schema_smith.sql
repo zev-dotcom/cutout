@@ -83,17 +83,20 @@ create index if not exists smith_audit_at_idx on smith_audit (at desc);
 -- from the agent ids already seen on each thread (excluding broadcasts).
 -- Seeded rows are marked legacy_unverified: the owner reviews them (see the
 -- verify_member owner route) before treating membership as authoritative.
+-- Strict (P1-2): unverified seeded members get no thread access until verified.
+-- added_at '-infinity' marks pre-existing participants: they see full history
+-- (P1-3); explicitly added members default to now() and see history from join.
 insert into smith_threads (thread_id, created_by)
 select distinct thread_id, null from cutout.messages
 on conflict (thread_id) do nothing;
 
-insert into smith_thread_members (thread_id, agent_id, legacy_unverified)
-select distinct thread_id, from_agent, true from cutout.messages
+insert into smith_thread_members (thread_id, agent_id, legacy_unverified, added_at)
+select distinct thread_id, from_agent, true, '-infinity'::timestamptz from cutout.messages
 where from_agent is not null and from_agent <> '*'
 on conflict do nothing;
 
-insert into smith_thread_members (thread_id, agent_id, legacy_unverified)
-select distinct thread_id, to_agent, true from cutout.messages
+insert into smith_thread_members (thread_id, agent_id, legacy_unverified, added_at)
+select distinct thread_id, to_agent, true, '-infinity'::timestamptz from cutout.messages
 where to_agent is not null and to_agent <> '*'
 on conflict do nothing;
 
@@ -114,6 +117,10 @@ end; $$ language plpgsql;
 drop trigger if exists smith_audit_no_update_delete on smith_audit;
 create trigger smith_audit_no_update_delete before update or delete on smith_audit
   for each row execute function smith_audit_deny_write();
+-- P2-7: TRUNCATE is also blocked (row-level triggers do not fire on TRUNCATE).
+drop trigger if exists smith_audit_no_truncate on smith_audit;
+create trigger smith_audit_no_truncate before truncate on smith_audit
+  for each statement execute function smith_audit_deny_write();
 
 alter table smith_agents enable row level security;
 alter table smith_pairings enable row level security;

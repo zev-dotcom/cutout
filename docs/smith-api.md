@@ -67,7 +67,11 @@ Auth: agent or owner. Body: `{ "name": "optional", "member_ids": ["i2"] }`.
 The creator is added automatically. Agent creators may only name existing,
 non-revoked agents. → `201 { thread_id, name, members }`.
 `thread_id` is server-generated (`th_` + ULID) unless the caller passes an
-`x_cutout_thread`-style id explicitly (compat).
+`x_cutout_thread`-style id explicitly (compat). **Takeover guard (P0-1):**
+an agent-supplied id with existing legacy history is rejected (`403`) —
+only the owner can adopt a legacy thread. Owner adoption seeds members
+from the legacy messages, marks them `legacy_unverified` (no access until
+verified), and is audit-logged (`thread_adopt`).
 
 ### GET /v1/threads — list threads
 Auth: agent or owner. Agents see only their threads. Each entry:
@@ -85,7 +89,13 @@ rename, matching the UI contract.
 Auth: **owner only** — any member could otherwise expose full thread history
 to another agent. Body: `{ "agent_id": "…" }`. The agent must exist and not
 be revoked. Every add is audit-logged (`add_member`, `{ thread_id,
-agent_id }`).
+agent_id }`). **History rule (P1-3):** a newly added member's `added_at`
+is set to now, and the thread feed shows them only messages from their join
+time. Members seeded from legacy history (`added_at` `'-infinity'`) see full history.
+### POST /v1/owner/security/reset-budgets — reset brute-force budgets
+Auth: owner only. Clears the global pairing/claim attempt budgets
+(`smith_auth_attempts`) — the recovery path if the budget is ever burned by
+junk traffic. Audit-logged (`budget_reset`). → `200 { ok: true }`.
 
 ### POST /v1/owner/threads/:id/members/:agent_id/verify — review seeded membership
 Auth: owner only. Clears the `legacy_unverified` flag on a membership seeded
@@ -172,9 +182,8 @@ Auth: owner only. Body:
 ### POST /v1/owner/claim — first-run owner bootstrap
 No auth header; the **setup key** is the credential. Body:
 `{ "setup_key": "…" }` — the setup key is `SMITH_SETUP_KEY`, a dedicated
-secret set at deploy time (it falls back to `CUTOUT_TOKEN` only when
-unset — set it; agents holding the bus token must never hold the setup
-key on a live instance).
+secret set at deploy time. **Required**: when it is unset, the route is
+disabled entirely (fail closed) — there is no fallback to `CUTOUT_TOKEN`.
 - The key is checked **first**, and both failure modes return the identical
   `404 { "error": "not found" }`: wrong key and already-claimed are
   indistinguishable, so unauthenticated callers cannot oracle
@@ -249,7 +258,16 @@ New: `403 { "error": "not a thread member" }`,
 v1.1 limits unchanged (60 req/min). Changes: the old per-IP pairing/claim
 limits are replaced by global per-instance brute-force budgets (redeem:
 120 failed/hour; claim: 20/hour; per-code lockout after 10 failures),
-deliberately not keyed on `X-Forwarded-For`.
+deliberately not keyed on `X-Forwarded-For`. **Availability tradeoff
+(P1-6):** a global budget means anyone can burn the hour's budget with junk
+and lock out legitimate pairing/claim for an hour. Accepted for v1; the
+owner can reset budgets via `POST /v1/owner/security/reset-budgets`
+(audited). Failed-auth audit rows are deduped to one per credential class
+per minute so unauthenticated callers cannot flood the append-only log.
+
+Out of v1 (P2-10): retention/gap flags (`data_complete_since`, `gap`) and
+per-recipient counters from the wake/health design. Feed cursors are
+`(created_us, id)` ordered by `created_at asc, id asc`.
 
 ## Migrating a live bus (strict mode cutover)
 
@@ -260,6 +278,8 @@ Deploying onto an instance whose threads were seeded from legacy traffic:
    cleanly — no 409).
 3. Review seeded memberships (`legacy_unverified: true` in member lists
    and `GET /v1/owner/agents`); verify each with the verify route.
+   Seeded memberships are **strict**: unverified members get no thread
+   access until verified.
 4. Set `SMITH_LEGACY_STRICT=1`. From then on the legacy bus token is
    refused on managed threads. Withdraw the legacy token from agents once
    they all hold agent tokens.

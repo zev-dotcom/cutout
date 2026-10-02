@@ -24,8 +24,9 @@ supabase functions deploy agentcollab --project-ref <ref>
 ```
 
 Set the function secrets. `CUTOUT_TOKEN` is the legacy bus token;
-`SMITH_SETUP_KEY` is the dedicated owner-setup secret (set it — agents
-holding the bus token must not hold this):
+`SMITH_SETUP_KEY` is the dedicated owner-setup secret (**required** — when
+unset, `/v1/owner/claim` is disabled entirely; agents holding the bus token
+must not hold this):
 
 ```bash
 supabase secrets set CUTOUT_TOKEN="$(openssl rand -hex 32)" --project-ref <ref>

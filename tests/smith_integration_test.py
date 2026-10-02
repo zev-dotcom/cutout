@@ -25,6 +25,18 @@ already applied), then exercises the Smith contract end to end:
  13. Legacy-unverified provenance is surfaced; owner can verify members
  14. Activity expiry evaluated on read (backdated row -> no working)
  15. Legacy cutout.py behavior intact on unmanaged threads
+ 16. P0-1: agent cannot take over a legacy thread id with history (403);
+     owner adoption is audited and seeds unverified members
+ 17. P1-2: unverified seeded members get no access until owner verifies;
+     legacy_unverified surfaced consistently in member lists
+ 18. P1-3: new members see thread history from their join time (added_at)
+ 19. P1-6: owner can reset burned brute-force budgets (audited)
+ 20. P2-8: re-issuing a pairing code expires the earlier one;
+     P2-9: renames write an audit row
+ 21. P1-5: failed-auth audit deduped per class with fixed 'unauthenticated'
+     actor; agent failures audited consistently
+ 22. P1-4: separate phase — claim disabled when SMITH_SETUP_KEY unset
+     (run with the no-setup-key flag against a keyless server)
 
 Setup: Postgres with schema.sql + schema_v1.1.sql + schema_smith.sql applied,
 then e.g.:
@@ -110,6 +122,17 @@ def legacy_headers(agent_id=None, extra=None):
     return h
 
 
+# 0. P1-4: owner claim disabled when SMITH_SETUP_KEY is unset (fail closed).
+# Separate phase: start the server WITHOUT SMITH_SETUP_KEY, then run:
+#   python3 tests/smith_integration_test.py [base_url] any-key [bus_token] no-setup-key
+if len(sys.argv) > 4 and sys.argv[4] == "no-setup-key":
+    s, _ = req("POST", "/v1/owner/claim", {"setup_key": "anything-at-all"})
+    check("claim disabled without setup key -> 404", s == 404, f"{s}")
+    s, _ = req("POST", "/v1/owner/claim", {"setup_key": BUS_TOKEN})
+    check("claim disabled without setup key -> 404 even for bus token", s == 404, f"{s}")
+    print(f"\n{len(PASS)} passed, {len(FAIL)} failed (no-setup-key phase)")
+    sys.exit(0 if not FAIL else 1)
+
 # 1. health
 s, h = req("GET", "/health")
 check("health 200 + smith field", s == 200 and h.get("smith") == "1.0", f"{s} {h}")
@@ -135,6 +158,19 @@ acts = [(r.get("action"), (r.get("detail") or {}).get("credential_class")) for r
 check("failed owner auth is audited", ("auth_failed", "owner") in acts, f"{acts}")
 s, _ = req("GET", "/v1/threads", headers=bearer("sm_agt_deadbeef"))
 check("bad sm_agt_ token -> 401 (no legacy fallthrough)", s == 401, f"{s}")
+
+# P1-5: failed-auth audit is deduped per class and uses a fixed actor
+s, _ = req("GET", "/v1/threads", headers=bearer("sm_own_deadbeef2"))
+s, _ = req("GET", "/v1/threads", headers=bearer("sm_own_deadbeef3"))
+ok, out = psql("SELECT count(*) FROM smith_audit WHERE action='auth_failed' AND detail->>'credential_class'='owner';")
+check("failed owner-auth audit deduped (rapid repeats, still 1 row)", ok and out.strip() == "1", out)
+ok, out = psql("SELECT count(*) FROM smith_audit WHERE action='auth_failed' AND detail->>'credential_class'='agent';")
+check("failed agent auth audited consistently with owner", ok and out.strip() == "1", out)
+s, _ = req("GET", "/v1/threads", headers=bearer("sm_agt_deadbeef2"))
+ok, out2 = psql("SELECT count(*) FROM smith_audit WHERE action='auth_failed' AND detail->>'credential_class'='agent';")
+check("failed agent-auth audit deduped too", ok and out2.strip() == out.strip(), out2)
+ok, out3 = psql("SELECT actor FROM smith_audit WHERE action='auth_failed' ORDER BY at DESC LIMIT 1;")
+check("failed-auth actor is fixed 'unauthenticated'", ok and out3.strip() == "unauthenticated", out3)
 
 # 3. pairing round trip
 s, p = req("POST", "/v1/pairings",
@@ -372,6 +408,103 @@ s, lm = req("GET", "/v1/messages?limit=50", headers=LEG)
 managed_leak = [m for m in lm.get("messages", []) if m.get("thread_id") == TH_A]
 check("strict: legacy message list excludes managed threads",
       s == 200 and not managed_leak, f"{s} leaked={len(managed_leak)}")
+
+# 16. P0-1: postThread takeover guard — an agent cannot adopt a legacy
+# thread id with history; the owner can, audited, seeded members unverified
+LEGACY_TID = "x_cutout_thread_takeover_" + uuid.uuid4().hex[:8]
+ok, _ = psql(f"INSERT INTO cutout.messages (id, thread_id, from_agent, to_agent, type, body) "
+             f"VALUES ('msg_takeover1', '{LEGACY_TID}', 'victim-agent', '*', 'note', 'victim history');")
+check("psql: seed legacy thread with history", ok)
+s, b = req("POST", "/v1/threads", {"name": "takeover", "thread_id": LEGACY_TID}, bearer(TOK_A))
+check("agent cannot take over legacy thread id with history -> 403",
+      s == 403 and "only the owner can adopt it" in (b.get("error") or ""), f"{s} {b}")
+FRESH_TID = "x_cutout_thread_fresh_" + uuid.uuid4().hex[:8]
+s, b = req("POST", "/v1/threads", {"name": "fresh", "thread_id": FRESH_TID}, bearer(TOK_A))
+check("agent can name a fresh id with zero history -> 201",
+      s == 201 and b.get("thread_id") == FRESH_TID, f"{s} {b}")
+s, b = req("POST", "/v1/threads", {"name": "adopted", "thread_id": LEGACY_TID}, bearer(OWNER))
+check("owner can adopt legacy thread -> 201", s == 201, f"{s} {b}")
+adopted_members = b.get("members", []) if isinstance(b, dict) else []
+victim = next((m for m in adopted_members if m.get("agent_id") == "victim-agent"), None)
+check("adopted members seeded as legacy_unverified",
+      victim is not None and victim.get("legacy_unverified") is True, f"{victim}")
+s, au = req("GET", "/v1/owner/audit?limit=30", headers=bearer(OWNER))
+acts = [r.get("action") for r in au.get("audit", [])]
+check("legacy adoption is audited (thread_adopt)", "thread_adopt" in acts, f"{acts}")
+
+# 17. P1-2: strict seeded membership — no access until the owner verifies
+s, p = req("POST", "/v1/pairings",
+           {"agent_id": "victim-agent", "display_name": "Victim", "platform": "test"},
+           bearer(OWNER))
+s, r = req("POST", "/v1/pairings/redeem", {"code": p.get("code")})
+TOK_V = r.get("agent_token") if isinstance(r, dict) else None
+check("victim-agent paired", s == 200 and TOK_V, f"{s} {r}")
+s, _ = req("GET", f"/v1/threads/{LEGACY_TID}/feed", headers=bearer(TOK_V))
+check("unverified seeded member cannot read thread -> 403", s == 403, f"{s}")
+s, tl = req("GET", "/v1/threads", headers=bearer(OWNER))
+adopted = next((t for t in tl.get("threads", []) if t.get("thread_id") == LEGACY_TID), None)
+amembers = adopted.get("members", []) if adopted else []
+check("listThreadsSmith members include legacy_unverified",
+      adopted is not None and amembers and all("legacy_unverified" in m for m in amembers),
+      f"{amembers}")
+s, _ = req("POST", f"/v1/owner/threads/{LEGACY_TID}/members/victim-agent/verify", {}, bearer(OWNER))
+check("owner verify seeded member -> 200", s == 200, f"{s}")
+s, f = req("GET", f"/v1/threads/{LEGACY_TID}/feed", headers=bearer(TOK_V))
+bodies = [m.get("body") for m in f.get("messages", [])]
+check("verified member can read thread incl. legacy history -> 200",
+      s == 200 and "victim history" in bodies, f"{s} {bodies}")
+
+# 18. P1-3: joined_at history rule — new members see messages from join time
+s, t = req("POST", "/v1/threads", {"name": "join-test"}, bearer(TOK_A))
+TH_J = t.get("thread_id") if isinstance(t, dict) else None
+s, _ = req("POST", "/v1/messages",
+           {"from": "agent-a", "thread_id": TH_J, "to": "*", "type": "note", "body": "before-join",
+            "idempotency_key": "kj1-" + uuid.uuid4().hex}, bearer(TOK_A))
+s, _ = req("POST", f"/v1/threads/{TH_J}/members", {"agent_id": "agent-c"}, bearer(OWNER))
+check("owner adds agent-c to new thread -> 200", s == 200, f"{s}")
+s, _ = req("POST", "/v1/messages",
+           {"from": "agent-a", "thread_id": TH_J, "to": "*", "type": "note", "body": "after-join",
+            "idempotency_key": "kj2-" + uuid.uuid4().hex}, bearer(TOK_A))
+s, fc = req("GET", f"/v1/threads/{TH_J}/feed", headers=bearer(TOK_C))
+bodies_c = [m.get("body") for m in fc.get("messages", [])]
+check("new member sees only post-join history",
+      "after-join" in bodies_c and "before-join" not in bodies_c, f"{bodies_c}")
+s, fa = req("GET", f"/v1/threads/{TH_J}/feed", headers=bearer(TOK_A))
+bodies_a = [m.get("body") for m in fa.get("messages", [])]
+check("existing member sees full history",
+      "after-join" in bodies_a and "before-join" in bodies_a, f"{bodies_a}")
+
+# 19. P1-6: owner can reset burned brute-force budgets
+ok, _ = psql("INSERT INTO smith_auth_attempts (kind, code_hash) SELECT 'redeem', 'floodtest' FROM generate_series(1, 500);")
+check("psql: burn redeem budget", ok)
+s, _ = req("POST", "/v1/pairings/redeem", {"code": "AAAA-AA"})
+check("burned budget -> 429", s == 429, f"{s}")
+s, _ = req("POST", "/v1/owner/security/reset-budgets", {}, bearer(TOK_A))
+check("budget reset requires owner -> 403", s == 403, f"{s}")
+s, rb = req("POST", "/v1/owner/security/reset-budgets", {}, bearer(OWNER))
+check("owner resets budgets -> 200", s == 200, f"{s} {rb}")
+ok, out = psql("SELECT count(*) FROM smith_auth_attempts;")
+check("attempts cleared after reset", ok and out.strip() == "0", out)
+s, au = req("GET", "/v1/owner/audit?limit=30", headers=bearer(OWNER))
+acts = [r.get("action") for r in au.get("audit", [])]
+check("budget reset is audited", "budget_reset" in acts, f"{acts}")
+
+# 20. P2-8: re-issuing a pairing code expires the earlier one; P2-9: rename audited
+s, p1 = req("POST", "/v1/pairings",
+            {"agent_id": "agent-p28", "display_name": "P28", "platform": "test"}, bearer(OWNER))
+code1 = p1.get("code")
+s, p2 = req("POST", "/v1/pairings",
+            {"agent_id": "agent-p28", "display_name": "P28", "platform": "test"}, bearer(OWNER))
+code2 = p2.get("code")
+s, _ = req("POST", "/v1/pairings/redeem", {"code": code1})
+check("redeeming superseded code -> 404", s == 404, f"{s}")
+s, r2 = req("POST", "/v1/pairings/redeem", {"code": code2})
+check("redeeming latest code -> 200", s == 200, f"{s}")
+s, _ = req("PATCH", f"/v1/threads/{TH_J}", {"name": "renamed-join-test"}, bearer(TOK_A))
+check("rename -> 200", s == 200, f"{s}")
+s, au = req("GET", "/v1/owner/audit?limit=30", headers=bearer(OWNER))
+acts = [r.get("action") for r in au.get("audit", [])]
+check("rename is audited (thread_rename)", "thread_rename" in acts, f"{acts}")
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
