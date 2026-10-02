@@ -210,7 +210,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-02.6";
+var SMITH_BUILD = "2026-10-02.7";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -261,6 +261,8 @@ function renderThreadList(){
   }).filter(function(t){
     return !q || (t.name || "").toLowerCase().indexOf(q) >= 0;
   });
+  var archivedList = list.filter(function(t){ return t.archived; });
+  list = list.filter(function(t){ return !t.archived; });
   var dms = list.filter(function(t){ return (t.members || []).length <= 1; });
   var groups = list.filter(function(t){ return (t.members || []).length > 1; });
   function section(label, items){
@@ -275,21 +277,70 @@ function renderThreadList(){
         : avatarHtml(t.members[0] || {display_name: t.name});
       var right = '<div class="tright"><div class="ttime">' +
         esc(t.last_at ? fmtListTime(t.last_at) : "") + "</div>" +
-        (t.unread ? '<span class="udot">' + esc(String(t.unread)) + "</span>" : "") + "</div>";
+        (t.muted ? '<span class="mutedic" title="Muted" aria-label="Muted">muted</span>' : "") +
+        (t.unread ? '<span class="udot' + (t.muted ? " dim" : "") + '">' + esc(String(t.unread)) + "</span>" : "") + "</div>";
       r.innerHTML = av +
         '<div class="tmeta"><div class="tnm">' + esc(t.name || t.thread_id) + "</div>" +
         '<div class="tsn">' + threadSnippet(t) + "</div></div>" + right;
-      r.addEventListener("click", function(){ openThread(t.thread_id); });
+      r.addEventListener("click", function(){ if (r.dataset.lp === "1"){ r.dataset.lp = ""; return; } openThread(t.thread_id); });
+      var lpT = null;
+      r.addEventListener("touchstart", function(){ lpT = setTimeout(function(){ r.dataset.lp = "1"; openThreadMenu(t); }, 550); }, {passive: true});
+      ["touchend", "touchmove", "touchcancel"].forEach(function(ev){ r.addEventListener(ev, function(){ clearTimeout(lpT); }, {passive: true}); });
+      r.addEventListener("contextmenu", function(e){ e.preventDefault(); openThreadMenu(t); });
       box.appendChild(r);
     });
   }
   section("DIRECT", dms);
   section("GROUPS", groups);
+  if (archivedList.length && !q){
+    var ab = el("button", "trow archrow");
+    ab.innerHTML = '<div class="tmeta"><div class="tnm">' + (state.showArchived ? "▾" : "▸") + " Archived (" + archivedList.length + ")</div></div>";
+    ab.addEventListener("click", function(){ state.showArchived = !state.showArchived; renderThreadList(); });
+    box.appendChild(ab);
+    if (state.showArchived) section("ARCHIVED", archivedList);
+  } else if (archivedList.length && q){
+    section("ARCHIVED", archivedList);
+  }
   if (!list.length){
     box.appendChild(el("div", "emptymsgs",
       q ? "No chats match your search." :
           "No chats yet.<br>Pair an agent to start your first conversation."));
   }
+}
+
+/* ---------- archive + mute menu ---------- */
+function closeSheet(){ var s = document.getElementById("sheet"); if (s) s.remove(); }
+async function setPrefs(t, patch){
+  closeSheet();
+  try {
+    await api("PUT", "/v1/owner/threads/" + encodeURIComponent(t.thread_id) + "/prefs", patch);
+    await loadThreads();
+    var nt = state.threadById[t.thread_id];
+    if (nt && state.currentThread === t.thread_id) renderThreadHeader(nt);
+    if (patch.archived === true && state.currentThread === t.thread_id) goThreads();
+    toast(patch.archived === true ? "Chat archived" : patch.archived === false ? "Chat restored" : patch.muted ? "Notifications muted" : "Notifications on");
+  } catch(e){ toast(e.message); }
+}
+function openThreadMenu(t){
+  closeSheet();
+  var sh = el("div", "sheet"); sh.id = "sheet";
+  var items = [
+    [t.archived ? "Unarchive chat" : "Archive chat", { archived: !t.archived }],
+    t.muted ? ["Turn notifications on", { muted: false }] : null,
+    t.muted ? null : ["Mute for 1 hour", { muted: "1h" }],
+    t.muted ? null : ["Mute for 8 hours", { muted: "8h" }],
+    t.muted ? null : ["Mute for 24 hours", { muted: "24h" }],
+    t.muted ? null : ["Mute until I turn it on", { muted: true }]
+  ].filter(Boolean);
+  var inner = '<div class="sheetbox" role="dialog" aria-label="Chat options"><div class="sheettitle">' + esc(t.name || t.thread_id) + "</div>" +
+    items.map(function(it, i){ return '<button type="button" class="sheetbtn" data-i="' + i + '">' + esc(it[0]) + "</button>"; }).join("") +
+    '<button type="button" class="sheetbtn cancel">Cancel</button></div>';
+  sh.innerHTML = inner;
+  sh.addEventListener("click", function(e){
+    if (e.target === sh || e.target.classList.contains("cancel")) return closeSheet();
+    var b = e.target.closest(".sheetbtn"); if (b && b.dataset.i != null) setPrefs(t, items[Number(b.dataset.i)][1]);
+  });
+  document.body.appendChild(sh);
 }
 
 /* ---------- thread view ---------- */
@@ -407,6 +458,59 @@ function replyChip(msg){
 function mentionsMe(msg){
   return !!(msg.metadata && Array.isArray(msg.metadata.mentions) && msg.metadata.mentions.indexOf("owner") >= 0);
 }
+var QUICK_RX = ["\uD83D\uDC4D", "\u2764\uFE0F", "\uD83D\uDE02", "\uD83C\uDF89", "\uD83D\uDC40", "\u2705"];
+function rxHtml(list){
+  if (!list || !list.length) return "";
+  return '<div class="rxs">' + list.map(function(r){
+    var mine = (r.actors || []).indexOf("owner") >= 0;
+    var who = (r.actors || []).map(function(a){ return a === "owner" ? "You" : agentLabel(a); }).join(", ");
+    return '<button type="button" class="rx' + (mine ? " mine" : "") + '" data-e="' + esc(r.emoji) + '" title="' + esc(who) + '" aria-label="' + esc(r.emoji + " " + r.count + (mine ? ", you reacted" : "")) + '">' +
+      esc(r.emoji) + (r.count > 1 ? ' <span class="rxn">' + r.count + "</span>" : "") + "</button>";
+  }).join("") + "</div>";
+}
+function setRx(row, list){
+  if (!row) return;
+  var old = row.querySelector(".rxs"), html = rxHtml(list);
+  if (old && !html){ old.remove(); return; }
+  if (!html) return;
+  var tmp = document.createElement("div"); tmp.innerHTML = html;
+  if (old){ if (old.innerHTML !== tmp.firstChild.innerHTML) old.innerHTML = tmp.firstChild.innerHTML; }
+  else { var b = row.querySelector(".bub"); if (b) b.insertAdjacentElement("afterend", tmp.firstChild); }
+}
+function applyReactions(map){
+  var box = $("threadMsgs"); if (!box || !map) return;
+  box.querySelectorAll(".msgrow[data-mid]").forEach(function(row){
+    var id = row.getAttribute("data-mid");
+    if (map[id]) setRx(row, map[id]); else if (row.querySelector(".rxs") && map.hasOwnProperty(id) === false && state.rxSeen && state.rxSeen[id]) setRx(row, []);
+  });
+  state.rxSeen = {}; Object.keys(map).forEach(function(k){ state.rxSeen[k] = 1; });
+}
+async function toggleRx(mid, emoji){
+  var row = $("threadMsgs").querySelector('[data-mid="' + String(mid).replace(/"/g, "") + '"]');
+  var chip = row && Array.prototype.filter.call(row.querySelectorAll(".rx"), function(c){ return c.dataset.e === emoji; })[0];
+  var mine = chip && chip.classList.contains("mine");
+  try {
+    var r = mine ? await api("DELETE", "/v1/messages/" + encodeURIComponent(mid) + "/reactions/" + encodeURIComponent(emoji))
+                 : await api("PUT", "/v1/messages/" + encodeURIComponent(mid) + "/reactions", { emoji: emoji });
+    setRx(row, r.reactions || []);
+  } catch (e){ toast("Could not react"); }
+}
+function openReactBar(mid){
+  closeSheet();
+  var sh = el("div", "sheet"); sh.id = "sheet";
+  sh.innerHTML = '<div class="sheetbox" role="dialog" aria-label="React"><div class="rxbar">' +
+    QUICK_RX.map(function(e){ return '<button type="button" class="rxpick" data-e="' + esc(e) + '">' + esc(e) + "</button>"; }).join("") +
+    '</div><button type="button" class="sheetbtn cancel">Cancel</button></div>';
+  sh.addEventListener("click", function(e){
+    if (e.target === sh || e.target.classList.contains("cancel")) return closeSheet();
+    var b = e.target.closest(".rxpick"); if (!b) return;
+    var row = $("threadMsgs").querySelector('[data-mid="' + String(mid).replace(/"/g, "") + '"]');
+    var have = row && Array.prototype.some.call(row.querySelectorAll(".rx.mine"), function(c){ return c.dataset.e === b.dataset.e; });
+    closeSheet();
+    if (!have) toggleRx(mid, b.dataset.e); else toggleRx(mid, b.dataset.e);
+  });
+  document.body.appendChild(sh);
+}
 function msgHtml(msg){
   var mine = msg.from === "owner";
   if (isRenameNote(msg)){
@@ -423,7 +527,7 @@ function msgHtml(msg){
     var lbl = metaLine(msg);
     return '<div class="msgrow msg-out" data-mid="' + esc(msg.id) + '" data-ts="' + esc(msg.created_at || "") + '">' +
       (msg.to && msg.to !== "*" && msg.to !== "owner" ? '<div class="who out">' + toChip(msg) + "</div>" : "") + replyChip(msg) +
-      '<div class="bub">' + bodyHtml(msg) + "</div>" +
+      '<div class="bub">' + bodyHtml(msg) + "</div>" + rxHtml(msg.reactions) +
       (lbl ? '<div class="rcpt">' + lbl + "</div>" : "") + "</div>";
   }
   var nm = esc(agentLabel(msg.from));
@@ -432,7 +536,7 @@ function msgHtml(msg){
     (plat ? ' <span class="plat">' + esc(String(plat).toUpperCase()) + "</span>" : "") + toChip(msg) + "</div>" + replyChip(msg);
   var tm = msg.created_at ? '<div class="rcpt"><span class="mt" data-short="' + esc(fmtClock(msg.created_at)) + '" data-full="' + esc(fmtFull(msg.created_at)) + '">' + esc(fmtClock(msg.created_at)) + "</span></div>" : "";
   return '<div class="msgrow them' + (mentionsMe(msg) ? " ment-me" : "") + '" data-mid="' + esc(msg.id) + '">' + who +
-    '<div class="bub">' + bodyHtml(msg) + "</div>" + tm + "</div>";
+    '<div class="bub">' + bodyHtml(msg) + "</div>" + rxHtml(msg.reactions) + tm + "</div>";
 }
 /* Cue dots: rendered ONLY from the working array handed in. Empty => nothing. */
 function workingPillHtml(working){
@@ -609,7 +713,7 @@ function startThreadStream(tid, gen){
               markRead(tid, d.messages || []);
               refreshThreadsQuiet();
             } else if (ev === "state"){
-              setWorking(d.working); applyPresence(d.presence); applyMarks(d.marks);
+              setWorking(d.working); applyPresence(d.presence); applyMarks(d.marks); applyReactions(d.reactions);
             }
           });
         }
@@ -1387,7 +1491,7 @@ async function disableNotifications(){
   renderNotifications();
 }
 function syncAppBadge(){
-  var total = (state.threads || []).reduce(function(n, t){ return n + (t.unread || 0); }, 0);
+  var total = (state.threads || []).reduce(function(n, t){ return n + (t.muted ? 0 : (t.unread || 0)); }, 0);
   try {
     if (navigator.setAppBadge) (total > 0 ? navigator.setAppBadge(total) : navigator.clearAppBadge()).catch(function(){});
   } catch(e){}
@@ -1445,6 +1549,7 @@ $("setupToken").addEventListener("keydown", function(e){ if (e.key === "Enter") 
 $("setupUrl").addEventListener("keydown", function(e){ if (e.key === "Enter") setupConnect(); });
 
 $("threadBack").addEventListener("click", goThreads);
+$("threadMenuBtn").addEventListener("click", function(){ var t = state.threadById[state.currentThread]; if (t) openThreadMenu(t); });
 document.querySelectorAll("[data-back]").forEach(function(b){
   b.addEventListener("click", goThreads);
 });
@@ -1502,6 +1607,63 @@ document.addEventListener("visibilitychange", function(){
     if (document.hidden) stopThreadPoll(); else { startThreadPoll(); pollThread(); }
   }
 });
+/* ---------- pull to refresh + update check ---------- */
+function attachPTR(el, onRefresh){
+  var y0 = null, pulling = false, ind = null;
+  function indicator(){ if (!ind){ ind = document.createElement("div"); ind.className = "ptr"; document.body.appendChild(ind); } return ind; }
+  el.addEventListener("touchstart", function(e){ y0 = el.scrollTop <= 0 ? e.touches[0].clientY : null; pulling = false; }, {passive: true});
+  el.addEventListener("touchmove", function(e){
+    if (y0 === null) return;
+    var dy = e.touches[0].clientY - y0;
+    if (dy > 12 && el.scrollTop <= 0){
+      pulling = true;
+      var i = indicator(); i.textContent = dy > 80 ? "Release to refresh" : "Pull to refresh";
+      i.style.opacity = Math.min(1, dy / 80); i.style.transform = "translate(-50%," + Math.min(dy / 2, 46) + "px)";
+      i.dataset.ready = dy > 80 ? "1" : "";
+    }
+  }, {passive: true});
+  function end(){
+    if (!pulling){ y0 = null; return; }
+    var i = indicator(), ready = i.dataset.ready === "1"; pulling = false; y0 = null;
+    if (ready){ i.textContent = "Refreshing…"; i.style.opacity = 1; i.style.transform = "translate(-50%,40px)";
+      Promise.resolve().then(onRefresh).catch(function(){}).then(function(){ setTimeout(function(){ i.style.opacity = 0; i.style.transform = "translate(-50%,0)"; }, 400); });
+    } else { i.style.opacity = 0; i.style.transform = "translate(-50%,0)"; }
+  }
+  el.addEventListener("touchend", end, {passive: true});
+  el.addEventListener("touchcancel", end, {passive: true});
+}
+attachPTR($("threadList"), function(){ return Promise.all([loadThreads(), loadAgents ? loadAgents().catch(function(){}) : null]); });
+attachPTR($("threadMsgs"), function(){ state.feedCursor = null; var box = $("threadMsgs"); box.innerHTML = ""; box.dataset.lastday = ""; return pollThread(); });
+var updateShown = false;
+function checkForUpdate(){
+  if (updateShown || document.hidden) return;
+  fetch("app.js?cb=" + Date.now(), {cache: "no-store"}).then(function(r){ return r.text(); }).then(function(t){
+    var m = /SMITH_BUILD = "([^"]+)"/.exec(t);
+    if (m && m[1] !== SMITH_BUILD){
+      updateShown = true;
+      var b = document.createElement("button"); b.className = "updbar"; b.type = "button";
+      b.textContent = "New version available. Tap to reload";
+      b.addEventListener("click", function(){ location.reload(); });
+      document.body.appendChild(b);
+    }
+  }).catch(function(){});
+}
+setInterval(checkForUpdate, 10 * 60 * 1000);
+document.addEventListener("visibilitychange", function(){ if (!document.hidden) setTimeout(checkForUpdate, 1500); });
+setTimeout(checkForUpdate, 20000);
+(function(){
+  var lp = null;
+  function rowOf(t){ var r = t.closest && t.closest("#threadMsgs .msgrow[data-mid]"); return r && t.closest(".bub") ? r : null; }
+  var tm = $("threadMsgs");
+  tm.addEventListener("touchstart", function(e){ var r = rowOf(e.target); if (!r) return; clearTimeout(lp); lp = setTimeout(function(){ r.dataset.lp = "1"; openReactBar(r.getAttribute("data-mid")); }, 550); }, {passive: true});
+  ["touchend", "touchmove", "touchcancel"].forEach(function(n){ tm.addEventListener(n, function(){ clearTimeout(lp); }, {passive: true}); });
+  tm.addEventListener("contextmenu", function(e){ var r = rowOf(e.target); if (!r) return; e.preventDefault(); openReactBar(r.getAttribute("data-mid")); });
+  tm.addEventListener("dblclick", function(e){ var r = rowOf(e.target); if (r) openReactBar(r.getAttribute("data-mid")); });
+  tm.addEventListener("click", function(e){
+    var c = e.target.closest && e.target.closest(".rx"); if (!c) return;
+    var r = c.closest(".msgrow[data-mid]"); if (r) toggleRx(r.getAttribute("data-mid"), c.dataset.e);
+  });
+})();
 document.addEventListener("click", function(e){
   var jb = e.target.closest && e.target.closest(".rpchip");
   if (jb){

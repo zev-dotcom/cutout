@@ -351,3 +351,23 @@ select{width:100%;min-height:var(--tap);border:1.5px solid var(--line);border-ra
 .sendbtn{background:var(--accent,#f05a28);color:#fff}
 [data-theme="noir"] .sendbtn{color:#fff}
 .sendbtn:disabled{opacity:.5}
+.udot.dim{background:var(--ink3);color:var(--bg)}
+.mutedic{font-size:.8rem;opacity:.7;margin-right:4px}
+.archrow{opacity:.75}
+.sheet{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:60;display:flex;align-items:flex-end;justify-content:center}
+.sheetbox{width:100%;max-width:480px;background:var(--bg);border-radius:18px 18px 0 0;padding:10px 12px calc(12px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:6px}
+.sheettitle{font-weight:700;padding:8px 8px 4px;color:var(--ink2);font-size:.9rem}
+.sheetbtn{min-height:var(--tap);border-radius:12px;border:1.5px solid var(--line);background:var(--bg2);font-size:1rem;color:var(--ink);text-align:left;padding:0 16px;cursor:pointer}
+.sheetbtn.cancel{text-align:center;font-weight:700}
+.ptr{position:fixed;top:56px;left:50%;transform:translate(-50%,0);z-index:50;background:var(--ink);color:var(--bg);border-radius:999px;padding:6px 14px;font-size:.8rem;font-weight:600;opacity:0;pointer-events:none;transition:opacity .15s}
+.updbar{position:fixed;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));z-index:70;background:var(--accent,#f05a28);color:#fff;border:none;border-radius:14px;min-height:var(--tap);font-size:1rem;font-weight:700;cursor:pointer}
+.mutedic{font-size:.68rem;font-weight:700;letter-spacing:.04em;color:var(--ink3);margin-right:6px;text-transform:uppercase}
+.chathead .iconbtn{min-width:36px;padding:0}
+.chathead .hinfo{min-width:0;flex:1}
+.rxs{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.msgrow.msg-out .rxs{justify-content:flex-end}
+.rx{min-height:28px;padding:0 9px;border-radius:14px;border:1.5px solid var(--line);background:var(--bg2);color:var(--ink);font-size:.85rem;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
+.rx.mine{border-color:var(--accent,#f05a28);background:rgba(240,90,40,.12)}
+.rxn{font-size:.75rem;font-weight:700;color:var(--ink2)}
+.rxbar{display:flex;justify-content:space-between;gap:4px;padding:6px 2px}
+.rxpick{flex:1;min-height:var(--tap);border:0;border-radius:12px;background:var(--bg2);font-size:1.5rem;cursor:pointer}
