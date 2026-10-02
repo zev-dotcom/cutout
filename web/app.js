@@ -268,7 +268,7 @@ function renderThreadList(){
       r.dataset.tid = t.thread_id;
       r.setAttribute("aria-current", t.thread_id === state.currentThread ? "true" : "false");
       var av = (t.members || []).length > 1
-        ? stackHtml(t.members)
+        ? stackHtml(visibleMembers(t.members))
         : avatarHtml(t.members[0] || {display_name: t.name});
       var right = '<div class="tright"><div class="ttime">' +
         esc(t.last_at ? fmtListTime(t.last_at) : "") + "</div>" +
@@ -290,12 +290,26 @@ function renderThreadList(){
 }
 
 /* ---------- thread view ---------- */
+/* Case-variant duplicates of a registered member (e.g. legacy "Instinct" next to paired
+   "instinct") are hidden; ids compare case-insensitively everywhere in the UI. */
+function visibleMembers(ms){
+  var reg = {};
+  ms.forEach(function(m){
+    if (!m.legacy_unverified && String(m.platform || "").toLowerCase() !== "unknown") reg[String(m.agent_id).toLowerCase()] = m.agent_id;
+  });
+  return ms.filter(function(m){
+    var k = String(m.agent_id).toLowerCase();
+    return !(reg[k] && reg[k] !== m.agent_id);
+  });
+}
 function memberSubHtml(t){
   var ms = t.members || [];
   if (!ms.length) return "No members yet";
-  return ms.map(function(m){
+  return visibleMembers(ms).map(function(m){
     var nm = esc(m.display_name || m.agent_id);
-    var p = m.platform ? ' <span class="plat">' + esc(m.platform.toUpperCase()) + "</span>" : "";
+    var unreg = m.legacy_unverified || (m.platform && String(m.platform).toLowerCase() === "unknown");
+    var p = unreg ? ' <span class="plat">LEGACY</span>'
+      : (m.platform ? ' <span class="plat">' + esc(m.platform.toUpperCase()) + "</span>" : "");
     return "<b>" + nm + "</b>" + p;
   }).join(" · ");
 }
@@ -303,7 +317,7 @@ function renderThreadHeader(t){
   $("threadName").textContent = t.name || t.thread_id;
   $("threadSub").innerHTML = memberSubHtml(t);
   var ms = t.members || [];
-  $("threadAvatar").innerHTML = ms.length > 1 ? stackHtml(ms)
+  $("threadAvatar").innerHTML = visibleMembers(ms).length > 1 ? stackHtml(visibleMembers(ms))
     : avatarHtml(ms[0] || {display_name: t.name});
   var others = ms.filter(function(m){ return m.agent_id !== "owner"; });
   $("composerInput").placeholder = others.length === 1
@@ -374,6 +388,8 @@ function appendMessages(msgs, opts){
   var box = $("threadMsgs");
   var lastDay = box.dataset.lastday || "";
   msgs.forEach(function(m){
+    // Concurrent polls (timer + send) can return the same message twice: render each id once.
+    if (m.id && box.querySelector('[data-mid="' + String(m.id).replace(/"/g, "") + '"]')) return;
     var day = fmtDay(m.created_at);
     if (day !== lastDay){
       box.insertAdjacentHTML("beforeend", '<div class="day">' + esc(day) + "</div>");
@@ -497,8 +513,8 @@ async function sendMessage(){
 }
 
 /* ---------- thread management ---------- */
-async function ensureAgents(){
-  if (!state.agents.length){
+async function ensureAgents(force){
+  if (force || !state.agents.length){
     try {
       var list = await api("GET", "/v1/owner/agents");
       indexAgents(Array.isArray(list) ? list : (list.agents || []));
@@ -530,10 +546,10 @@ async function addMember(){
   var tid = state.currentThread;
   var t = state.threadById[tid];
   if (!tid || !t) return;
-  await ensureAgents();
+  await ensureAgents(true); // always fresh: agents paired since page load must appear
   var have = {};
-  (t.members || []).forEach(function(m){ have[m.agent_id] = 1; });
-  var cands = state.agents.filter(function(a){ return !have[a.agent_id] && isRegistered(a); });
+  (t.members || []).forEach(function(m){ have[String(m.agent_id).toLowerCase()] = 1; });
+  var cands = state.agents.filter(function(a){ return !have[String(a.agent_id).toLowerCase()] && isRegistered(a); });
   if (!cands.length){ toast("No other agents to add."); return; }
   var opts = cands.map(function(a){
     return '<option value="' + esc(a.agent_id) + '">' +
@@ -553,7 +569,7 @@ async function addMember(){
     });
 }
 async function createThread(){
-  await ensureAgents();
+  await ensureAgents(true);
   var cands = state.agents.filter(isRegistered);
   if (!cands.length){
     modal("New chat",
@@ -695,6 +711,9 @@ async function loadAgents(){
         (a.revoked_at ? '<span class="revoketag">REVOKED</span>'
           : '<button class="revoke">Revoke</button>');
       if (!a.revoked_at){
+        var wl = el("div", "asub wakeline", "Wake: loading…");
+        row.children[1].appendChild(wl);
+        refreshWakeLine(a, wl);
         row.querySelector(".revoke").addEventListener("click", function(){
           modal("Revoke " + (a.display_name || a.agent_id) + "?",
             "<p class='fine'>This cuts the agent's token and its future access to threads. Past messages stay.</p>",
@@ -714,6 +733,92 @@ async function loadAgents(){
   } catch(e){
     box.innerHTML = '<p class="fine">Could not load agents: ' + esc(e.message) + "</p>";
   }
+}
+
+/* ---------- wake hooks ---------- */
+function ago(iso){
+  if (!iso) return "never";
+  var s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 90) return "just now";
+  if (s < 5400) return Math.round(s / 60) + "m ago";
+  if (s < 129600) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+function wakeSummary(w){
+  var m = w.method || "none";
+  if (m === "none") return "none (poll only)";
+  if (m === "wait") return "long-poll";
+  if (m === "schedule") return "schedule, every " + ((w.config || {}).interval_minutes || "?") + " min";
+  var st = w.last_status ? (w.last_status === "ok" ? "ok" : w.last_status) : "no wake yet";
+  return m + " · " + (w.enabled ? "" : "DISABLED · ") + st + (w.last_wake_at ? " · " + ago(w.last_wake_at) : "");
+}
+async function refreshWakeLine(a, node){
+  try {
+    var w = await api("GET", "/v1/owner/agents/" + encodeURIComponent(a.agent_id) + "/wake");
+    node.innerHTML = "";
+    node.appendChild(document.createTextNode("Wake: " + wakeSummary(w) + " "));
+    var b = el("button", "linkbtn", "Edit");
+    b.addEventListener("click", function(){ openWakeModal(a, w, node); });
+    node.appendChild(b);
+  } catch(e){
+    node.remove(); // instance without wake hooks: show nothing
+  }
+}
+function openWakeModal(a, w, node){
+  var cur = w.method || "none";
+  var opts = ["none", "wait", "schedule", "webhook"].concat(w.email_available ? ["email"] : []);
+  var sel = opts.map(function(m){
+    return '<option value="' + m + '"' + (m === cur ? " selected" : "") + ">" + m + "</option>";
+  }).join("");
+  var cfg = w.config || {};
+  modal("Wake: " + (a.display_name || a.agent_id),
+    '<p class="fine">How Smith nudges this agent when mail arrives. Delivery never depends on it, and a wake carries only a count.</p>' +
+    '<div class="field"><label for="wkMethod">METHOD</label><select id="wkMethod">' + sel + "</select></div>" +
+    '<div class="field" id="wkUrlF"><label for="wkUrl">WEBHOOK URL (HTTPS)</label>' +
+      '<input id="wkUrl" autocomplete="off" spellcheck="false" placeholder="https://…" value="' + esc(cfg.url || "") + '"></div>' +
+    '<div class="field" id="wkIntF"><label for="wkInt">EVERY (MINUTES)</label>' +
+      '<input id="wkInt" inputmode="numeric" value="' + esc(String(cfg.interval_minutes || 5)) + '"></div>' +
+    '<div class="field" id="wkMailF"><label for="wkMail">ALLOWLISTED EMAIL</label>' +
+      '<input id="wkMail" autocomplete="off" value="' + esc(cfg.address || "") + '"></div>' +
+    '<p class="fine" id="wkStat">Status: ' + esc(wakeSummary(w)) + (w.fail_count ? " · " + w.fail_count + " failures" : "") + "</p>" +
+    '<button class="bigbtn" id="wkTest" style="min-height:44px;margin-bottom:6px">Send test wake</button>' +
+    '<p class="fine" id="wkMsg"></p>',
+    "Save", function(mm){
+      var method = mm.querySelector("#wkMethod").value;
+      var body = {method: method};
+      if (method === "webhook") body.url = mm.querySelector("#wkUrl").value.trim();
+      if (method === "schedule") body.interval_minutes = Number(mm.querySelector("#wkInt").value);
+      if (method === "email") body.address = mm.querySelector("#wkMail").value.trim();
+      api("PUT", "/v1/owner/agents/" + encodeURIComponent(a.agent_id) + "/wake", body)
+        .then(function(res){
+          if (res.signing_secret){
+            modal("Signing secret (shown once)",
+              '<p class="fine">Give this to the agent now. Smith will not show it again.</p>' +
+              '<div class="field"><input readonly value="' + esc(res.signing_secret) + '" onclick="this.select()"></div>',
+              "Copy", function(){ copyText(res.signing_secret); return false; });
+          }
+          toast("Wake saved.");
+          refreshWakeLine(a, node);
+        })
+        .catch(function(e){ toast(e.message); });
+    });
+  var mm = $("modalRoot");
+  function sync(){
+    var m = mm.querySelector("#wkMethod").value;
+    mm.querySelector("#wkUrlF").hidden = m !== "webhook";
+    mm.querySelector("#wkIntF").hidden = m !== "schedule";
+    mm.querySelector("#wkMailF").hidden = m !== "email";
+    mm.querySelector("#wkTest").hidden = !(cur === "webhook" || cur === "email") || m !== cur;
+  }
+  mm.querySelector("#wkMethod").addEventListener("change", sync);
+  sync();
+  mm.querySelector("#wkTest").addEventListener("click", function(){
+    var out = mm.querySelector("#wkMsg");
+    out.textContent = "Sending…";
+    api("POST", "/v1/owner/agents/" + encodeURIComponent(a.agent_id) + "/wake/test", {})
+      .then(function(r){ out.textContent = "Test wake: " + r.status; refreshWakeLine(a, node); })
+      .catch(function(e){ out.textContent = e.message; });
+  });
 }
 
 /* ---------- audit ---------- */

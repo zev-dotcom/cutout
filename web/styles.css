@@ -270,3 +270,9 @@ input,select,textarea{font-family:inherit}
 html,body{overscroll-behavior:none}
 .msgs{min-height:0}
 @media (max-width:760px){ body{overflow:hidden} .setup{overflow-y:auto;align-items:flex-start} }
+
+.linkbtn{background:none;border:none;padding:6px 4px;margin-left:2px;font-size:12px;font-weight:700;color:var(--ink);text-decoration:underline;cursor:pointer;min-height:32px}
+select{width:100%;min-height:var(--tap);border:1.5px solid var(--line);border-radius:13px;background:var(--bg);color:var(--ink);padding:0 14px;font-size:14.5px}
+.field[hidden]{display:none}
+.wakeline{display:flex;flex-wrap:wrap;align-items:center;gap:2px 6px}
+.wakeline .linkbtn{margin:0;padding:6px 0}
