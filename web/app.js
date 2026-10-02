@@ -210,7 +210,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-02.2";
+var SMITH_BUILD = "2026-10-02.3";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -313,7 +313,9 @@ function memberSubHtml(t){
     var unreg = m.legacy_unverified || (m.platform && String(m.platform).toLowerCase() === "unknown");
     var p = unreg ? ' <span class="plat">LEGACY</span>'
       : (m.platform ? ' <span class="plat">' + esc(m.platform.toUpperCase()) + "</span>" : "");
-    return "<b>" + nm + "</b>" + p;
+    var pr = state.presence && state.presence[m.agent_id];
+    var dot = pr ? ' <span class="pdot ' + (pr.online ? "on" : "off") + '" title="' + (pr.online ? "online" : "offline") + '"></span>' : "";
+    return '<span class="mem">' + "<b>" + nm + "</b>" + dot + p + "</span>";
   }).join(" · ");
 }
 function renderThreadHeader(t){
@@ -341,7 +343,10 @@ function renderThreadHeader(t){
 function receiptLabel(msg){
   // Render ONLY from real receipt events attached to the message.
   var rcs = msg.receipts || [];
-  if (!rcs.length) return "";
+  if (!rcs.length){
+    var sn = msg.seen_by || [];
+    return sn.length ? "✓ <b>seen</b> · " + esc(msg.created_at ? fmtClock(msg.created_at) : "") : "";
+  }
   var acted = rcs.filter(function(r){ return r.status === "acted"; });
   var recvd = rcs.filter(function(r){ return r.status === "received"; });
   var t = msg.created_at ? fmtClock(msg.created_at) : "";
@@ -389,7 +394,7 @@ function msgHtml(msg){
   }
   if (mine){
     var lbl = receiptLabel(msg);
-    return '<div class="msgrow msg-out" data-mid="' + esc(msg.id) + '">' +
+    return '<div class="msgrow msg-out" data-mid="' + esc(msg.id) + '" data-ts="' + esc(msg.created_at || "") + '">' +
       '<div class="bub">' + bodyHtml(msg) + "</div>" +
       (lbl ? '<div class="rcpt">' + lbl + "</div>" : "") + "</div>";
   }
@@ -511,12 +516,77 @@ function pollThread(){
     refreshThreadsQuiet();
   }).catch(function(){ /* transient poll errors stay silent; next tick retries */ });
 }
+/* Live stream (SSE over fetch). Falls back to the 5 s poll if the stream cannot open. */
+function applyPresence(list){
+  state.presence = {};
+  (list || []).forEach(function(p){ state.presence[p.agent_id] = p; });
+  var t = (state.threads || []).filter(function(x){ return x.thread_id === state.currentThread; })[0];
+  if (t) renderThreadHeader(t);
+}
+function applyMarks(marks){
+  var box = $("threadMsgs"); if (!box || !marks) return;
+  Object.keys(marks).forEach(function(id){
+    var row = box.querySelector('[data-mid="' + id.replace(/"/g, "") + '"]');
+    if (!row || !row.classList.contains("msg-out")) return;
+    var lbl = receiptLabel({ receipts: marks[id].receipts, seen_by: marks[id].seen_by, created_at: row.getAttribute("data-ts") || "" });
+    var el = row.querySelector(".rcpt");
+    if (!lbl){ return; }
+    if (!el){ el = document.createElement("div"); el.className = "rcpt"; row.appendChild(el); }
+    if (el.innerHTML !== lbl && !/acted/.test(el.innerHTML)) el.innerHTML = lbl;
+  });
+}
+function startThreadStream(tid, gen){
+  var ctl = new AbortController(); state.streamCtl = ctl;
+  var fails = 0;
+  (async function loop(){
+    while (gen === state.streamGen && tid === state.currentThread){
+      try {
+        var url = "/v1/owner/stream?thread_id=" + encodeURIComponent(tid) + (state.feedCursor ? "&since=" + encodeURIComponent(state.feedCursor) : "");
+        var res = await fetch(baseUrl() + url, { headers: { "Authorization": "Bearer " + token() }, signal: ctl.signal });
+        if (!res.ok || !res.body) throw new Error("stream " + res.status);
+        fails = 0; stopPollTimer();
+        var rd = res.body.getReader(), dec = new TextDecoder(), buf = "";
+        for (;;){
+          var ch = await rd.read(); if (ch.done) break;
+          buf += dec.decode(ch.value, { stream: true });
+          var parts = buf.split("\n\n"); buf = parts.pop();
+          parts.forEach(function(raw){
+            var ev = "", data = "";
+            raw.split("\n").forEach(function(l){ if (l.indexOf("event:") === 0) ev = l.slice(6).trim(); else if (l.indexOf("data:") === 0) data += l.slice(5).trim(); });
+            if (!ev || !data || tid !== state.currentThread) return;
+            var d; try { d = JSON.parse(data); } catch(e){ return; }
+            if (ev === "messages"){
+              state.feedCursor = d.next_cursor || state.feedCursor;
+              appendMessages(d.messages || []);
+              var box = $("threadMsgs"); box.scrollTop = box.scrollHeight;
+              markRead(tid, d.messages || []);
+              refreshThreadsQuiet();
+            } else if (ev === "state"){
+              setWorking(d.working); applyPresence(d.presence); applyMarks(d.marks);
+            }
+          });
+        }
+      } catch(e){
+        if (gen !== state.streamGen) return;
+        fails++;
+        if (fails >= 2) startPollTimer();
+        await new Promise(function(r){ setTimeout(r, Math.min(15000, 1000 * fails)); });
+      }
+    }
+  })();
+}
+function startPollTimer(){ if (!state.threadTimer) state.threadTimer = setInterval(pollThread, 5000); }
+function stopPollTimer(){ if (state.threadTimer){ clearInterval(state.threadTimer); state.threadTimer = null; } }
 function startThreadPoll(){
   stopThreadPoll();
-  state.threadTimer = setInterval(pollThread, 5000);
+  state.streamGen = (state.streamGen || 0) + 1;
+  if (window.ReadableStream && window.TextDecoder && window.AbortController) startThreadStream(state.currentThread, state.streamGen);
+  else startPollTimer();
 }
 function stopThreadPoll(){
-  if (state.threadTimer){ clearInterval(state.threadTimer); state.threadTimer = null; }
+  state.streamGen = (state.streamGen || 0) + 1;
+  if (state.streamCtl){ try { state.streamCtl.abort(); } catch(e){} state.streamCtl = null; }
+  stopPollTimer();
 }
 var listRefreshing = false;
 function refreshThreadsQuiet(){
@@ -1364,6 +1434,11 @@ $("threadSearch").addEventListener("input", function(e){
   renderThreadList();
 });
 
+document.addEventListener("visibilitychange", function(){
+  if (state.currentThread && $("threadMsgs") && window.ReadableStream){
+    if (document.hidden) stopThreadPoll(); else { startThreadPoll(); pollThread(); }
+  }
+});
 applyTheme();
 boot();
 })();
@@ -1387,3 +1462,4 @@ boot();
   document.addEventListener("focusin", function(){ setTimeout(fit, 120); setTimeout(fit, 400); });
   fit();
 })();
+

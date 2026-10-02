@@ -85,3 +85,13 @@ alter table smith.smith_agent_cursor enable row level security;
 alter table smith.smith_wake_log enable row level security;
 alter table smith.smith_canaries enable row level security;
 do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith.smith_agent_cursor from anon, authenticated; revoke all on smith.smith_wake_log from anon, authenticated; revoke all on smith.smith_canaries from anon, authenticated; end if; end $$;
+
+-- Auto "seen": first time a recipient agent's poll returned an owner message (additive).
+create table if not exists smith.smith_seen (
+  message_id text not null,
+  agent_id   text not null,
+  at         timestamptz not null default now(),
+  primary key (message_id, agent_id)
+);
+alter table smith.smith_seen enable row level security;
+do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith.smith_seen from anon, authenticated; end if; end $$;

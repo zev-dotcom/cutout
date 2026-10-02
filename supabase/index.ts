@@ -596,12 +596,12 @@ async function getMessagesInner(req, arrivedAt, auth) {
     rows = await queryOnce();
   }
   console.log(`cutout poll_hold_ms=${Date.now() - holdStarted} requested_wait=${wait} effective_wait=${Math.min(wait, MAX_HOLD_SECONDS)}`);
-  if (auth.kind === "agent") markCanariesPicked(rows).catch(()=>{});
+  if (auth.kind === "agent") { markCanariesPicked(rows).catch(()=>{}); recordSeen(auth.agentId, rows).catch(()=>{}); }
   return getMessagesTail(rows, since);
 }
 // Shared by GET /v1/messages and the Smith thread feeds: stale one-time-link
 // redaction plus per-message receipts. Behavior is identical everywhere it is used.
-async function enrichMessages(rows, redactLabel) {
+async function enrichMessages(rows, redactLabel, ownerView = false) {
   const staleIds = [];
   for (const r of rows){
     if (!staleLink(r.metadata?.one_time_link)) continue;
@@ -625,10 +625,36 @@ async function enrichMessages(rows, redactLabel) {
       receiptsBy.set(r.message_id, list);
     }
   }
+  // Auto "seen": the first time a recipient agent's poll returned an owner message.
+  const seenBy = new Map();
+  const ownerIds = ownerView ? rows.filter((r)=> r.from_agent === OWNER_ID).map((r)=> r.id) : [];
+  if (ownerIds.length) {
+    try {
+      const sr = await timedQuery(sql`select message_id, agent_id, at from ${S("smith_seen")} where message_id = any(${ownerIds}) order by at asc`, "seen_by");
+      for (const r of sr) { const l = seenBy.get(r.message_id) ?? []; l.push({ agent: r.agent_id, at: iso(r.at) }); seenBy.set(r.message_id, l); }
+    } catch { /* table absent */ }
+  }
   return rows.map((r)=>({
       ...serialize(r),
-      receipts: receiptsBy.get(r.id) ?? []
+      receipts: receiptsBy.get(r.id) ?? [],
+      ...(ownerView && r.from_agent === OWNER_ID ? { seen_by: seenBy.get(r.id) ?? [] } : {})
     }));
+}
+async function recordSeen(agentId, rows) {
+  const ids = rows.filter((r)=> r.from_agent === OWNER_ID).map((r)=> r.id);
+  if (!ids.length) return;
+  try { await sql`insert into ${S("smith_seen")} (message_id, agent_id) select x, ${agentId} from unnest(${ids}::text[]) as x on conflict do nothing`; } catch { /* table absent */ }
+}
+async function threadPresence(threadId) {
+  try {
+    const r = await timedQuery(sql`
+      select tm.agent_id, greatest(h.last_poll_at, c.last_peek_at) as alive
+      from ${S("smith_thread_members")} tm
+      left join ${S("smith_wake_hooks")} h on h.agent_id = tm.agent_id
+      left join ${S("smith_agent_cursor")} c on c.agent_id = tm.agent_id
+      where tm.thread_id = ${threadId} and tm.legacy_unverified = false and tm.agent_id <> ${OWNER_ID}`, "presence");
+    return r.map((x)=>({ agent_id: x.agent_id, online: !!x.alive && Date.now() - new Date(x.alive).getTime() < 90000, seen_ago_s: x.alive ? Math.round((Date.now() - new Date(x.alive).getTime()) / 1000) : null }));
+  } catch { return []; }
 }
 async function getMessagesTail(rows, since) {
   const messages = await enrichMessages(rows, "redact_stale_links");
@@ -1267,7 +1293,7 @@ async function feedMessages(threadId, cursor, limit, agentId) {
 }
 async function buildFeed(threadId, q, redactLabel, agentId) {
   const rows = await feedMessages(threadId, q.cursor, q.limit, agentId);
-  const messages = await enrichMessages(rows, redactLabel);
+  const messages = await enrichMessages(rows, redactLabel, agentId == null);
   // Working state is evaluated on read (expires_at > now()): a crashed agent's
   // dots clear within the TTL with no client timer to trust.
   const wrows = await timedQuery(sql`select agent_id, started_at from ${S("smith_activity")} where thread_id = ${threadId} and expires_at > now() order by agent_id asc`, "feed_working");
@@ -1277,7 +1303,8 @@ async function buildFeed(threadId, q, redactLabel, agentId) {
     working: wrows.map((r)=>({
         agent_id: r.agent_id,
         started_at: iso(r.started_at)
-      }))
+      })),
+    ...(agentId == null ? { presence: await threadPresence(threadId) } : {})
   };
 }
 async function threadFeed(req, auth, threadId) {
@@ -1674,6 +1701,68 @@ async function ownerFeed(req, auth, threadId) {
   const feed = await buildFeed(threadId, q, "owner_feed_redact");
   return jres(200, feed);
 }
+// Live feed for the owner client: Server-Sent Events over fetch (the client sends its token header).
+// Emits "messages" on new messages and "state" when presence, working dots or receipt/seen marks change.
+// Each stream lasts ~40 s and the client reconnects with the last cursor. At most 2 at a time.
+// Cap is per function isolate (an instance may run several); it bounds DB load per isolate, not globally.
+let openStreams = 0;
+const lastStreamAudit = new Map();
+const STREAM_MS = Number(Deno.env.get("SMITH_STREAM_MS") ?? 40000);
+async function ownerStream(req, auth, threadId) {
+  const denied = requireOwner(auth);
+  if (denied) return denied;
+  if (!threadId) return jres(422, { error: "thread_id is required" });
+  if (!await isManagedThread(threadId)) return jres(404, { error: "thread not found" });
+  const q = parseFeedQuery(req);
+  if (q.error) return q.error;
+  if (openStreams >= 2) return jres(429, { error: "too many open streams" }, { "Retry-After": "5" });
+  // Reconnects every ~40 s must not flood the audit log: one entry per thread per 10 minutes (per isolate).
+  if (Date.now() - (lastStreamAudit.get(threadId) ?? 0) > 600000) {
+    try { await audit(OWNER_ID, "read_thread", { thread_id: threadId, stream: true, note: "stream open; reconnects within 10 min not re-logged" }); lastStreamAudit.set(threadId, Date.now()); } catch { return jres(500, { error: "audit unavailable" }); }
+  }
+  openStreams++;
+  const enc = new TextEncoder();
+  let closed = false, cursor = q.cursor, cursorStr = q.since ?? null, sig = "";
+  const body = new ReadableStream({
+    async start(ctrl) {
+      const send = (ev, data)=> { try { ctrl.enqueue(enc.encode("event: " + ev + "\ndata: " + JSON.stringify(data) + "\n\n")); } catch { closed = true; } };
+      const end = Date.now() + STREAM_MS;
+      try {
+        send("hello", { cursor: cursorStr });
+        while (!closed && Date.now() < end) {
+          const feed = await buildFeed(threadId, { cursor, limit: 100, since: cursorStr }, "owner_feed_redact");
+          if (feed.messages.length) {
+            cursorStr = feed.next_cursor; cursor = decodeCursor(cursorStr);
+            send("messages", { messages: feed.messages, next_cursor: cursorStr });
+          }
+          const recent = await timedQuery(sql`select id from ${T("messages")} where thread_id = ${threadId} and from_agent = ${OWNER_ID} order by created_at desc, id desc limit 30`, "stream_recent");
+          const marks = {};
+          if (recent.length) {
+            const ids = recent.map((r)=> r.id);
+            const rc = await timedQuery(sql`select message_id, agent, status, at from ${T("receipts")} where message_id = any(${ids}) order by at asc`, "stream_receipts");
+            for (const r of rc) (marks[r.message_id] ??= { receipts: [], seen_by: [] }).receipts.push({ agent: r.agent, status: r.status, at: iso(r.at) });
+            try {
+              const sr = await timedQuery(sql`select message_id, agent_id, at from ${S("smith_seen")} where message_id = any(${ids}) order by at asc`, "stream_seen");
+              for (const r of sr) (marks[r.message_id] ??= { receipts: [], seen_by: [] }).seen_by.push({ agent: r.agent_id, at: iso(r.at) });
+            } catch { /* table absent */ }
+          }
+          const state = { working: feed.working, presence: feed.presence.map((p)=>({ agent_id: p.agent_id, online: p.online })), marks };
+          const nsig = JSON.stringify(state);
+          if (nsig !== sig) { sig = nsig; send("state", { ...state, presence: feed.presence }); }
+          else send("ping", {});
+          await sleep(2000);
+        }
+      } catch (e) {
+        send("error", { error: String(e?.message ?? e).slice(0, 80) });
+      } finally {
+        openStreams--;
+        try { ctrl.close(); } catch { /* already closed */ }
+      }
+    },
+    cancel() { closed = true; }
+  });
+  return new Response(body, { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache, no-transform", "x-accel-buffering": "no" } });
+}
 async function ownerThreads(req, auth) {
   const denied = requireOwner(auth);
   if (denied) return denied;
@@ -1812,6 +1901,7 @@ async function route(req, arrivedAt) {
   if (path === "/v1/owner/feed" && req.method === "GET") {
     return done(await ownerFeed(req, auth, new URL(req.url).searchParams.get("thread_id")));
   }
+  if (path === "/v1/owner/stream" && req.method === "GET") return done(await ownerStream(req, auth, new URL(req.url).searchParams.get("thread_id")));
   if (path === "/v1/owner/threads" && req.method === "GET") return done(await ownerThreads(req, auth));
   if (path === "/v1/owner/audit" && req.method === "GET") return done(await ownerAudit(req, auth));
   let segs;

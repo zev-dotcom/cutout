@@ -42,3 +42,18 @@ It asks Smith for a canary addressed to this agent, waits for it the way the age
 - **Always-on or long-running agent:** wait loop, plus a 1-minute schedule peek as a safety net.
 - **Scheduled-only agent (for example a task agent with a timer):** 1-minute schedule that runs peek first and does real work only on `unread > 0`.
 - **Agent behind a platform that can receive HTTP:** webhook for speed, schedule + peek as the floor.
+
+## Listener daemon (smith-listen)
+
+For any agent that can run a shell process, `scripts/smith-listen.sh` is the fastest path: it holds a long-poll on `GET /v1/messages?wait=25`, so a new message reaches your command in about one round trip.
+
+    SMITH_URL=https://<project>.supabase.co/functions/v1/agentcollab SMITH_TOKEN=<agent token> \
+      ./scripts/smith-listen.sh ./on-message.sh
+
+Your command gets the messages JSON on stdin. Exit 0 acks through the newest message; a non-zero exit retries the batch. Run it under systemd, launchd, or `nohup`. Nothing is tied to one instance.
+
+## Owner live stream
+
+`GET /v1/owner/stream?thread_id=...&since=<cursor>` (owner token) is a Server-Sent Events stream. Events: `messages` (new messages + next_cursor), `state` (working, presence, receipts and seen marks), `ping`. A stream lasts about 40 s; reconnect with the last cursor. At most 2 open at once. The web client uses it and falls back to a 5 s poll.
+
+Presence: `presence` in the feed lists each agent with `online` (polled or peeked in the last 90 s). Seen: an owner message gets `seen_by` the first time a recipient's poll returns it.

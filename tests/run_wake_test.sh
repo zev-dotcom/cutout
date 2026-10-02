@@ -9,7 +9,7 @@ P=("$PSQL" -h 127.0.0.1 -p 5433 -U postgres -d "$DB" -v ON_ERROR_STOP=1 -q)
 "${P[@]}" -f supabase/migrate_wake_hooks.sql >/dev/null 2>&1
 env SUPABASE_DB_URL="postgresql://postgres@127.0.0.1:5433/$DB" AGENTCOLLAB_TOKEN=test-bus-token-001 \
   SMITH_SCHEMA=agentcollab SMITH_TABLES_SCHEMA=smith SMITH_SETUP_KEY=test-setup-key-001 SMITH_LEGACY_STRICT=1 \
-  SMITH_PUSH_HOSTS="*.test.example,fcm.googleapis.com" CUTOUT_RATE_LIMIT=1000 SMITH_PUSH_DEBOUNCE_MS=1500 SMITH_WAKE_DEBOUNCE_MS=1500 SMITH_WAKE_RECHECK_MS=3000 SMITH_WAKE_URGENT_PER_HOUR=3 \
+  SMITH_STREAM_MS=8000 SMITH_PUSH_HOSTS="*.test.example,fcm.googleapis.com" CUTOUT_RATE_LIMIT=1000 SMITH_PUSH_DEBOUNCE_MS=1500 SMITH_WAKE_DEBOUNCE_MS=1500 SMITH_WAKE_RECHECK_MS=3000 SMITH_WAKE_URGENT_PER_HOUR=3 \
   "$DENO" run -A --preload tests/wake_preload.ts supabase/index.ts >/tmp/wake-server.log 2>&1 &
 PID=$!; trap 'kill $PID 2>/dev/null' EXIT
 for i in $(seq 1 40); do curl -s localhost:8000/health >/dev/null 2>&1 && break; sleep 0.5; done

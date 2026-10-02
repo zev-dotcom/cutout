@@ -333,3 +333,7 @@ select{width:100%;min-height:var(--tap);border:1.5px solid var(--line);border-ra
 .accrow .linkbtn{display:inline;padding:0 2px;min-height:0}
 .accrow .revoke,.accrow .revoketag{margin-top:2px}
 .accrow .wakeline{text-align:left}.accrow .wakeline .linkbtn{display:inline-block;vertical-align:baseline}
+
+.pdot{display:inline-block;width:7px;height:7px;border-radius:50%;margin:0 2px 1px 3px;vertical-align:middle}
+.pdot.on{background:#2fb562}.pdot.off{background:var(--ink3);opacity:.5}
+.mem{white-space:nowrap}

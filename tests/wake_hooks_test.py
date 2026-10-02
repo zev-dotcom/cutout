@@ -279,4 +279,61 @@ check("acking an old message does not mark an unpicked canary", sql("select acke
 s, _p = req("GET", "/v1/messages?peek=1", tok=OWN); check("owner peek is refused (403)", s == 403, s)
 s, h = req("GET", "/v1/owner/wake-health", tok=OWN); hb = {x["agent_id"]: x for x in h["agents"]}
 check("webhook-only agent shows ok, not Not seen", hb["mn-c"]["state"] in ("ok", "slow") and hb["mn-c"]["wake_method"] == "webhook", hb["mn-c"])
+# --- live stream, presence, seen ---
+import http.client, threading as _th2, urllib.parse as _up
+SU = _up.urlparse(sys.argv[1])
+def read_stream(path, tok, secs, out):
+    c = http.client.HTTPConnection(SU.hostname, SU.port, timeout=secs + 3)
+    c.request("GET", path, headers={"Authorization": "Bearer " + tok})
+    r = c.getresponse(); out["status"] = r.status; out["ctype"] = r.getheader("content-type"); out["events"] = []
+    t0 = time.time(); ev = None
+    while time.time() - t0 < secs:
+        line = r.readline().decode()
+        if not line: break
+        line = line.strip()
+        if line.startswith("event:"): ev = line[6:].strip()
+        elif line.startswith("data:") and ev: out["events"].append((time.time() - t0, ev, json.loads(line[5:]))); ev = None
+    c.close()
+s, th4 = req("POST", "/v1/threads", {"member_ids": ["pk-a", "pk-b"], "name": "stream"}, OWN); T4 = th4["thread_id"]
+s, _r = req("GET", "/v1/owner/stream?thread_id=" + T4, tok=PA); check("stream is owner-only (403)", s == 403, s)
+out = {}; th_ = _th2.Thread(target=read_stream, args=("/v1/owner/stream?thread_id=" + T4, OWN, 5, out)); th_.start()
+time.sleep(1.5)
+req("POST", "/v1/messages", {"thread_id": T4, "from": "pk-a", "to": "*", "type": "note", "body": "live one"}, PA)
+time.sleep(0.3)
+s, mo = req("POST", "/v1/messages", {"thread_id": T4, "from": "owner", "to": "*", "type": "note", "body": "from owner"}, OWN)
+time.sleep(0.5); req("GET", "/v1/messages?thread_id=" + T4, tok=PB)   # pk-b polls: auto-seen
+th_.join()
+evs = out.get("events", [])
+check("stream is event-stream", out.get("status") == 200 and "text/event-stream" in (out.get("ctype") or ""), out.get("ctype"))
+live = [e for e in evs if e[1] == "messages" and any(m["body"] == "live one" for m in e[2]["messages"])]
+check("new message pushed within one 2 s tick", live and live[0][0] - 1.5 < 2.6, [e[0] for e in live])
+sts = [e for e in evs if e[1] == "state"]
+check("state event carries presence for members", sts and {p["agent_id"] for p in sts[-1][2]["presence"]} == {"pk-a", "pk-b"}, sts[-1][2]["presence"] if sts else None)
+check("presence marks a just-polled agent online", sts and any(p["agent_id"] == "pk-b" and p["online"] for p in sts[-1][2]["presence"]), sts[-1][2]["presence"] if sts else None)
+check("seen mark appears for an owner message", sts and any(any(x["agent"] == "pk-b" for x in v["seen_by"]) for v in sts[-1][2]["marks"].values()), sts[-1][2]["marks"] if sts else None)
+s, fd = req("GET", "/v1/owner/feed?thread_id=" + T4, tok=OWN); om = [m for m in fd["messages"] if m["body"] == "from owner"][0]
+check("feed shows seen_by on owner messages", [x["agent"] for x in om["seen_by"]] == ["pk-b"], om.get("seen_by"))
+s, _r = req("GET", "/v1/messages?peek=1", tok=PA)
+# --- smith-listen.sh ---
+import subprocess, tempfile, os as _os
+_d = tempfile.mkdtemp(); _out = _d + "/got.json"
+open(_d + "/cmd.sh", "w").write("#!/bin/bash\ncat > " + _out + "\n"); _os.chmod(_d + "/cmd.sh", 0o755)
+s, th5 = req("POST", "/v1/threads", {"member_ids": ["pk-a", "pk-b"], "name": "listen"}, OWN); T5 = th5["thread_id"]
+lp = subprocess.Popen(["bash", _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "scripts", "smith-listen.sh"), _d + "/cmd.sh"],
+    env={**_os.environ, "SMITH_URL": sys.argv[1], "SMITH_TOKEN": PB, "SMITH_WAIT": "3"}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(1.5); t0 = time.time()
+req("POST", "/v1/messages", {"thread_id": T5, "from": "pk-a", "to": "*", "type": "note", "body": "listen-ping"}, PA)
+while time.time() - t0 < 6 and "listen-ping" not in (open(_out).read() if _os.path.exists(_out) else ""): time.sleep(0.1)
+lat = time.time() - t0
+got = open(_out).read() if _os.path.exists(_out) else ""
+check("smith-listen runs the command on a new message", "listen-ping" in got, got[:80])
+check("smith-listen latency under 3 s", lat < 3, lat)
+time.sleep(1.0)
+s, pk = req("GET", "/v1/messages?peek=1", tok=PB)
+check("smith-listen acks after the command ran", pk.get("unread") == 0, pk)
+lp.kill()
+s, fa = req("GET", "/v1/threads/" + T4 + "/feed", tok=PB)
+check("agent feed carries no presence or seen_by", "presence" not in fa and all("seen_by" not in m for m in fa["messages"]), list(fa))
+s, ga = req("GET", "/v1/messages?thread_id=" + T4 + "&since=", tok=PB)
+check("agent poll carries no seen_by", all("seen_by" not in m for m in ga.get("messages", [])), None)
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)
