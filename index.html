@@ -13,7 +13,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Smith">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="stylesheet" href="styles.css?v=20261002f">
+<link rel="stylesheet" href="styles.css?v=20261002h">
 </head>
 <body data-theme="mono">
 
@@ -60,7 +60,6 @@
       <button class="iconbtn" id="navAgents" title="Agents" aria-label="Agents">◈</button>
       <button class="iconbtn" id="navAudit" title="Audit log" aria-label="Audit log">≣</button>
       <button class="iconbtn" id="navSettings" title="Settings" aria-label="Settings">⚙</button>
-      <div class="ownerav" title="Instance owner">OW</div>
     </div>
     <div class="installcard" id="installCard" hidden></div>
     <div class="search"><span aria-hidden="true">⌕</span><input id="threadSearch" placeholder="Search chats" aria-label="Search chats"></div>
@@ -99,8 +98,8 @@
       <div class="composer">
         <div class="mentionpop" id="mentionPop" role="listbox" aria-label="Mention someone" hidden></div>
         <button class="cbtn" id="mentionBtn" type="button" aria-label="Mention someone" title="Mention">@</button>
-        <div class="cfield"><input id="composerInput" placeholder="Message…" aria-label="Message" autocomplete="off"></div>
-        <button class="sendbtn" id="sendBtn" aria-label="Send">↑</button>
+        <div class="cfield"><textarea id="composerInput" rows="1" placeholder="Message…" aria-label="Message" autocomplete="off" enterkeyhint="enter"></textarea></div>
+        <button class="sendbtn" id="sendBtn" aria-label="Send"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20V5"/><path d="M5.5 11.5 12 5l6.5 6.5"/></svg></button>
       </div>
     </section>
 
@@ -242,6 +241,6 @@
 <div class="toast" id="toast" hidden></div>
 <div id="modalRoot"></div>
 
-<script src="app.js?v=20261002f"></script>
+<script src="app.js?v=20261002h"></script>
 </body>
 </html>

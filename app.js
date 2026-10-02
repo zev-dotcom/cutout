@@ -210,7 +210,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-02.4";
+var SMITH_BUILD = "2026-10-02.6";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -388,6 +388,22 @@ function bodyHtml(msg){
   });
   return html;
 }
+/* Who a message is addressed to, and what it replies to. */
+var msgIndex = {};
+function toChip(msg){
+  var to = msg.to;
+  if (!to || to === "*") return "";
+  var who = to === "owner" ? "you" : agentLabel(to);
+  if (msg.from === "owner" && to === "owner") return "";
+  return '<span class="tochip">to ' + esc(who) + "</span>";
+}
+function replyChip(msg){
+  if (!msg.reply_to) return "";
+  var r = msgIndex[msg.reply_to];
+  var nm = r ? (r.from === "owner" ? "You" : agentLabel(r.from)) : "earlier message";
+  var tx = r ? String(r.body || "").replace(/\s+/g, " ").slice(0, 70) : "";
+  return '<button type="button" class="rpchip" data-jump="' + esc(msg.reply_to) + '"><b>↩ ' + esc(nm) + "</b>" + (tx ? " " + esc(tx) : "") + "</button>";
+}
 function mentionsMe(msg){
   return !!(msg.metadata && Array.isArray(msg.metadata.mentions) && msg.metadata.mentions.indexOf("owner") >= 0);
 }
@@ -406,13 +422,14 @@ function msgHtml(msg){
   if (mine){
     var lbl = metaLine(msg);
     return '<div class="msgrow msg-out" data-mid="' + esc(msg.id) + '" data-ts="' + esc(msg.created_at || "") + '">' +
+      (msg.to && msg.to !== "*" && msg.to !== "owner" ? '<div class="who out">' + toChip(msg) + "</div>" : "") + replyChip(msg) +
       '<div class="bub">' + bodyHtml(msg) + "</div>" +
       (lbl ? '<div class="rcpt">' + lbl + "</div>" : "") + "</div>";
   }
   var nm = esc(agentLabel(msg.from));
   var plat = agentPlat(msg.from);
   var who = '<div class="who">' + nm +
-    (plat ? ' <span class="plat">' + esc(String(plat).toUpperCase()) + "</span>" : "") + "</div>";
+    (plat ? ' <span class="plat">' + esc(String(plat).toUpperCase()) + "</span>" : "") + toChip(msg) + "</div>" + replyChip(msg);
   var tm = msg.created_at ? '<div class="rcpt"><span class="mt" data-short="' + esc(fmtClock(msg.created_at)) + '" data-full="' + esc(fmtFull(msg.created_at)) + '">' + esc(fmtClock(msg.created_at)) + "</span></div>" : "";
   return '<div class="msgrow them' + (mentionsMe(msg) ? " ment-me" : "") + '" data-mid="' + esc(msg.id) + '">' + who +
     '<div class="bub">' + bodyHtml(msg) + "</div>" + tm + "</div>";
@@ -444,6 +461,7 @@ function appendMessages(msgs, opts){
   msgs.forEach(function(m){
     // Concurrent polls (timer + send) can return the same message twice: render each id once.
     if (m.id && box.querySelector('[data-mid="' + String(m.id).replace(/"/g, "") + '"]')) return;
+    if (m.id) msgIndex[m.id] = { from: m.from, body: m.body };
     var day = fmtDay(m.created_at);
     if (day !== lastDay){
       box.insertAdjacentHTML("beforeend", '<div class="day">' + esc(day) + "</div>");
@@ -675,7 +693,10 @@ function pickMention(i){
 }
 
 /* ---------- composer ---------- */
+var sending = false, draftKey = null;
+function growComposer(){ var i = $("composerInput"); i.style.height = "auto"; i.style.height = Math.min(128, i.scrollHeight) + "px"; }
 async function sendMessage(){
+  if (sending) return;   // a double tap while a send is in flight is ignored
   var tid = state.currentThread;
   var input = $("composerInput");
   var body = input.value.trim();
@@ -684,7 +705,9 @@ async function sendMessage(){
   var members = (t && t.members || []).filter(function(m){ return m.agent_id !== "owner"; });
   var to = members.length === 1 ? members[0].agent_id : "*";
   var mentions = Object.keys(mentionPicks).filter(function(id){ return body.indexOf("@" + mentionPicks[id]) >= 0; });
+  sending = true;
   $("sendBtn").disabled = true;
+  if (!draftKey) draftKey = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
   try {
     await api("POST", "/v1/messages", {
       thread_id: tid,
@@ -693,13 +716,15 @@ async function sendMessage(){
       type: "note",
       body: body,
       ...(mentions.length ? { metadata: { mentions: mentions } } : {}),
-      idempotency_key: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()))
+      idempotency_key: draftKey
     });
-    input.value = ""; mentionPicks = {}; closeMentionPop();
+    draftKey = null;
+    input.value = ""; growComposer(); mentionPicks = {}; closeMentionPop();
     pollThread(); // fetch our own message right away
   } catch(e){
     toast(e.message); // keep the text; nothing is faked
   } finally {
+    sending = false;
     $("sendBtn").disabled = false;
   }
 }
@@ -1436,6 +1461,13 @@ $("issueCodeBtn").addEventListener("click", issuePairing);
 $("rotateTokenBtn").addEventListener("click", rotateToken);
 $("changeInstanceBtn").addEventListener("click", changeInstance);
 $("sendBtn").addEventListener("click", sendMessage);
+var lastTypingPing = 0;
+$("composerInput").addEventListener("input", function(){
+  var now = Date.now();
+  if (!state.currentThread || !this.value || now - lastTypingPing < 3000) return;
+  lastTypingPing = now;
+  api("POST", "/v1/owner/typing", { thread_id: state.currentThread }).catch(function(){});
+});
 $("composerInput").addEventListener("keydown", function(e){
   var open = !$("mentionPop").hidden && mentionCands.length;
   if (open && (e.key === "ArrowDown" || e.key === "ArrowUp")){
@@ -1445,9 +1477,8 @@ $("composerInput").addEventListener("keydown", function(e){
   }
   if (open && (e.key === "Enter" || e.key === "Tab")){ e.preventDefault(); pickMention(mentionSel); return; }
   if (open && e.key === "Escape"){ e.preventDefault(); closeMentionPop(); return; }
-  if (e.key === "Enter" && !e.shiftKey){ e.preventDefault(); sendMessage(); }
 });
-$("composerInput").addEventListener("input", updateMentionPop);
+$("composerInput").addEventListener("input", function(){ growComposer(); draftKey = null; updateMentionPop(); });
 $("composerInput").addEventListener("click", updateMentionPop);
 $("mentionPop").addEventListener("pointerdown", function(e){
   var b = e.target.closest(".mrow"); if (!b) return;
@@ -1472,6 +1503,12 @@ document.addEventListener("visibilitychange", function(){
   }
 });
 document.addEventListener("click", function(e){
+  var jb = e.target.closest && e.target.closest(".rpchip");
+  if (jb){
+    var tgt = $("threadMsgs").querySelector('[data-mid="' + String(jb.dataset.jump).replace(/"/g, "") + '"]');
+    if (tgt){ tgt.scrollIntoView({block: "center", behavior: "smooth"}); tgt.classList.add("flash"); setTimeout(function(){ tgt.classList.remove("flash"); }, 1400); }
+    return;
+  }
   var row = e.target.closest && e.target.closest(".msgrow[data-mid]");
   if (!row || e.target.closest("a,button")) return;
   var mt = row.querySelector(".mt");
