@@ -31,7 +31,7 @@ body{min-height:0}
 <p class="fine">Takes about a minute. First time? You will create your owner token in step 2.</p>
 <h2>Three steps</h2><ol class="st"><li><div><b>Add Smith to your home screen</b><span>It opens like an app and can send you notifications.</span></div></li>
 <li><div><b>Connect it to your address</b><span>Open your setup link, or paste your Smith address and owner token.</span></div></li>
-<li><div><b>Start chatting and turn on notifications</b><span>Message your agents from one inbox and hear back right away.</span></div></li></ol><h2 id="ldIosH">On iPhone</h2><div class="card" id="ldIos"><ol class="st"><li><div><b>Tap Share in Safari</b><span>The square with an arrow.</span></div></li><li><div><b>Choose <span class="glyph" style="color:var(--ink)">Add to Home Screen</span></b><span>Scroll down in the share sheet.</span></div></li><li><div><b>Tap Add, then open Smith</b><span>Use the home-screen icon from now on.</span></div></li></ol></div><div class="after"><div class="ico">&#8962;</div><div><b>Already set up?</b><span>Open Smith from your home screen. Your chats, notifications and settings live there.</span></div></div></div>
+<li><div><b>Start chatting and turn on notifications</b><span>Message your agents from one inbox and hear back right away.</span></div></li></ol><h2 id="ldIosH">On iPhone</h2><div class="card" id="ldIos"><ol class="st"><li><div><b>Tap Share</b><span>The square with an arrow, in Safari. Chrome and Edge have it in the browser menu.</span></div></li><li><div><b>Choose <span class="glyph" style="color:var(--ink)">Add to Home Screen</span></b><span>Scroll down in the share sheet.</span></div></li><li><div><b>Tap Add, then open Smith</b><span>Use the home-screen icon from now on.</span></div></li></ol></div><div class="after"><div class="ico">&#8962;</div><div><b>Already set up?</b><span>Open Smith from your home screen. Your chats, notifications and settings live there.</span></div></div></div>
 <script>
 (function(){
 var inst=null,btn=document.getElementById("ldInstall"),msg=document.getElementById("ldMsg"),ios=document.getElementById("ldIos"),iosH=document.getElementById("ldIosH");
@@ -39,15 +39,19 @@ var isIOS=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==="M
 var standalone=(window.matchMedia&&window.matchMedia("(display-mode: standalone)").matches)||navigator.standalone===true;
 if(standalone){location.replace("./");return;}
 function say(t){msg.textContent=t;msg.hidden=false;}
-window.addEventListener("beforeinstallprompt",function(e){e.preventDefault();inst=e;ios.hidden=true;iosH.hidden=true;});
-window.addEventListener("appinstalled",function(){location.replace("./");});
+var MENU="Use your browser menu, then Install app or Add to Home screen.";
+var safariDesk=!isIOS&&/Safari\//.test(navigator.userAgent)&&!/Chrome|Chromium|Edg|Firefox/.test(navigator.userAgent);
+window.addEventListener("beforeinstallprompt",function(e){e.preventDefault();inst=e;ios.hidden=true;iosH.hidden=true;msg.hidden=true;});
+window.addEventListener("appinstalled",function(){inst=null;say("Installed. Open Smith from your home screen or app list.");});
 btn.addEventListener("click",function(ev){
-  if(inst){ev.preventDefault();var d=inst;inst=null;d.prompt();
-    if(d.userChoice)d.userChoice.then(function(c){if(c&&c.outcome==="accepted")say("Installed. Open Smith from your home screen or app list.");else{inst=d;say("Install cancelled. Tap Install Smith to try again.");}});
+  if(inst){ev.preventDefault();var d=inst;inst=null;
+    try{var r=d.prompt();if(r&&r.catch)r.catch(function(){});
+      if(d.userChoice)d.userChoice.then(function(c){say(c&&c.outcome==="accepted"?"Installed. Open Smith from your home screen or app list.":MENU);},function(){say(MENU);});
+    }catch(x){say(MENU);}
     return;}
   ev.preventDefault();
-  if(isIOS){ios.hidden=false;iosH.hidden=false;iosH.scrollIntoView({behavior:"smooth",block:"start"});say("Follow the three iPhone steps below, in Safari.");return;}
-  say("Use your browser menu and choose Install app (or Add to Home screen). Then open Smith from there.");
+  if(isIOS){ios.hidden=false;iosH.hidden=false;iosH.scrollIntoView({behavior:"smooth",block:"start"});say("Follow the three steps below. Safari is recommended.");return;}
+  say(safariDesk?"In Safari, choose File, then Add to Dock.":MENU);
 });
 if(!isIOS){iosH.textContent="On iPhone or iPad";}
 })();
