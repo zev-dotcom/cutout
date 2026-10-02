@@ -262,3 +262,6 @@ input,select,textarea{font-family:inherit}
   .sigdots.live{animation:none!important}
   .tdots span{animation:none!important;opacity:.7}
 }
+
+/* hidden attribute must win over display:flex rules (setup card stayed visible) */
+[hidden]{display:none !important}

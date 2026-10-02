@@ -1794,7 +1794,23 @@ async function route(req, arrivedAt) {
     error: "not found"
   }));
 }
+// CORS: exact-origin allowlist for the hosted Smith web client. No wildcard.
+const CORS_ORIGIN = "https://zev-dotcom.github.io";
+function corsHeaders(req) {
+  if (req.headers.get("origin") !== CORS_ORIGIN) return null;
+  return {
+    "access-control-allow-origin": CORS_ORIGIN,
+    "access-control-allow-headers": "Authorization, X-Agent-Id, Content-Type",
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-max-age": "600",
+    "vary": "Origin"
+  };
+}
 Deno.serve(async (req)=>{
+  if (req.method === "OPTIONS") {
+    const ch = corsHeaders(req);
+    return ch ? new Response(null, { status: 204, headers: ch }) : jres(404, { error: "not found" });
+  }
   const arrivedAt = Date.now();
   const startupAt = Date.now();
   await startupPurge;
@@ -1822,5 +1838,7 @@ Deno.serve(async (req)=>{
     console.error("rate header read failed", e);
   }
   console.log(`cutout response_ms=${Date.now() - arrivedAt} status=${res.status}`);
+  const ch = corsHeaders(req);
+  if (ch) for (const [k, v] of Object.entries(ch)) res.headers.set(k, v);
   return res;
 });
