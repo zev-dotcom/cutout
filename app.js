@@ -109,22 +109,30 @@ function token(){
   var c = loadCfg();
   return c ? c.token : "";
 }
-async function api(method, path, body){
-  var res = await fetch(baseUrl() + path, {
-    method: method,
-    headers: {
-      "Authorization": "Bearer " + token(),
-      "Content-Type": "application/json"
-    },
-    body: body == null ? undefined : JSON.stringify(body)
-  });
+async function api(method, path, body, timeoutMs){
+  var ctl = timeoutMs ? new AbortController() : null, timer = ctl ? setTimeout(function(){ ctl.abort(); }, timeoutMs) : null;
+  var res;
+  try {
+    res = await fetch(baseUrl() + path, {
+      method: method,
+      headers: {
+        "Authorization": "Bearer " + token(),
+        "Content-Type": "application/json"
+      },
+      body: body == null ? undefined : JSON.stringify(body),
+      signal: ctl ? ctl.signal : undefined
+    });
+  } catch(e){
+    if (ctl && ctl.signal.aborted){ var te = new Error("Timed out. Check your connection."); te.timeout = true; throw te; }
+    throw e;
+  } finally { if (timer) clearTimeout(timer); }
   var data = null;
   try { data = await res.json(); } catch(e){ /* non-JSON */ }
   if (!res.ok){
     var msg = (data && data.error) ? data.error : ("HTTP " + res.status);
     if (res.status === 401) msg = "Owner token rejected (401). Check the token in Settings.";
     if (res.status === 403) msg = "Forbidden (403): " + msg;
-    throw new Error(msg);
+    var err = new Error(msg); err.status = res.status; throw err;
   }
   return data;
 }
@@ -286,7 +294,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-02.11";
+var SMITH_BUILD = "2026-10-02.12";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -698,6 +706,15 @@ function appendMessages(msgs, opts){
     // Concurrent polls (timer + send) can return the same message twice: render each id once.
     if (m.id && box.querySelector('[data-mid="' + String(m.id).replace(/"/g, "") + '"]')) return;
     if (m.id) indexMsg(m);
+    if (m.from === "owner"){
+      // The server copy of a message we are still sending (stream or poll beat the POST reply): drop the temporary
+      // bubble. Matched by the client key we put in metadata; body text only for copies that carry no key.
+      var ck = m.metadata && m.metadata.client_key;
+      var pend = Array.prototype.filter.call(box.querySelectorAll(".msgrow[data-pk]"), function(r){
+        return ck ? r.dataset.pk === ck : (r.classList.contains("pending") && r.dataset.pbody === m.body);
+      })[0];
+      if (pend){ delete pendingSends[pend.dataset.pk]; outboxDrop(pend.dataset.pk); pend.remove(); }
+    }
     var day = fmtDay(m.created_at);
     if (day !== lastDay){
       box.insertAdjacentHTML("beforeend", '<div class="day">' + esc(day) + "</div>");
@@ -773,6 +790,7 @@ function openThread(tid){
       }
       setWorking(feed.working);
       markRead(tid, msgs);
+      resumeOutbox(tid);
       startThreadPoll();
     })
     .catch(function(e){ toast(e.message); });
@@ -929,40 +947,105 @@ function pickMention(i){
 }
 
 /* ---------- composer ---------- */
-var sending = false, draftKey = null;
+var draftKey = null;
 function growComposer(){ var i = $("composerInput"); i.style.height = "auto"; i.style.height = Math.min(128, i.scrollHeight) + "px"; }
-async function sendMessage(){
-  if (sending) return;   // a double tap while a send is in flight is ignored
+/* Optimistic send: the bubble shows at once as "Sending…", the POST runs in the background and the
+   server's id replaces the temporary one. A failed send stays on screen with a tap-to-retry that reuses
+   the same idempotency key, so a retry (or a double tap) can never post twice. */
+var pendingSends = {};
+var OUTBOX_KEY = "smith.outbox";
+function loadOutbox(){ try { return JSON.parse(localStorage.getItem(OUTBOX_KEY) || "{}") || {}; } catch(e){ return {}; } }
+function saveOutbox(o){ try { localStorage.setItem(OUTBOX_KEY, JSON.stringify(o)); } catch(e){} }
+function outboxAdd(p){ var o = loadOutbox(); o[p.key] = { key: p.key, tid: p.tid, body: p.body, to: p.to, mentions: p.mentions, at: p.at }; saveOutbox(o); }
+function outboxDrop(key){ var o = loadOutbox(); if (o[key]){ delete o[key]; saveOutbox(o); } }
+var sendChain = {};   // per thread: POSTs go out in tap order
+function pendingRow(p){
+  var box = $("threadMsgs");
+  var row = box.querySelector('[data-pk="' + CSS.escape(p.key) + '"]');
+  return row;
+}
+function showPending(p){
+  var box = $("threadMsgs");
+  var msg = { id: "pending-" + p.key, from: "owner", to: p.to, type: "note", body: p.body, created_at: p.at, metadata: p.mentions.length ? { mentions: p.mentions } : {} };
+  var day = fmtDay(p.at), lastDay = box.dataset.lastday || "";
+  if (day !== lastDay){ box.insertAdjacentHTML("beforeend", '<div class="day">' + esc(day) + "</div>"); box.dataset.lastday = day; }
+  box.insertAdjacentHTML("beforeend", msgHtml(msg));
+  var rows = box.querySelectorAll(".msgrow.msg-out"), row = rows[rows.length - 1];
+  row.classList.add("pending"); row.dataset.pk = p.key; row.dataset.pbody = p.body; row.removeAttribute("data-mid");
+  var r = row.querySelector(".rcpt"); if (!r){ r = document.createElement("div"); r.className = "rcpt"; row.appendChild(r); }
+  r.textContent = "Sending…";
+  box.scrollTop = box.scrollHeight;
+}
+function markFailed(p, text){
+  if (text) toast(text);
+  var row = pendingRow(p); if (!row) return;
+  row.classList.remove("pending"); row.classList.add("failed");
+  var r = row.querySelector(".rcpt"); if (r) r.innerHTML = '<button type="button" class="retrybtn">Not sent. Tap to retry</button>';
+  var btn = row.querySelector(".retrybtn");
+  if (btn) btn.onclick = function(){ row.classList.remove("failed"); row.classList.add("pending"); r.textContent = "Sending…"; postPending(p); };
+}
+function postPending(p){
+  // Serialize per thread so a slow first send cannot be overtaken by a quick second one.
+  var prev = sendChain[p.tid] || Promise.resolve();
+  var cur = prev.then(function(){ return doPost(p); });
+  sendChain[p.tid] = cur.catch(function(){});
+  return cur;
+}
+async function doPost(p){
+  try {
+    var res = await api("POST", "/v1/messages", {
+      thread_id: p.tid, from: "owner", to: p.to, type: "note", body: p.body,
+      metadata: { client_key: p.key, ...(p.mentions.length ? { mentions: p.mentions } : {}) },
+      idempotency_key: p.key
+    }, 15000); // a hung request becomes "Not sent" so the queue keeps moving; the same key makes the retry safe
+    delete pendingSends[p.key]; outboxDrop(p.key);
+    var row = pendingRow(p);
+    if (p.tid !== state.currentThread){ if (row) row.remove(); return; }
+    var real = { id: res.id, from: "owner", to: p.to, type: "note", body: p.body, created_at: res.created_at || p.at,
+      metadata: { client_key: p.key, ...(p.mentions.length ? { mentions: p.mentions } : {}) } };
+    if ($("threadMsgs").querySelector('[data-mid="' + CSS.escape(String(res.id)) + '"]')){ if (row) row.remove(); return; } // the stream got there first
+    if (row) row.remove();
+    appendMessages([real]);
+    $("threadMsgs").scrollTop = $("threadMsgs").scrollHeight;
+    pollThread(); // pick up receipts and anything else, off the critical path
+  } catch(e){
+    // A definite refusal (400, 404, 413, 422) will not succeed on its own: do not keep it for auto-resend.
+    if (e.status === 400 || e.status === 404 || e.status === 413 || e.status === 422){ delete pendingSends[p.key]; outboxDrop(p.key); } // 401/403 keep it: a fixed token must not lose the text
+    markFailed(p, e.message);
+  }
+}
+/* Sends that never got an answer (thread left, reload, app killed): show them again and send once more with
+   the same key. The server treats the key as the same message, so nothing is posted twice and nothing is lost. */
+function resumeOutbox(tid){
+  var o = loadOutbox(), now = Date.now(), expired = 0;
+  Object.keys(o).forEach(function(k){
+    var p = o[k], age = now - Date.parse(p.at);
+    if (age > 24 * 3600 * 1000){ outboxDrop(k); expired++; return; }
+    if (p.tid !== tid) return;
+    var box = $("threadMsgs");
+    if (box.querySelector('[data-pk="' + CSS.escape(p.key) + '"]')) return;
+    p.mentions = p.mentions || [];
+    showPending(p);
+    if (pendingSends[p.key] || age < 10 * 60 * 1000){ pendingSends[p.key] = p; postPending(p); }
+    else { pendingSends[p.key] = p; markFailed(p); }   // old: let the person decide, it may be stale
+  });
+  if (expired) toast(expired === 1 ? "An unsent message from over a day ago was discarded." : expired + " unsent messages from over a day ago were discarded.");
+}
+function sendMessage(){
   var tid = state.currentThread;
   var input = $("composerInput");
   var body = input.value.trim();
-  if (!tid || !body) return;
+  if (!tid || !body) return;   // a double tap finds the composer already empty
   var t = state.threadById[tid];
   var members = (t && t.members || []).filter(function(m){ return m.agent_id !== "owner"; });
   var to = members.length === 1 ? members[0].agent_id : "*";
   var mentions = Object.keys(mentionPicks).filter(function(id){ return body.indexOf("@" + mentionPicks[id]) >= 0; });
-  sending = true;
-  $("sendBtn").disabled = true;
-  if (!draftKey) draftKey = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
-  try {
-    await api("POST", "/v1/messages", {
-      thread_id: tid,
-      from: "owner",
-      to: to,
-      type: "note",
-      body: body,
-      ...(mentions.length ? { metadata: { mentions: mentions } } : {}),
-      idempotency_key: draftKey
-    });
-    draftKey = null;
-    input.value = ""; growComposer(); mentionPicks = {}; closeMentionPop();
-    pollThread(); // fetch our own message right away
-  } catch(e){
-    toast(e.message); // keep the text; nothing is faked
-  } finally {
-    sending = false;
-    $("sendBtn").disabled = false;
-  }
+  var p = { key: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()), tid: tid, body: body, to: to,
+    mentions: mentions, at: new Date().toISOString() };
+  pendingSends[p.key] = p; outboxAdd(p);
+  input.value = ""; growComposer(); mentionPicks = {}; closeMentionPop(); draftKey = null;
+  showPending(p);
+  postPending(p);
 }
 
 /* ---------- thread management ---------- */

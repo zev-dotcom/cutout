@@ -422,3 +422,6 @@ html,body{overflow-x:hidden}
 .hostconfirm[hidden]{display:none}
 .chathead .stack .avatar{width:30px;height:30px;font-size:12px}
 .chathead .stack .avatar:nth-child(3){width:26px;height:26px;font-size:10px}
+.msgrow.pending .bub{opacity:.6}
+.msgrow.failed .bub{outline:2px solid var(--danger);outline-offset:1px}
+.retrybtn{background:none;border:none;padding:2px 0;font:inherit;font-weight:600;color:var(--danger);cursor:pointer}
