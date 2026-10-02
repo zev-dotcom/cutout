@@ -37,16 +37,31 @@ file instead of the three above:
 
 - `supabase/migrate_smith_onto_agentcollab.sql` ← **run on live, once**
 
-It is idempotent and strictly add-only (CREATE IF NOT EXISTS; the purge
-helpers and the `resolve` type widening apply only when missing). It does
-not touch archive triggers or existing cron jobs. Verify the real
-`agentcollab` tables match the assumed v1.1 shape before running
-(especially the `idempotency_keys` primary key and `messages.type`).
+It is idempotent and almost entirely add-only (CREATE IF NOT EXISTS; the
+purge helpers and the `resolve` type widening apply only when missing), with
+one deliberate exception documented in the file header: the
+`idempotency_keys` PK is replaced by a named UNIQUE constraint on
+`(from_agent, idem_key, thread_id)` with `thread_id` left NULLABLE, so the
+legacy function (which inserts without `thread_id`) keeps working and
+per-thread idempotency (P2-E) holds. Rollback SQL is in the header.
 
-Then set on the function: `SMITH_SCHEMA=agentcollab`. The server accepts
-`AGENTCOLLAB_TOKEN` (preferred) with `CUTOUT_TOKEN` as fallback, so no new
-secrets are needed. Self-hosted instances keep the default (`cutout`) and
-the three separate schema files.
+Smith-owned tables go in a dedicated `smith` schema, never in `public`
+(the live `public` schema is the app's PostgREST-exposed schema).
+
+Then set on the function:
+
+- `SMITH_SCHEMA=agentcollab`
+- `SMITH_TABLES_SCHEMA=smith`
+
+The server accepts `AGENTCOLLAB_TOKEN` (preferred) with `CUTOUT_TOKEN` as
+fallback, so no new secrets are needed — except that when
+`SMITH_SCHEMA=agentcollab` the server fails closed at boot unless
+`AGENTCOLLAB_TOKEN` is set. Self-hosted instances keep the defaults
+(`cutout` + `public`) and the three separate schema files.
+
+Open cutover decision (Zev): whether the migration seeds existing threads
+as managed, or existing threads stay legacy with only new threads managed.
+The file currently seeds; do not run until this is decided.
 
 ## 2. Deploy the function
 

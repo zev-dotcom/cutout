@@ -39,6 +39,13 @@ Set `SMITH_SCHEMA=agentcollab` when deploying against the live bus schema,
 after running `supabase/migrate_smith_onto_agentcollab.sql` (see
 deploy-checklist.md).
 
+Smith-owned tables (`smith_agents`, `smith_threads`, …) live in a second
+selectable schema via `SMITH_TABLES_SCHEMA` (default `public`). Set
+`SMITH_TABLES_SCHEMA=smith` when the database's `public` schema is shared
+with an app (e.g. PostgREST-exposed). Both values are validated at startup;
+`pg_*` and `information_schema` are rejected, and the bus schema may not be
+`public`.
+
 Optional hardening knobs (defaults are production-safe):
 
 ```bash

@@ -1,21 +1,47 @@
 -- Smith v1: bring the LIVE agentcollab schema up to Smith level.
 -- Option A (deploy-compat): the Smith edge function runs against the live
--- `agentcollab` schema when SMITH_SCHEMA=agentcollab. Run this file (once) on
--- the live Supabase project via the SQL editor, BEFORE deploying the
--- schema-aware function build. Idempotent and strictly add-only:
+-- `agentcollab` bus schema with SMITH_SCHEMA=agentcollab and
+-- SMITH_TABLES_SCHEMA=smith. Run this file (once) on the live Supabase
+-- project via the SQL editor, BEFORE deploying the schema-aware function
+-- build. Idempotent.
+--
+-- Mostly add-only:
 --   - base bus tables / indexes: CREATE IF NOT EXISTS only
 --   - purge helpers: created only if the live schema lacks them
 --   - message type check: widened only if 'resolve' is not already allowed
---   - Smith tables (smith_*): created in the default schema, IF NOT EXISTS
+--   - Smith tables (smith.*): created IF NOT EXISTS in a DEDICATED `smith`
+--     schema, never in `public` (the live `public` schema belongs to
+--     another app and is PostgREST-exposed)
 --   - seeds: INSERT ... ON CONFLICT DO NOTHING from agentcollab.messages
 -- Untouched: archive triggers, existing cron jobs (no pg_cron statements
--- below), existing constraints and data. No DROP of live objects.
+-- below), existing data. No DROP of live objects EXCEPT the
+-- idempotency_keys PK swap documented below.
+--
+-- IDEMPOTENCY (not add-only, deliberate): the live PK on
+-- idempotency_keys(from_agent, idem_key) is replaced by a UNIQUE constraint
+-- on (from_agent, idem_key, thread_id). Rationale:
+--   - P2-E (locked, tested): idempotency is scoped to (from, key, thread);
+--     the same key reused in a different thread must INSERT, which the old
+--     PK forbids. The old PK cannot stay.
+--   - thread_id stays NULLABLE so the live legacy function v15 (which
+--     inserts without thread_id) keeps working; NULLs never conflict in the
+--     unique index, so legacy rows are unaffected.
+-- Rollback to v15: drop the unique constraint and re-add the old PK --
+--   alter table agentcollab.idempotency_keys
+--     drop constraint idempotency_keys_from_key_thread_uniq;
+--   alter table agentcollab.idempotency_keys
+--     add constraint idempotency_keys_pkey primary key (from_agent, idem_key);
+-- (fails if Smith inserted the same key in two threads during the window;
+-- check first).
 --
 -- Builder: verify the real agentcollab tables/columns match the assumed v1.1
 -- shape before running (especially idempotency_keys PK and messages.type).
 
 -- Cutout bus schema (SPEC v1). Dedicated schema in the existing Supabase project.
 create schema if not exists agentcollab;
+
+-- Smith-owned tables live in their own schema, away from PostgREST.
+create schema if not exists smith;
 
 create table if not exists agentcollab.messages (
   id          text primary key,                 -- msg_<ulid>
@@ -78,6 +104,9 @@ end $mig$;
 -- and erases their URL).
 -- A link whose expires_at does not parse never counts as expired.
 -- Add-only: only created when the live schema does not already define it.
+-- NOTE: this creates agentcollab.purge only if missing; it never replaces an
+-- existing live purge function. Verify the live agentcollab.purge (if any)
+-- does not conflict with Smith's retention semantics before deploying.
 do $mig$ begin
   if not exists (
     select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
@@ -144,10 +173,10 @@ create index if not exists receipts_msg_at_idx on agentcollab.receipts (message_
 alter table agentcollab.idempotency_keys enable row level security;
 
 -- Smith v1 schema: identity, pairing, thread ACLs, activity, owner audit.
--- Run after schema.sql + schema_v1.1.sql. Idempotent.
--- Single owner per instance; anyone can run their own instance.
+-- All Smith-owned objects live in the dedicated `smith` schema (see header).
+-- Idempotent. Single owner per instance; anyone can run their own instance.
 
-create table if not exists smith_agents (
+create table if not exists smith.smith_agents (
   agent_id     text primary key,                       -- e.g. 'koda', 'i2'
   display_name text not null,
   platform     text not null default 'unknown',        -- Muse, Instinct, Grokbot…
@@ -156,73 +185,73 @@ create table if not exists smith_agents (
   revoked_at   timestamptz,
   legacy_unverified boolean not null default false     -- true when seeded from unverified legacy sender fields
 );
-alter table smith_agents add column if not exists legacy_unverified boolean not null default false;
-create index if not exists smith_agents_token_idx on smith_agents (token_hash);
+alter table smith.smith_agents add column if not exists legacy_unverified boolean not null default false;
+create index if not exists smith_agents_token_idx on smith.smith_agents (token_hash);
 
-create table if not exists smith_pairings (
+create table if not exists smith.smith_pairings (
   id          text primary key,                        -- pg_ + ulid-ish
   code_hash   text not null unique,                    -- sha256 hex of the code
-  agent_id    text not null references smith_agents(agent_id),
+  agent_id    text not null references smith.smith_agents(agent_id),
   expires_at  timestamptz not null,
   redeemed_at timestamptz,
   locked_at   timestamptz,                             -- set after too many failed redeem attempts
   created_at  timestamptz not null default now()
 );
-alter table smith_pairings add column if not exists locked_at timestamptz;
+alter table smith.smith_pairings add column if not exists locked_at timestamptz;
 
 -- Failed unauthenticated auth attempts (pairing redeem, owner claim).
 -- Backs the global brute-force budgets; pruned to the last hour on each attempt.
-create table if not exists smith_auth_attempts (
+create table if not exists smith.smith_auth_attempts (
   id        bigserial primary key,
   kind      text not null,                             -- 'redeem' or 'claim'
   code_hash text,                                      -- redeem code hash; null for claim/invalid
   at        timestamptz not null default now()
 );
-create index if not exists smith_auth_attempts_kind_at_idx on smith_auth_attempts (kind, at desc);
+create index if not exists smith_auth_attempts_kind_at_idx on smith.smith_auth_attempts (kind, at desc);
 
-create table if not exists smith_threads (
+create table if not exists smith.smith_threads (
   thread_id  text primary key,
   name       text,
   created_by text,
   created_at timestamptz not null default now()
 );
 
-create table if not exists smith_thread_members (
-  thread_id text not null references smith_threads(thread_id) on delete cascade,
+create table if not exists smith.smith_thread_members (
+  thread_id text not null references smith.smith_threads(thread_id) on delete cascade,
   agent_id  text not null,
   added_at  timestamptz not null default now(),
   legacy_unverified boolean not null default false,    -- true when seeded from unverified legacy sender fields
   primary key (thread_id, agent_id)
 );
-alter table smith_thread_members add column if not exists legacy_unverified boolean not null default false;
-create index if not exists smith_members_agent_idx on smith_thread_members (agent_id);
+alter table smith.smith_thread_members add column if not exists legacy_unverified boolean not null default false;
+create index if not exists smith_members_agent_idx on smith.smith_thread_members (agent_id);
 
-create table if not exists smith_activity (
+create table if not exists smith.smith_activity (
   thread_id  text not null,
   agent_id   text not null,
   started_at timestamptz not null default now(),
   expires_at timestamptz not null,
   primary key (thread_id, agent_id)
 );
-create index if not exists smith_activity_expiry_idx on smith_activity (expires_at);
+create index if not exists smith_activity_expiry_idx on smith.smith_activity (expires_at);
 
 -- One row per instance. The raw token is shown once by the mint script;
 -- only the hash lives here.
-create table if not exists smith_owner (
+create table if not exists smith.smith_owner (
   id         int primary key default 1 check (id = 1),
   token_hash text not null,
   created_at timestamptz not null default now()
 );
 
 -- Append-only audit log. No route deletes rows.
-create table if not exists smith_audit (
+create table if not exists smith.smith_audit (
   id     bigserial primary key,
   at     timestamptz not null default now(),
   actor  text not null,                                 -- 'owner' or agent_id
   action text not null,                                 -- read_thread, issue_pairing, …
   detail jsonb not null default '{}'::jsonb
 );
-create index if not exists smith_audit_at_idx on smith_audit (at desc);
+create index if not exists smith_audit_at_idx on smith.smith_audit (at desc);
 
 -- Migrate every pre-existing thread into managed threads, seeding members
 -- from the agent ids already seen on each thread (excluding broadcasts).
@@ -231,16 +260,16 @@ create index if not exists smith_audit_at_idx on smith_audit (at desc);
 -- Strict (P1-2): unverified seeded members get no thread access until verified.
 -- added_at '-infinity' marks pre-existing participants: they see full history
 -- (P1-3); explicitly added members default to now() and see history from join.
-insert into smith_threads (thread_id, created_by)
+insert into smith.smith_threads (thread_id, created_by)
 select distinct thread_id, null from agentcollab.messages
 on conflict (thread_id) do nothing;
 
-insert into smith_thread_members (thread_id, agent_id, legacy_unverified, added_at)
+insert into smith.smith_thread_members (thread_id, agent_id, legacy_unverified, added_at)
 select distinct thread_id, from_agent, true, '-infinity'::timestamptz from agentcollab.messages
 where from_agent is not null and from_agent <> '*'
 on conflict do nothing;
 
-insert into smith_thread_members (thread_id, agent_id, legacy_unverified, added_at)
+insert into smith.smith_thread_members (thread_id, agent_id, legacy_unverified, added_at)
 select distinct thread_id, to_agent, true, '-infinity'::timestamptz from agentcollab.messages
 where to_agent is not null and to_agent <> '*'
 on conflict do nothing;
@@ -248,33 +277,31 @@ on conflict do nothing;
 -- Seed agent rows for ids already on the bus so re-pairing is a rotation,
 -- not a duplicate. token_hash stays null until the owner issues a pairing
 -- code; null means "known id, no Smith token yet".
-insert into smith_agents (agent_id, display_name, platform, token_hash, legacy_unverified)
+insert into smith.smith_agents (agent_id, display_name, platform, token_hash, legacy_unverified)
 select distinct from_agent, from_agent, 'unknown', null, true from agentcollab.messages
 where from_agent is not null and from_agent <> '*'
 on conflict (agent_id) do nothing;
 
--- Append-only audit log: no route deletes rows, and the database itself
--- rejects UPDATE and DELETE so a compromised function cannot rewrite history.
 -- P2-E: scope idempotency keys to (from_agent, idem_key, thread_id) so a reused
 -- key in a different thread creates a new message instead of returning the old
--- thread's message id. The PK constraint is named explicitly so the idempotence
--- guard matches on re-run (an unnamed ADD PRIMARY KEY would be created as
--- idempotency_keys_pkey and the guard would never match, dropping and
--- re-adding the PK on every migration). The whole block runs in one
--- transaction so a re-run can never leave the table without its PK.
+-- thread's message id. See the header for why the old PK is replaced (not kept)
+-- and why thread_id stays nullable. The unique constraint is named explicitly
+-- so the idempotence guard matches on re-run. The whole block runs in one
+-- transaction so a re-run can never leave the table without its uniqueness.
 begin;
 alter table agentcollab.idempotency_keys add column if not exists thread_id text;
 update agentcollab.idempotency_keys k set thread_id = m.thread_id
   from agentcollab.messages m where m.id = k.message_id and k.thread_id is null;
-alter table agentcollab.idempotency_keys alter column thread_id set not null;
 alter table agentcollab.idempotency_keys drop constraint if exists idempotency_keys_pkey;
 do $$ begin
   if not exists (
     select 1 from pg_constraint
     where conrelid = 'agentcollab.idempotency_keys'::regclass
-      and conname = 'idempotency_keys_from_key_thread_pkey'
+      and conname = 'idempotency_keys_from_key_thread_uniq'
   ) then
-    alter table agentcollab.idempotency_keys add constraint idempotency_keys_from_key_thread_pkey primary key (from_agent, idem_key, thread_id);
+    alter table agentcollab.idempotency_keys
+      add constraint idempotency_keys_from_key_thread_uniq
+      unique (from_agent, idem_key, thread_id);
   end if;
 end $$;
 commit;
@@ -285,23 +312,25 @@ commit;
 alter table agentcollab.rate_log add column if not exists identity text;
 create index if not exists rate_log_identity_at_idx on agentcollab.rate_log (identity, at desc);
 
-create or replace function smith_audit_deny_write() returns trigger as $$
+-- Append-only audit log: no route deletes rows, and the database itself
+-- rejects UPDATE and DELETE so a compromised function cannot rewrite history.
+create or replace function smith.smith_audit_deny_write() returns trigger as $$
 begin
   raise exception 'smith_audit is append-only';
 end; $$ language plpgsql;
-drop trigger if exists smith_audit_no_update_delete on smith_audit;
-create trigger smith_audit_no_update_delete before update or delete on smith_audit
-  for each row execute function smith_audit_deny_write();
+drop trigger if exists smith_audit_no_update_delete on smith.smith_audit;
+create trigger smith_audit_no_update_delete before update or delete on smith.smith_audit
+  for each row execute function smith.smith_audit_deny_write();
 -- P2-7: TRUNCATE is also blocked (row-level triggers do not fire on TRUNCATE).
-drop trigger if exists smith_audit_no_truncate on smith_audit;
-create trigger smith_audit_no_truncate before truncate on smith_audit
-  for each statement execute function smith_audit_deny_write();
+drop trigger if exists smith_audit_no_truncate on smith.smith_audit;
+create trigger smith_audit_no_truncate before truncate on smith.smith_audit
+  for each statement execute function smith.smith_audit_deny_write();
 
-alter table smith_agents enable row level security;
-alter table smith_pairings enable row level security;
-alter table smith_threads enable row level security;
-alter table smith_thread_members enable row level security;
-alter table smith_activity enable row level security;
-alter table smith_owner enable row level security;
-alter table smith_audit enable row level security;
-alter table smith_auth_attempts enable row level security;
+alter table smith.smith_agents enable row level security;
+alter table smith.smith_pairings enable row level security;
+alter table smith.smith_threads enable row level security;
+alter table smith.smith_thread_members enable row level security;
+alter table smith.smith_activity enable row level security;
+alter table smith.smith_owner enable row level security;
+alter table smith.smith_audit enable row level security;
+alter table smith.smith_auth_attempts enable row level security;

@@ -39,8 +39,9 @@ already applied), then exercises the Smith contract end to end:
      (run with the no-setup-key flag against a keyless server)
  23. Round-3 P2s: fail-closed default for a missing member row; failed-auth
      traffic under the fixed 'unauthenticated' rate bucket; all legacy
-     callers in one bucket regardless of X-Agent-Id; named idempotency PK
-     with an idempotent migration re-run
+     callers in one bucket regardless of X-Agent-Id; named idempotency
+     uniqueness (PK on fresh installs, unique constraint on the live-migration
+     path) with an idempotent migration re-run
 
 Setup: Postgres with schema.sql + schema_v1.1.sql + schema_smith.sql applied,
 then e.g.:
@@ -66,6 +67,7 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 SETUP_KEY = sys.argv[2] if len(sys.argv) > 2 else "test-setup-key-001"
 BUS_TOKEN = sys.argv[3] if len(sys.argv) > 3 else "test-bus-token-001"
 SCHEMA = os.environ.get("SMITH_SCHEMA", "cutout")  # bus-table schema under test
+TABLES_SCHEMA = os.environ.get("SMITH_TABLES_SCHEMA", "public")  # Smith-owned tables schema under test
 
 PASS = []
 FAIL = []
@@ -167,14 +169,14 @@ check("bad sm_agt_ token -> 401 (no legacy fallthrough)", s == 401, f"{s}")
 # P1-5: failed-auth audit is deduped per class and uses a fixed actor
 s, _ = req("GET", "/v1/threads", headers=bearer("sm_own_deadbeef2"))
 s, _ = req("GET", "/v1/threads", headers=bearer("sm_own_deadbeef3"))
-ok, out = psql("SELECT count(*) FROM smith_audit WHERE action='auth_failed' AND detail->>'credential_class'='owner';")
+ok, out = psql(f"SELECT count(*) FROM {TABLES_SCHEMA}.smith_audit WHERE action='auth_failed' AND detail->>'credential_class'='owner';")
 check("failed owner-auth audit deduped (rapid repeats, still 1 row)", ok and out.strip() == "1", out)
-ok, out = psql("SELECT count(*) FROM smith_audit WHERE action='auth_failed' AND detail->>'credential_class'='agent';")
+ok, out = psql(f"SELECT count(*) FROM {TABLES_SCHEMA}.smith_audit WHERE action='auth_failed' AND detail->>'credential_class'='agent';")
 check("failed agent auth audited consistently with owner", ok and out.strip() == "1", out)
 s, _ = req("GET", "/v1/threads", headers=bearer("sm_agt_deadbeef2"))
-ok, out2 = psql("SELECT count(*) FROM smith_audit WHERE action='auth_failed' AND detail->>'credential_class'='agent';")
+ok, out2 = psql(f"SELECT count(*) FROM {TABLES_SCHEMA}.smith_audit WHERE action='auth_failed' AND detail->>'credential_class'='agent';")
 check("failed agent-auth audit deduped too", ok and out2.strip() == out.strip(), out2)
-ok, out3 = psql("SELECT actor FROM smith_audit WHERE action='auth_failed' ORDER BY at DESC LIMIT 1;")
+ok, out3 = psql(f"SELECT actor FROM {TABLES_SCHEMA}.smith_audit WHERE action='auth_failed' ORDER BY at DESC LIMIT 1;")
 check("failed-auth actor is fixed 'unauthenticated'", ok and out3.strip() == "unauthenticated", out3)
 
 # 3. pairing round trip
@@ -275,23 +277,23 @@ s, of = req("GET", f"/v1/owner/feed?thread_id={TH_A}", headers=bearer(OWNER))
 check("owner feed works + is audited", s == 200 and isinstance(of, dict), f"{s}")
 
 # 8b. owner reads are fail-closed: break audit inserts, reads must be denied
-ok, _ = psql("CREATE TRIGGER boom BEFORE INSERT ON smith_audit FOR EACH ROW "
-             "EXECUTE FUNCTION smith_audit_deny_write();")
+ok, _ = psql(f"CREATE TRIGGER boom BEFORE INSERT ON {TABLES_SCHEMA}.smith_audit FOR EACH ROW "
+             f"EXECUTE FUNCTION {TABLES_SCHEMA}.smith_audit_deny_write();")
 check("psql: boom trigger installed", ok)
 s, b = req("GET", f"/v1/owner/feed?thread_id={TH_A}", headers=bearer(OWNER))
 check("owner feed denied when audit write fails -> 500, no data",
       s == 500 and b.get("error") == "audit unavailable", f"{s} {b}")
 s, b = req("GET", "/v1/owner/threads", headers=bearer(OWNER))
 check("owner threads denied when audit write fails -> 500", s == 500, f"{s} {b}")
-ok, _ = psql("DROP TRIGGER boom ON smith_audit;")
+ok, _ = psql(f"DROP TRIGGER boom ON {TABLES_SCHEMA}.smith_audit;")
 check("psql: boom trigger dropped", ok)
 s, _ = req("GET", f"/v1/owner/feed?thread_id={TH_A}", headers=bearer(OWNER))
 check("owner feed works again after trigger dropped", s == 200, f"{s}")
 
 # 9. smith_audit is append-only at the DB level
-ok, err = psql("UPDATE smith_audit SET action = 'tampered';", expect_fail=True)
+ok, err = psql(f"UPDATE {TABLES_SCHEMA}.smith_audit SET action = 'tampered';", expect_fail=True)
 check("DB rejects UPDATE on smith_audit", ok and "append-only" in err, err[:120])
-ok, err = psql("DELETE FROM smith_audit;", expect_fail=True)
+ok, err = psql(f"DELETE FROM {TABLES_SCHEMA}.smith_audit;", expect_fail=True)
 check("DB rejects DELETE on smith_audit", ok and "append-only" in err, err[:120])
 
 # 14. activity expiry evaluated on read
@@ -300,7 +302,7 @@ check("activity heartbeat -> 200", s == 200, f"{s}")
 s, f1 = req("GET", f"/v1/threads/{TH_A}/feed", headers=bearer(TOK_A))
 w1 = [w["agent_id"] for w in f1.get("working", [])]
 check("feed shows working agent", "agent-a" in w1, f"{w1}")
-ok, _ = psql("UPDATE smith_activity SET expires_at = now() - interval '1 second';")
+ok, _ = psql(f"UPDATE {TABLES_SCHEMA}.smith_activity SET expires_at = now() - interval '1 second';")
 check("psql: backdate activity expiry", ok)
 s, f2 = req("GET", f"/v1/threads/{TH_A}/feed", headers=bearer(TOK_A))
 w2 = f2.get("working", [])
@@ -315,7 +317,7 @@ s, _ = req("GET", "/v1/threads", headers=legacy_headers("agent-b"))
 check("revoked identity denied on legacy path -> 401", s == 401, f"{s}")
 
 # 11. seeded legacy agent rows (token_hash null) may be paired
-ok, _ = psql("INSERT INTO smith_agents (agent_id, display_name, platform, token_hash, legacy_unverified) "
+ok, _ = psql(f"INSERT INTO {TABLES_SCHEMA}.smith_agents (agent_id, display_name, platform, token_hash, legacy_unverified) "
              "VALUES ('legacy-seed', 'Legacy Seed', 'unknown', NULL, true);")
 check("psql: seed legacy agent row", ok)
 s, ps = req("POST", "/v1/pairings",
@@ -346,21 +348,21 @@ s, pe = req("POST", "/v1/pairings",
             bearer(OWNER))
 CODE_E = pe["code"]
 EHASH = hashlib.sha256(CODE_E.replace("-", "").encode()).hexdigest()
-ok, _ = psql(f"UPDATE smith_pairings SET expires_at = now() - interval '1 minute' "
+ok, _ = psql(f"UPDATE {TABLES_SCHEMA}.smith_pairings SET expires_at = now() - interval '1 minute' "
              f"WHERE code_hash = '{EHASH}';")
 check("psql: expire code E", ok)
-ok, _ = psql("TRUNCATE smith_auth_attempts;")
+ok, _ = psql(f"TRUNCATE {TABLES_SCHEMA}.smith_auth_attempts;")
 check("psql: reset attempt table", ok)
 for _ in range(3):  # SMITH_REDEEM_CODE_LOCKOUT_AFTER=3 in the test env
     s, _ = req("POST", "/v1/pairings/redeem", {"code": CODE_E})
     assert s == 404, s
-ok, out = psql(f"SELECT locked_at IS NOT NULL FROM smith_pairings WHERE code_hash = '{EHASH}';")
+ok, out = psql(f"SELECT locked_at IS NOT NULL FROM {TABLES_SCHEMA}.smith_pairings WHERE code_hash = '{EHASH}';")
 check("code locked after lockout threshold", ok and out.strip() == "t", out)
 s, _ = req("POST", "/v1/pairings/redeem", {"code": CODE_E})
 check("locked code stays 404", s == 404, f"{s}")
 
 # 10c. global brute-force budget ignores X-Forwarded-For
-ok, _ = psql("TRUNCATE smith_auth_attempts;")
+ok, _ = psql(f"TRUNCATE {TABLES_SCHEMA}.smith_auth_attempts;")
 check("psql: reset attempt table", ok)
 got_429 = False
 for i in range(41):  # SMITH_REDEEM_BUDGET_PER_HOUR=40 in the test env
@@ -374,11 +376,11 @@ check("global budget trips despite rotating forged X-Forwarded-For -> 429", got_
 # a fresh code cannot be redeemed while the instance is locked out
 s, _ = req("POST", "/v1/pairings/redeem", {"code": "CCCCCC"})
 check("redeem locked out at budget -> 429", s == 429, f"{s}")
-ok, _ = psql("TRUNCATE smith_auth_attempts;")
+ok, _ = psql(f"TRUNCATE {TABLES_SCHEMA}.smith_auth_attempts;")
 check("psql: reset attempt table", ok)
 
 # 13. legacy-unverified provenance is surfaced; owner can verify
-ok, _ = psql("INSERT INTO smith_agents (agent_id, display_name, platform, token_hash, legacy_unverified) "
+ok, _ = psql(f"INSERT INTO {TABLES_SCHEMA}.smith_agents (agent_id, display_name, platform, token_hash, legacy_unverified) "
              "VALUES ('legacy-ghost', 'Legacy Ghost', 'unknown', NULL, true);")
 check("psql: seed legacy-ghost agent", ok)
 s, tg = req("POST", "/v1/threads", {"name": "ghost-thread", "member_ids": ["legacy-ghost"]}, bearer(TOK_A))
@@ -393,7 +395,7 @@ check("owner agents list surfaces legacy_unverified",
       len(ghosts) == 1 and ghosts[0].get("legacy_unverified") is True, f"{ghosts}")
 s, _ = req("POST", f"/v1/owner/threads/{TH_G}/members/legacy-ghost/verify", {}, bearer(OWNER))
 check("owner verify member -> 200", s == 200, f"{s}")
-ok, out = psql(f"SELECT legacy_unverified FROM smith_thread_members "
+ok, out = psql(f"SELECT legacy_unverified FROM {TABLES_SCHEMA}.smith_thread_members "
                f"WHERE thread_id = '{TH_G}' AND agent_id = 'legacy-ghost';")
 check("member flag cleared after verify", ok and out.strip() == "f", out)
 s, au = req("GET", "/v1/owner/audit?limit=20", headers=bearer(OWNER))
@@ -480,7 +482,7 @@ check("existing member sees full history",
       "after-join" in bodies_a and "before-join" in bodies_a, f"{bodies_a}")
 
 # 19. P1-6: owner can reset burned brute-force budgets
-ok, _ = psql("INSERT INTO smith_auth_attempts (kind, code_hash) SELECT 'redeem', 'floodtest' FROM generate_series(1, 500);")
+ok, _ = psql(f"INSERT INTO {TABLES_SCHEMA}.smith_auth_attempts (kind, code_hash) SELECT 'redeem', 'floodtest' FROM generate_series(1, 500);")
 check("psql: burn redeem budget", ok)
 s, _ = req("POST", "/v1/pairings/redeem", {"code": "AAAA-AA"})
 check("burned budget -> 429", s == 429, f"{s}")
@@ -488,7 +490,7 @@ s, _ = req("POST", "/v1/owner/security/reset-budgets", {}, bearer(TOK_A))
 check("budget reset requires owner -> 403", s == 403, f"{s}")
 s, rb = req("POST", "/v1/owner/security/reset-budgets", {}, bearer(OWNER))
 check("owner resets budgets -> 200", s == 200, f"{s} {rb}")
-ok, out = psql("SELECT count(*) FROM smith_auth_attempts;")
+ok, out = psql(f"SELECT count(*) FROM {TABLES_SCHEMA}.smith_auth_attempts;")
 check("attempts cleared after reset", ok and out.strip() == "0", out)
 s, au = req("GET", "/v1/owner/audit?limit=30", headers=bearer(OWNER))
 acts = [r.get("action") for r in au.get("audit", [])]
@@ -586,7 +588,7 @@ check("same key same thread -> 200 duplicate", s == 200 and d3.get("duplicate") 
 # 23. Round-3 P2s (I2 round-3 review of be76d04).
 # P2-2: a missing member row must default to 'infinity' (see nothing), not
 # '-infinity'. White-box check of the exact coalesce default feedMessages uses.
-ok, rows = psql(f"select count(*) from {SCHEMA}.messages m where m.thread_id = '{TH_R3LATE}' and m.created_at >= coalesce((select tm.added_at from smith_thread_members tm where tm.thread_id = '{TH_R3LATE}' and tm.agent_id = 'ghost-no-such-member'), 'infinity'::timestamptz)")
+ok, rows = psql(f"select count(*) from {SCHEMA}.messages m where m.thread_id = '{TH_R3LATE}' and m.created_at >= coalesce((select tm.added_at from {TABLES_SCHEMA}.smith_thread_members tm where tm.thread_id = '{TH_R3LATE}' and tm.agent_id = 'ghost-no-such-member'), 'infinity'::timestamptz)")
 check("missing member row sees nothing (fail-closed default)", ok and rows.strip() == "0", rows.strip() if ok else rows)
 
 # P2-3: failed-auth traffic is rate-limited under the fixed 'unauthenticated' bucket.
@@ -603,15 +605,32 @@ s, _ = req("GET", f"/v1/messages?thread_id={TH_LEG}&limit=1", headers=legacy_hea
 ok, rows = psql(f"select string_agg(distinct identity, ',') from {SCHEMA}.rate_log where identity like 'legacy%'")
 check("legacy identities collapse to single 'legacy' bucket", ok and rows.strip() == "legacy", rows.strip() if ok else rows)
 
-# P2-4: migration PK constraint is named; re-running the migration is a no-op.
-ok, rows = psql(f"select conname from pg_constraint where conrelid = '{SCHEMA}.idempotency_keys'::regclass and contype = 'p'")
-check("idempotency PK named idempotency_keys_from_key_thread_pkey", ok and rows.strip() == "idempotency_keys_from_key_thread_pkey", rows.strip() if ok else rows)
-p = subprocess.run([f"{_pg}/psql", "-h", "127.0.0.1", "-p", "5433", "-U", "smithtest",
-                    "-d", "smithtest", "-v", "ON_ERROR_STOP=1", "-f", "supabase/schema_smith.sql"],
-                   env=_env, capture_output=True, text=True)
-check("schema_smith.sql re-runs cleanly", p.returncode == 0, (p.stderr or "")[:200])
-ok, rows = psql(f"select conname from pg_constraint where conrelid = '{SCHEMA}.idempotency_keys'::regclass and contype = 'p'")
-check("PK still named after re-run (guard matched, no drop/re-add)", ok and rows.strip() == "idempotency_keys_from_key_thread_pkey", rows.strip() if ok else rows)
+# P2-4: idempotency uniqueness is named; re-running the migration is a no-op.
+# Fresh-install path (schema_smith.sql): widened named PK, thread_id NOT NULL.
+# Live-migration path (migrate_smith_onto_agentcollab.sql): named UNIQUE
+# constraint, thread_id NULLABLE so the legacy v15 function keeps working.
+if SCHEMA == "agentcollab":
+    ok, rows = psql(f"select conname from pg_constraint where conrelid = '{SCHEMA}.idempotency_keys'::regclass and contype = 'u'")
+    check("idempotency unique constraint named idempotency_keys_from_key_thread_uniq", ok and rows.strip() == "idempotency_keys_from_key_thread_uniq", rows.strip() if ok else rows)
+    ok, rows = psql(f"select is_nullable from information_schema.columns where table_schema = '{SCHEMA}' and table_name = 'idempotency_keys' and column_name = 'thread_id'")
+    check("thread_id stays nullable (legacy v15 compat)", ok and rows.strip() == "YES", rows.strip() if ok else rows)
+    ok, rows = psql(f"select count(*) from pg_constraint where conrelid = '{SCHEMA}.idempotency_keys'::regclass and contype = 'p'")
+    check("old PK idempotency_keys_pkey is gone", ok and rows.strip() == "0", rows.strip() if ok else rows)
+    p = subprocess.run([f"{_pg}/psql", "-h", "127.0.0.1", "-p", "5433", "-U", "smithtest",
+                        "-d", "smithtest", "-v", "ON_ERROR_STOP=1", "-f", "supabase/migrate_smith_onto_agentcollab.sql"],
+                       env=_env, capture_output=True, text=True)
+    check("migration re-runs cleanly", p.returncode == 0, (p.stderr or "")[:200])
+    ok, rows = psql(f"select conname from pg_constraint where conrelid = '{SCHEMA}.idempotency_keys'::regclass and contype = 'u'")
+    check("unique constraint still named after re-run (guard matched, no drop/re-add)", ok and rows.strip() == "idempotency_keys_from_key_thread_uniq", rows.strip() if ok else rows)
+else:
+    ok, rows = psql(f"select conname from pg_constraint where conrelid = '{SCHEMA}.idempotency_keys'::regclass and contype = 'p'")
+    check("idempotency PK named idempotency_keys_from_key_thread_pkey", ok and rows.strip() == "idempotency_keys_from_key_thread_pkey", rows.strip() if ok else rows)
+    p = subprocess.run([f"{_pg}/psql", "-h", "127.0.0.1", "-p", "5433", "-U", "smithtest",
+                        "-d", "smithtest", "-v", "ON_ERROR_STOP=1", "-f", "supabase/schema_smith.sql"],
+                       env=_env, capture_output=True, text=True)
+    check("schema_smith.sql re-runs cleanly", p.returncode == 0, (p.stderr or "")[:200])
+    ok, rows = psql(f"select conname from pg_constraint where conrelid = '{SCHEMA}.idempotency_keys'::regclass and contype = 'p'")
+    check("PK still named after re-run (guard matched, no drop/re-add)", ok and rows.strip() == "idempotency_keys_from_key_thread_pkey", rows.strip() if ok else rows)
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:

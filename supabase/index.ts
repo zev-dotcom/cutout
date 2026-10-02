@@ -60,13 +60,32 @@ const DB_OPTIONS = {
 let sql = postgres(poolerUrl(DB_URL), DB_OPTIONS);
 // Option A (deploy-compat): the bus-table schema is selectable. Default
 // "cutout" (self-host); set SMITH_SCHEMA=agentcollab for the live deploy.
-// Validated as a bare identifier at startup; table names are hardcoded in T().
-const SCHEMA = (()=>{
-  const s = Deno.env.get("SMITH_SCHEMA") ?? "cutout";
-  if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`bad SMITH_SCHEMA: ${s}`);
-  return s;
-})();
+// Smith-owned tables live in a second selectable schema so a shared or
+// PostgREST-exposed database (the live project, where `public` is the app
+// schema) never sees them. Default "public" (self-host); set
+// SMITH_TABLES_SCHEMA=smith for the live deploy. Both are validated as bare
+// identifiers at startup (fail closed); table names are hardcoded in T()/S().
+// I2 hardening: pg_* / information_schema are never valid here, and the bus
+// schema may not be "public".
+function validSchema(s, allowPublic) {
+  if (!/^[a-z_][a-z0-9_]*$/.test(s)) return false;
+  if (s.startsWith("pg_") || s === "information_schema") return false;
+  if (s === "public" && !allowPublic) return false;
+  return true;
+}
+const SCHEMA = Deno.env.get("SMITH_SCHEMA") ?? "cutout";
+if (!validSchema(SCHEMA, false)) throw new Error(`bad SMITH_SCHEMA: ${SCHEMA}`);
+const TABLES_SCHEMA = Deno.env.get("SMITH_TABLES_SCHEMA") ?? "public";
+if (!validSchema(TABLES_SCHEMA, true)) throw new Error(`bad SMITH_TABLES_SCHEMA: ${TABLES_SCHEMA}`);
 const T = (name)=>sql.unsafe(`${SCHEMA}.${name}`);
+const S = (name)=>sql.unsafe(`${TABLES_SCHEMA}.${name}`);
+// I2 hardening (c): when targeting the live bus schema, the live token must
+// be set explicitly; silently falling back to a leftover CUTOUT_TOKEN would
+// make the wrong credential the live one.
+if (SCHEMA === "agentcollab" && !Deno.env.get("AGENTCOLLAB_TOKEN")) {
+  throw new Error("SMITH_SCHEMA=agentcollab requires AGENTCOLLAB_TOKEN");
+}
+console.log(`smith schema=${SCHEMA} tables_schema=${TABLES_SCHEMA} token=${Deno.env.get("AGENTCOLLAB_TOKEN") ? "agentcollab" : "cutout"}`);
 function recycleDb(client) {
   if (sql !== client) return;
   sql = postgres(poolerUrl(DB_URL), DB_OPTIONS);
@@ -434,7 +453,7 @@ async function postMessage(req, auth) {
                  values (${from}, ${idemKey}, ${body.thread_id}, ${id})`;
       }
       if (auth.kind === "owner") {
-        await tx`insert into smith_audit (actor, action, detail)
+        await tx`insert into ${S("smith_audit")} (actor, action, detail)
                  values ('owner', 'send_message', ${sql.json({ thread_id: body.thread_id })})`;
       }
       return r;
@@ -512,13 +531,13 @@ async function getMessages(req, arrivedAt, auth) {
       ${threadId ? sql`and thread_id = ${threadId}` : sql``}
       ${to ? sql`and to_agent = ${to}` : scopeAgent ? sql`and (to_agent = ${scopeAgent} or to_agent = '*')` : sql``}
       ${auth.kind === "agent" ? sql`and exists (
-        select 1 from smith_thread_members tm
+        select 1 from ${S("smith_thread_members")} tm
         where tm.thread_id = ${T("messages")}.thread_id
           and tm.agent_id = ${auth.agentId}
           and tm.legacy_unverified = false
           and ${T("messages")}.created_at >= tm.added_at
       )` : sql``}
-      ${auth.kind === "legacy" && LEGACY_STRICT ? sql`and not exists (select 1 from smith_threads s where s.thread_id = ${T("messages")}.thread_id)` : sql``}
+      ${auth.kind === "legacy" && LEGACY_STRICT ? sql`and not exists (select 1 from ${S("smith_threads")} s where s.thread_id = ${T("messages")}.thread_id)` : sql``}
       order by created_at asc, id asc
       limit ${limit}`;
     return await timedQuery(q, "query_once");
@@ -631,7 +650,7 @@ async function postReceipt(req, auth) {
   if (auth.kind === "agent") {
     exists = await timedQuery(sql`
       select m.thread_id, m.metadata from ${T("messages")} m
-      join smith_thread_members tm on tm.thread_id = m.thread_id
+      join ${S("smith_thread_members")} tm on tm.thread_id = m.thread_id
         and tm.agent_id = ${auth.agentId}
         and tm.legacy_unverified = false
       where m.id = ${mid} and m.created_at >= tm.added_at`, "receipt_readable");
@@ -671,7 +690,7 @@ async function getThreads(req) {
           and not exists (select 1 from ${T("receipts")} r where r.message_id = m.id and r.agent = ${agentId})
       )::int` : sql`0`} as unread
     from ${T("messages")} m
-    ${LEGACY_STRICT ? sql`where not exists (select 1 from smith_threads s where s.thread_id = m.thread_id)` : sql``}
+    ${LEGACY_STRICT ? sql`where not exists (select 1 from ${S("smith_threads")} s where s.thread_id = m.thread_id)` : sql``}
     group by m.thread_id
     order by last_at desc`, "threads");
   return jres(200, {
@@ -778,7 +797,7 @@ async function resolveAuth(req) {
   if (!m) return null;
   const token = m[1];
   if (token.startsWith("sm_own_")) {
-    const rows = await timedQuery(sql`select 1 from smith_owner where token_hash = ${await sha256Hex(token)}`, "auth_owner");
+    const rows = await timedQuery(sql`select 1 from ${S("smith_owner")} where token_hash = ${await sha256Hex(token)}`, "auth_owner");
     if (rows.length) return {
       kind: "owner",
       agentId: OWNER_ID
@@ -788,7 +807,7 @@ async function resolveAuth(req) {
     return null;
   }
   if (token.startsWith("sm_agt_")) {
-    const rows = await timedQuery(sql`select agent_id, revoked_at from smith_agents where token_hash = ${await sha256Hex(token)}`, "auth_agent");
+    const rows = await timedQuery(sql`select agent_id, revoked_at from ${S("smith_agents")} where token_hash = ${await sha256Hex(token)}`, "auth_agent");
     if (!rows.length || rows[0].revoked_at !== null) {
       // Consistent with owner failures: audited (deduped, fixed actor), then deny.
       await auditFailedAuth("agent", rows.length ? {
@@ -809,7 +828,7 @@ async function resolveAuth(req) {
     if (aid) {
       // Revocation applies to every credential class, including the legacy
       // bus-token path: a revoked identity cannot return through it.
-      const rows = await timedQuery(sql`select revoked_at from smith_agents where agent_id = ${aid}`, "auth_legacy_revoked");
+      const rows = await timedQuery(sql`select revoked_at from ${S("smith_agents")} where agent_id = ${aid}`, "auth_legacy_revoked");
       if (rows.length && rows[0].revoked_at !== null) {
         await auditFailedAuth("legacy", {
           reason: "revoked",
@@ -826,16 +845,16 @@ async function resolveAuth(req) {
   return null;
 }
 async function audit(actor, action, detail) {
-  await timedQuery(sql`insert into smith_audit (actor, action, detail) values (${actor}, ${action}, ${sql.json(detail ?? {})})`, "audit_append");
+  await timedQuery(sql`insert into ${S("smith_audit")} (actor, action, detail) values (${actor}, ${action}, ${sql.json(detail ?? {})})`, "audit_append");
 }
 async function isManagedThread(threadId) {
-  const rows = await timedQuery(sql`select 1 from smith_threads where thread_id = ${threadId}`, "thread_managed");
+  const rows = await timedQuery(sql`select 1 from ${S("smith_threads")} where thread_id = ${threadId}`, "thread_managed");
   return rows.length > 0;
 }
 async function isThreadMember(auth, threadId) {
   if (auth.kind === "owner") return true; // implicit member of every thread
   if (!auth.agentId) return false;
-  const rows = await timedQuery(sql`select legacy_unverified from smith_thread_members where thread_id = ${threadId} and agent_id = ${auth.agentId}`, "member_check");
+  const rows = await timedQuery(sql`select legacy_unverified from ${S("smith_thread_members")} where thread_id = ${threadId} and agent_id = ${auth.agentId}`, "member_check");
   if (!rows.length) return false;
   // P1-2 strict: memberships seeded from unverified legacy sender fields grant
   // no access until the owner verifies them (verify_member route).
@@ -866,8 +885,8 @@ async function threadAccess(auth, threadId) {
 }
 async function memberObjects(threadId) {
   const rows = await timedQuery(sql`
-    select tm.agent_id, tm.legacy_unverified, a.display_name, a.platform from smith_thread_members tm
-    left join smith_agents a on a.agent_id = tm.agent_id
+    select tm.agent_id, tm.legacy_unverified, a.display_name, a.platform from ${S("smith_thread_members")} tm
+    left join ${S("smith_agents")} a on a.agent_id = tm.agent_id
     where tm.thread_id = ${threadId} order by tm.agent_id asc`, "thread_members");
   return rows.map((r)=>({
       agent_id: r.agent_id,
@@ -921,13 +940,13 @@ async function postThread(req, auth) {
   } else {
     tid = "th_" + ulid();
   }
-  const dup = await timedQuery(sql`select 1 from smith_threads where thread_id = ${tid}`, "thread_exists");
+  const dup = await timedQuery(sql`select 1 from ${S("smith_threads")} where thread_id = ${tid}`, "thread_exists");
   if (dup.length) return jres(409, {
     error: "thread already exists"
   });
   // Agent creators may only name existing, non-revoked agents. Owner creators
   // may name unknown ids; they become stub rows (known id, no Smith token yet).
-  const known = await timedQuery(sql`select agent_id, revoked_at from smith_agents where agent_id = any(${memberIds})`, "members_known");
+  const known = await timedQuery(sql`select agent_id, revoked_at from ${S("smith_agents")} where agent_id = any(${memberIds})`, "members_known");
   const knownMap = new Map(known.map((r)=>[
       r.agent_id,
       r.revoked_at
@@ -936,7 +955,7 @@ async function postThread(req, auth) {
     const rev = knownMap.get(mid);
     if (auth.kind === "owner") {
       if (rev === undefined) {
-        await timedQuery(sql`insert into smith_agents (agent_id, display_name, platform) values (${mid}, ${mid}, 'unknown') on conflict (agent_id) do nothing`, "member_stub");
+        await timedQuery(sql`insert into ${S("smith_agents")} (agent_id, display_name, platform) values (${mid}, ${mid}, 'unknown') on conflict (agent_id) do nothing`, "member_stub");
       } else if (rev !== null) {
         return jres(422, {
           error: `agent is revoked: ${mid}`
@@ -956,15 +975,15 @@ async function postThread(req, auth) {
   const TAKEOVER = "__takeover__";
   try {
     await timedQuery(sql.begin(async (tx)=>{
-      await tx`insert into smith_threads (thread_id, name, created_by) values (${tid}, ${name}, ${auth.agentId})`;
+      await tx`insert into ${S("smith_threads")} (thread_id, name, created_by) values (${tid}, ${name}, ${auth.agentId})`;
       if (auth.kind === "owner") {
         // Owner-only legacy adoption: seed members from pre-existing legacy
         // messages, marked unverified (strict P1-2: no access until verified).
-        const s1 = await tx`insert into smith_thread_members (thread_id, agent_id, legacy_unverified, added_at)
+        const s1 = await tx`insert into ${S("smith_thread_members")} (thread_id, agent_id, legacy_unverified, added_at)
                  select ${tid}, from_agent, true, '-infinity'::timestamptz from ${T("messages")}
                  where thread_id = ${tid} and from_agent is not null and from_agent <> '*'
                  on conflict do nothing returning agent_id`;
-        const s2 = await tx`insert into smith_thread_members (thread_id, agent_id, legacy_unverified, added_at)
+        const s2 = await tx`insert into ${S("smith_thread_members")} (thread_id, agent_id, legacy_unverified, added_at)
                  select ${tid}, to_agent, true, '-infinity'::timestamptz from ${T("messages")}
                  where thread_id = ${tid} and to_agent is not null and to_agent <> '*'
                  on conflict do nothing returning agent_id`;
@@ -982,7 +1001,7 @@ async function postThread(req, auth) {
         ...memberIds
       ];
       for (const mid of all){
-        await tx`insert into smith_thread_members (thread_id, agent_id) values (${tid}, ${mid}) on conflict do nothing`;
+        await tx`insert into ${S("smith_thread_members")} (thread_id, agent_id) values (${tid}, ${mid}) on conflict do nothing`;
       }
     }), "thread_create", 3500);
   } catch (e) {
@@ -1001,12 +1020,12 @@ async function postThread(req, auth) {
 }
 async function listThreadsSmith(auth) {
   const aid = auth.agentId;
-  const scope = auth.kind === "owner" ? sql`` : sql`where t.thread_id in (select thread_id from smith_thread_members where agent_id = ${aid})`;
+  const scope = auth.kind === "owner" ? sql`` : sql`where t.thread_id in (select thread_id from ${S("smith_thread_members")} where agent_id = ${aid})`;
   const threads = await timedQuery(sql`
     select t.thread_id, t.name, max(m.created_at) as last_at,
       count(*) filter (where (m.to_agent = ${aid} or m.to_agent = '*')
         and not exists (select 1 from ${T("receipts")} r where r.message_id = m.id and r.agent = ${aid}))::int as unread
-    from smith_threads t
+    from ${S("smith_threads")} t
     left join ${T("messages")} m on m.thread_id = t.thread_id
     ${scope}
     group by t.thread_id, t.name
@@ -1016,7 +1035,7 @@ async function listThreadsSmith(auth) {
   if (tids.length) {
     const mrows = await timedQuery(sql`
       select tm.thread_id, tm.agent_id, tm.legacy_unverified, a.display_name, a.platform
-      from smith_thread_members tm left join smith_agents a on a.agent_id = tm.agent_id
+      from ${S("smith_thread_members")} tm left join ${S("smith_agents")} a on a.agent_id = tm.agent_id
       where tm.thread_id = any(${tids}) order by tm.thread_id asc, tm.agent_id asc`, "smith_thread_members");
     for (const r of mrows){
       const list = membersBy.get(r.thread_id) ?? [];
@@ -1029,7 +1048,7 @@ async function listThreadsSmith(auth) {
       membersBy.set(r.thread_id, list);
     }
     const wrows = await timedQuery(sql`
-      select thread_id, agent_id from smith_activity
+      select thread_id, agent_id from ${S("smith_activity")}
       where thread_id = any(${tids}) and expires_at > now() order by thread_id asc, agent_id asc`, "smith_thread_working");
     for (const r of wrows){
       const list = workingBy.get(r.thread_id) ?? [];
@@ -1064,11 +1083,11 @@ async function renameThread(req, auth, threadId) {
       error: `name must be a non-empty string of at most ${MAX_THREAD_NAME} characters`
     });
   }
-  const cur = await timedQuery(sql`select name from smith_threads where thread_id = ${threadId}`, "thread_name");
+  const cur = await timedQuery(sql`select name from ${S("smith_threads")} where thread_id = ${threadId}`, "thread_name");
   const oldName = cur.length ? cur[0].name : null;
   const noteId = "msg_" + ulid();
   await timedQuery(sql.begin(async (tx)=>{
-    await tx`update smith_threads set name = ${body.name} where thread_id = ${threadId}`;
+    await tx`update ${S("smith_threads")} set name = ${body.name} where thread_id = ${threadId}`;
     // Renames are data, not message edits: append a note message carrying the
     // compat key, matching the UI contract.
     await tx`insert into ${T("messages")} (id, thread_id, from_agent, to_agent, type, body, metadata)
@@ -1117,11 +1136,11 @@ async function addMember(req, auth, threadId) {
   if (RESERVED_AGENT_RE.test(aid)) return jres(422, {
     error: "agent_id 'owner' is reserved"
   });
-  const rows = await timedQuery(sql`select revoked_at from smith_agents where agent_id = ${aid}`, "member_agent");
+  const rows = await timedQuery(sql`select revoked_at from ${S("smith_agents")} where agent_id = ${aid}`, "member_agent");
   if (!rows.length || rows[0].revoked_at !== null) return jres(422, {
     error: `unknown or revoked agent: ${aid}`
   });
-  await timedQuery(sql`insert into smith_thread_members (thread_id, agent_id) values (${threadId}, ${aid}) on conflict do nothing`, "member_add");
+  await timedQuery(sql`insert into ${S("smith_thread_members")} (thread_id, agent_id) values (${threadId}, ${aid}) on conflict do nothing`, "member_add");
   await audit(OWNER_ID, "add_member", {
     thread_id: threadId,
     agent_id: aid
@@ -1165,7 +1184,7 @@ async function feedMessages(threadId, cursor, limit, agentId) {
            (extract(epoch from created_at) * 1000000)::bigint as created_us, metadata
     from ${T("messages")} m
     where m.thread_id = ${threadId}
-    ${agentId ? sql`and m.created_at >= coalesce((select tm.added_at from smith_thread_members tm where tm.thread_id = ${threadId} and tm.agent_id = ${agentId}), 'infinity'::timestamptz)` : sql``}
+    ${agentId ? sql`and m.created_at >= coalesce((select tm.added_at from ${S("smith_thread_members")} tm where tm.thread_id = ${threadId} and tm.agent_id = ${agentId}), 'infinity'::timestamptz)` : sql``}
     ${cursor ? sql`and (((extract(epoch from m.created_at) * 1000000)::bigint > ${cursor.us}) or (((extract(epoch from m.created_at) * 1000000)::bigint = ${cursor.us}) and m.id > ${cursor.id}))` : sql``}
     order by m.created_at asc, m.id asc
     limit ${limit}`, "feed_query");
@@ -1175,7 +1194,7 @@ async function buildFeed(threadId, q, redactLabel, agentId) {
   const messages = await enrichMessages(rows, redactLabel);
   // Working state is evaluated on read (expires_at > now()): a crashed agent's
   // dots clear within the TTL with no client timer to trust.
-  const wrows = await timedQuery(sql`select agent_id, started_at from smith_activity where thread_id = ${threadId} and expires_at > now() order by agent_id asc`, "feed_working");
+  const wrows = await timedQuery(sql`select agent_id, started_at from ${S("smith_activity")} where thread_id = ${threadId} and expires_at > now() order by agent_id asc`, "feed_working");
   return {
     messages,
     next_cursor: rows.length ? encodeCursor(Number(rows[rows.length - 1].created_us), rows[rows.length - 1].id) : q.since ?? null,
@@ -1224,11 +1243,11 @@ async function postActivity(req, auth) {
   if (denied) return denied;
   if (body.state === "working") {
     await timedQuery(sql`
-      insert into smith_activity (thread_id, agent_id, started_at, expires_at)
+      insert into ${S("smith_activity")} (thread_id, agent_id, started_at, expires_at)
       values (${body.thread_id}, ${aid}, now(), now() + (${ACTIVITY_TTL_SECONDS} * interval '1 second'))
       on conflict (thread_id, agent_id) do update set expires_at = excluded.expires_at`, "activity_working");
   } else {
-    await timedQuery(sql`delete from smith_activity where thread_id = ${body.thread_id} and agent_id = ${aid}`, "activity_idle");
+    await timedQuery(sql`delete from ${S("smith_activity")} where thread_id = ${body.thread_id} and agent_id = ${aid}`, "activity_idle");
   }
   return jres(200, {
     ok: true
@@ -1272,7 +1291,7 @@ async function issuePairing(req, auth) {
       });
     }
   }
-  const existing = await timedQuery(sql`select revoked_at, token_hash from smith_agents where agent_id = ${aid}`, "pairing_agent");
+  const existing = await timedQuery(sql`select revoked_at, token_hash from ${S("smith_agents")} where agent_id = ${aid}`, "pairing_agent");
   // "Already paired" means an active Smith token exists. Seeded legacy rows
   // (token_hash null) and revoked rows may be paired: issuing rotates in.
   if (existing.length && existing[0].revoked_at === null && existing[0].token_hash !== null) return jres(409, {
@@ -1283,14 +1302,14 @@ async function issuePairing(req, auth) {
   const expiresAt = new Date(Date.now() + minutes * 60 * 1000);
   await timedQuery(sql.begin(async (tx)=>{
     if (existing.length) {
-      await tx`update smith_agents set display_name = ${body.display_name}, platform = ${platform} where agent_id = ${aid}`;
+      await tx`update ${S("smith_agents")} set display_name = ${body.display_name}, platform = ${platform} where agent_id = ${aid}`;
     } else {
-      await tx`insert into smith_agents (agent_id, display_name, platform) values (${aid}, ${body.display_name}, ${platform})`;
+      await tx`insert into ${S("smith_agents")} (agent_id, display_name, platform) values (${aid}, ${body.display_name}, ${platform})`;
     }
     // P2-8: at most one live code per agent; re-issuing expires earlier ones.
-    await tx`update smith_pairings set expires_at = now()
+    await tx`update ${S("smith_pairings")} set expires_at = now()
              where agent_id = ${aid} and redeemed_at is null and expires_at > now()`;
-    await tx`insert into smith_pairings (id, code_hash, agent_id, expires_at)
+    await tx`insert into ${S("smith_pairings")} (id, code_hash, agent_id, expires_at)
              values (${pid}, ${await sha256Hex(code.raw)}, ${aid}, ${expiresAt.toISOString()})`;
   }), "pairing_issue", 3500);
   await audit(OWNER_ID, "issue_pairing", {
@@ -1310,19 +1329,19 @@ async function issuePairing(req, auth) {
 // X-Forwarded-For, which an attacker controls. Rows older than an hour are
 // pruned on each attempt, so the table stays tiny.
 async function authAttemptPrune(kind) {
-  await timedQuery(sql`delete from smith_auth_attempts where kind = ${kind} and at < now() - interval '1 hour'`, "attempt_prune");
+  await timedQuery(sql`delete from ${S("smith_auth_attempts")} where kind = ${kind} and at < now() - interval '1 hour'`, "attempt_prune");
 }
 async function authBudgetExceeded(kind, budget) {
-  const rows = await timedQuery(sql`select count(*)::int as c from smith_auth_attempts where kind = ${kind} and at > now() - interval '1 hour'`, "attempt_count");
+  const rows = await timedQuery(sql`select count(*)::int as c from ${S("smith_auth_attempts")} where kind = ${kind} and at > now() - interval '1 hour'`, "attempt_count");
   return rows[0].c >= budget;
 }
 async function recordAuthFailure(kind, codeHash) {
-  await timedQuery(sql`insert into smith_auth_attempts (kind, code_hash) values (${kind}, ${codeHash})`, "attempt_fail");
+  await timedQuery(sql`insert into ${S("smith_auth_attempts")} (kind, code_hash) values (${kind}, ${codeHash})`, "attempt_fail");
 }
 async function lockCodeIfNeeded(codeHash) {
-  const rows = await timedQuery(sql`select count(*)::int as c from smith_auth_attempts where kind = 'redeem' and code_hash = ${codeHash} and at > now() - interval '1 hour'`, "attempt_code");
+  const rows = await timedQuery(sql`select count(*)::int as c from ${S("smith_auth_attempts")} where kind = 'redeem' and code_hash = ${codeHash} and at > now() - interval '1 hour'`, "attempt_code");
   if (rows[0].c >= REDEEM_CODE_LOCKOUT_AFTER) {
-    await timedQuery(sql`update smith_pairings set locked_at = now() where code_hash = ${codeHash} and locked_at is null`, "pairing_lock");
+    await timedQuery(sql`update ${S("smith_pairings")} set locked_at = now() where code_hash = ${codeHash} and locked_at is null`, "pairing_lock");
   }
 }
 async function redeemPairing(req) {
@@ -1362,13 +1381,13 @@ async function redeemPairing(req) {
   let redeemed = null;
   try {
     await timedQuery(sql.begin(async (tx)=>{
-      const rows = await tx`update smith_pairings set redeemed_at = now()
+      const rows = await tx`update ${S("smith_pairings")} set redeemed_at = now()
         where code_hash = ${codeHash} and redeemed_at is null and locked_at is null and expires_at > now()
         returning id, agent_id`;
       if (!rows.length) throw INVALID_CODE;
       redeemed = rows[0];
       // Redeeming rotates the token and un-revokes a re-paired agent.
-      await tx`update smith_agents set token_hash = ${tokenHash}, revoked_at = null where agent_id = ${redeemed.agent_id}`;
+      await tx`update ${S("smith_agents")} set token_hash = ${tokenHash}, revoked_at = null where agent_id = ${redeemed.agent_id}`;
     }), "pairing_redeem", 3500);
   } catch (e) {
     if (e === INVALID_CODE) return bad();
@@ -1418,12 +1437,12 @@ async function claimOwner(req) {
     });
   };
   if (!SETUP_KEY || body.setup_key !== SETUP_KEY) return gone();
-  const existing = await timedQuery(sql`select 1 from smith_owner`, "claim_exists");
+  const existing = await timedQuery(sql`select 1 from ${S("smith_owner")}`, "claim_exists");
   if (existing.length) return gone();
   const token = "sm_own_" + randomHexBytes(32);
   await timedQuery(sql.begin(async (tx)=>{
-    await tx`insert into smith_owner (token_hash) values (${await sha256Hex(token)})`;
-    await tx`insert into smith_audit (actor, action, detail) values ('owner', 'claim_owner', ${sql.json({})})`;
+    await tx`insert into ${S("smith_owner")} (token_hash) values (${await sha256Hex(token)})`;
+    await tx`insert into ${S("smith_audit")} (actor, action, detail) values ('owner', 'claim_owner', ${sql.json({})})`;
   }), "owner_claim", 3500);
   return jres(201, {
     owner_token: token
@@ -1438,7 +1457,7 @@ function requireOwner(auth) {
 async function ownerAgents(req, auth) {
   const denied = requireOwner(auth);
   if (denied) return denied;
-  const rows = await timedQuery(sql`select agent_id, display_name, platform, created_at, revoked_at, legacy_unverified, (token_hash is not null) as has_token from smith_agents order by agent_id asc`, "owner_agents");
+  const rows = await timedQuery(sql`select agent_id, display_name, platform, created_at, revoked_at, legacy_unverified, (token_hash is not null) as has_token from ${S("smith_agents")} order by agent_id asc`, "owner_agents");
   return jres(200, {
     agents: rows.map((r)=>({
         agent_id: r.agent_id,
@@ -1454,16 +1473,16 @@ async function ownerAgents(req, auth) {
 async function revokeAgent(req, auth, aid) {
   const denied = requireOwner(auth);
   if (denied) return denied;
-  const rows = await timedQuery(sql`select 1 from smith_agents where agent_id = ${aid}`, "revoke_exists");
+  const rows = await timedQuery(sql`select 1 from ${S("smith_agents")} where agent_id = ${aid}`, "revoke_exists");
   if (!rows.length) return jres(404, {
     error: "agent not found"
   });
   await timedQuery(sql.begin(async (tx)=>{
-    await tx`update smith_agents set revoked_at = now(), token_hash = null where agent_id = ${aid}`;
-    await tx`delete from smith_thread_members where agent_id = ${aid}`;
-    await tx`delete from smith_activity where agent_id = ${aid}`;
+    await tx`update ${S("smith_agents")} set revoked_at = now(), token_hash = null where agent_id = ${aid}`;
+    await tx`delete from ${S("smith_thread_members")} where agent_id = ${aid}`;
+    await tx`delete from ${S("smith_activity")} where agent_id = ${aid}`;
     // Kill outstanding pairing codes too: redeeming one would otherwise un-revoke.
-    await tx`update smith_pairings set redeemed_at = now() where agent_id = ${aid} and redeemed_at is null`;
+    await tx`update ${S("smith_pairings")} set redeemed_at = now() where agent_id = ${aid} and redeemed_at is null`;
   }), "agent_revoke", 3500);
   await audit(OWNER_ID, "revoke_agent", {
     agent_id: aid
@@ -1480,7 +1499,7 @@ async function verifyMember(req, auth, threadId, aid) {
   if (!await isManagedThread(threadId)) return jres(404, {
     error: "thread not found"
   });
-  const rows = await timedQuery(sql`update smith_thread_members set legacy_unverified = false where thread_id = ${threadId} and agent_id = ${aid} returning 1`, "member_verify");
+  const rows = await timedQuery(sql`update ${S("smith_thread_members")} set legacy_unverified = false where thread_id = ${threadId} and agent_id = ${aid} returning 1`, "member_verify");
   if (!rows.length) return jres(404, {
     error: "member not found"
   });
@@ -1498,7 +1517,7 @@ async function verifyMember(req, auth, threadId, aid) {
 async function resetAuthBudgets(req, auth) {
   const denied = requireOwner(auth);
   if (denied) return denied;
-  await timedQuery(sql`delete from smith_auth_attempts`, "budget_reset");
+  await timedQuery(sql`delete from ${S("smith_auth_attempts")}`, "budget_reset");
   await audit(OWNER_ID, "budget_reset", {});
   return jres(200, {
     ok: true
@@ -1507,7 +1526,7 @@ async function resetAuthBudgets(req, auth) {
 async function rotateOwner(req, auth) {  const denied = requireOwner(auth);
   if (denied) return denied;
   const token = "sm_own_" + randomHexBytes(32);
-  await timedQuery(sql`update smith_owner set token_hash = ${await sha256Hex(token)} where id = 1`, "owner_rotate");
+  await timedQuery(sql`update ${S("smith_owner")} set token_hash = ${await sha256Hex(token)} where id = 1`, "owner_rotate");
   await audit(OWNER_ID, "rotate_owner", {});
   return jres(200, {
     owner_token: token
@@ -1580,7 +1599,7 @@ async function ownerAudit(req, auth) {
     });
   }
   const rows = await timedQuery(sql`
-    select id, at, actor, action, detail from smith_audit
+    select id, at, actor, action, detail from ${S("smith_audit")}
     ${sinceId !== null ? sql`where id > ${sinceId}` : sql``}
     order by id desc limit ${limit}`, "owner_audit");
   return jres(200, {
