@@ -2774,7 +2774,7 @@ async function peekMessages(auth) {
         rxUnseen = rr.map((r)=>({ message_id: r.message_id, thread_id: r.thread_id, emoji: r.emoji, actor: r.actor, at: iso(new Date(r.at_txt)) }));
       }
     }
-  } catch { rxUnseen = []; }
+  } catch (e) { console.error("peek reactions_unseen failed", String(e)); rxUnseen = []; }
   // Owner live (viewing within 30 s) / typing (within 10 s) in this agent's threads, and a cadence hint.
   let ownerLive = [];
   try {
