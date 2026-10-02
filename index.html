@@ -13,23 +13,51 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Smith">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="stylesheet" href="styles.css?v=20261002k">
+<link rel="stylesheet" href="styles.css?v=20261002n">
 </head>
 <body data-theme="mono">
 
 <!-- FIRST-RUN SETUP -->
+<div class="onb" id="onbInstall" hidden>
+  <div class="onb-card">
+    <h1>Smith<span class="sigdots live" aria-hidden="true"><i>●</i><i>●</i><i>●</i></span></h1>
+    <div class="onbbar"><i class="on"></i><i></i><i></i></div>
+    <div class="onbstep">STEP 1 OF 3</div>
+    <div id="onbInstallBody"></div>
+    <button class="bigbtn" id="onbInstallGo" type="button"></button>
+    <button class="ghostbtn plain" id="onbInstallSkip" type="button">Skip for now</button>
+  </div>
+</div>
+<div class="onb" id="onbNotif" hidden>
+  <div class="onb-card">
+    <h1>Smith<span class="sigdots live" aria-hidden="true"><i>●</i><i>●</i><i>●</i></span></h1>
+    <div class="onbbar"><i class="on"></i><i class="on"></i><i class="on"></i></div>
+    <div class="onbstep">STEP 3 OF 3</div>
+    <h2>Get notified</h2>
+    <p class="lede">Turn on notifications so you hear when an agent answers. You can mute any chat later.</p>
+    <div class="onbnote" id="onbNotifNote"></div>
+    <button class="bigbtn" id="onbNotifGo" type="button">Turn on notifications</button>
+    <button class="ghostbtn plain" id="onbNotifSkip" type="button">Not now</button>
+  </div>
+</div>
 <div class="setup" id="setup" hidden>
   <div class="setup-card">
     <h1>Smith<span class="sigdots live" id="setupDots" aria-hidden="true"><i>●</i><i>●</i><i>●</i></span></h1>
-    <p class="lede">Connect this client to your Smith instance. The instance URL and
-      owner token live only in this browser's local storage — they are never
-      sent anywhere except your instance.</p>
-    <div class="field">
-      <label for="setupUrl">INSTANCE URL</label>
-      <input id="setupUrl" type="url" inputmode="url" autocomplete="off" spellcheck="false"
-        placeholder="https://xyzcompany.supabase.co/functions/v1/agentcollab">
-      <div class="hint">Your Supabase function URL, e.g. https://&lt;ref&gt;.supabase.co/functions/v1/agentcollab</div>
+    <div class="onbbar" id="setupBar"><i class="on"></i><i class="on"></i><i></i></div>
+    <div class="onbstep">STEP 2 OF 3</div>
+    <p class="lede">Connect this phone to your Smith. The address and owner token stay on this device, and your owner token is never put in a link.</p>
+    <div class="field" id="setupLinkField">
+      <label for="setupLink">SETUP LINK (OPTIONAL)</label>
+      <input id="setupLink" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="Paste the link you were given">
+      <div class="hint">Fills in the address for you.</div>
     </div>
+    <div class="field">
+      <label for="setupUrl">YOUR SMITH ADDRESS</label>
+      <input id="setupUrl" type="url" inputmode="url" autocomplete="off" spellcheck="false"
+        placeholder="https://your-smith-address">
+      <div class="hint">The address of your Smith, from your setup link or your host.</div>
+    </div>
+    <div class="hostconfirm" id="setupHost" hidden><div>This address came from a link: <b id="setupHostName"></b></div><div class="hint">Only continue if you trust it. Your owner token is sent to this address.</div><button class="ghostbtn" id="setupHostOk" type="button">Yes, use this address</button></div>
     <div class="field">
       <label for="setupToken">OWNER TOKEN</label>
       <input id="setupToken" type="password" autocomplete="off" spellcheck="false"
@@ -37,7 +65,7 @@
       <div class="hint">Mint it below on first run, or paste one you already have. Shown once, never logged.</div>
     </div>
     <button class="bigbtn" id="setupGo">Connect</button>
-    <button class="linkbtn" id="setupClaimToggle" type="button">First time here? Generate your owner token</button>
+    <button class="ghostbtn" id="setupClaimToggle" type="button">First time? Create your owner token</button>
     <div id="setupClaim" hidden>
       <div class="field">
         <label for="setupKey">SETUP KEY</label>
@@ -62,6 +90,7 @@
       <button class="iconbtn" id="navSettings" title="Settings" aria-label="Settings">⚙</button>
     </div>
     <div class="installcard" id="installCard" hidden></div>
+    <div class="welcomecard" id="welcomeCard" hidden><div class="ic-h">Add your first agent<button class="ic-x" id="welcomeX" aria-label="Dismiss">✕</button></div><div>Pair an agent and start your first chat.</div><div class="ic-b"><button class="copybtn" id="welcomeGo" style="width:auto;min-height:44px;padding:0 18px">Pair an agent</button></div></div>
     <div class="search"><span aria-hidden="true">⌕</span><input id="threadSearch" placeholder="Search chats" aria-label="Search chats"></div>
     <div class="tlist" id="threadList" role="listbox" aria-label="Threads"></div>
     <button class="newthread" id="newThreadBtn">＋ New chat</button>
@@ -242,6 +271,6 @@
 <div class="toast" id="toast" hidden></div>
 <div id="modalRoot"></div>
 
-<script src="app.js?v=20261002k"></script>
+<script src="app.js?v=20261002n"></script>
 </body>
 </html>
