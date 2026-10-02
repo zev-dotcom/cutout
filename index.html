@@ -13,7 +13,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Smith">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="stylesheet" href="styles.css?v=20261001f">
+<link rel="stylesheet" href="styles.css?v=20261002a">
 </head>
 <body data-theme="mono">
 
@@ -97,6 +97,8 @@
       </div>
       <div class="msgs" id="threadMsgs"></div>
       <div class="composer">
+        <div class="mentionpop" id="mentionPop" role="listbox" aria-label="Mention someone" hidden></div>
+        <button class="cbtn" id="mentionBtn" type="button" aria-label="Mention someone" title="Mention">@</button>
         <div class="cfield"><input id="composerInput" placeholder="Message…" aria-label="Message" autocomplete="off"></div>
         <button class="sendbtn" id="sendBtn" aria-label="Send">↑</button>
       </div>
@@ -240,6 +242,6 @@
 <div class="toast" id="toast" hidden></div>
 <div id="modalRoot"></div>
 
-<script src="app.js?v=20261001f"></script>
+<script src="app.js?v=20261002a"></script>
 </body>
 </html>
