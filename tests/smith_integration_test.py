@@ -506,6 +506,78 @@ s, au = req("GET", "/v1/owner/audit?limit=30", headers=bearer(OWNER))
 acts = [r.get("action") for r in au.get("audit", [])]
 check("rename is audited (thread_rename)", "thread_rename" in acts, f"{acts}")
 
+# 21. Round 3 (I2 re-review of e53b143): P1-A/B/C, P2-D/E.
+# P1-A: /v1/messages must enforce the same predicate as the feed (verified
+# membership + added_at history rule).
+# Setup: legacy-seeded thread adopted by owner -> unverified member.
+TH_R3 = "x_cutout_thread_r3_unverified"
+psql(f"insert into cutout.messages (id, thread_id, from_agent, to_agent, type, body) values ('msg_r3_legacy1', '{TH_R3}', 'legacy-r3-sender', '*', 'note', 'legacy hello')")
+s, _ = req("POST", "/v1/threads", {"thread_id": TH_R3, "name": "r3-adopted"}, bearer(OWNER))
+check("owner adopts legacy thread -> 201", s == 201, f"{s}")
+# Pair an agent with the seeded sender id (still unverified).
+s, p = req("POST", "/v1/pairings", {"agent_id": "legacy-r3-sender", "display_name": "R3U", "platform": "test"}, bearer(OWNER))
+s, r = req("POST", "/v1/pairings/redeem", {"code": p["code"]})
+TOK_R3U = r["agent_token"]
+s, _ = req("GET", f"/v1/messages?thread_id={TH_R3}", headers=bearer(TOK_R3U))
+check("unverified member /v1/messages?thread_id= -> 403", s == 403, f"{s}")
+s, m = req("GET", "/v1/messages?limit=100", headers=bearer(TOK_R3U))
+ids = [x.get("thread_id") for x in m.get("messages", [])]
+check("unverified member unscoped /v1/messages sees no adopted-thread msgs", TH_R3 not in ids, f"{ids}")
+# Late-joiner history rule through /v1/messages.
+s, t = req("POST", "/v1/threads", {"name": "r3-late"}, bearer(TOK_A))
+TH_R3LATE = t["thread_id"]
+s, m1 = req("POST", "/v1/messages", {"thread_id": TH_R3LATE, "from": "agent-a", "to": "*", "type": "note", "body": "before join"}, bearer(TOK_A))
+M1 = m1["id"]
+s, p = req("POST", "/v1/pairings", {"agent_id": "agent-r3late", "display_name": "R3L", "platform": "test"}, bearer(OWNER))
+s, r = req("POST", "/v1/pairings/redeem", {"code": p["code"]})
+TOK_R3L = r["agent_token"]
+s, _ = req("POST", f"/v1/threads/{TH_R3LATE}/members", {"agent_id": "agent-r3late"}, bearer(OWNER))
+check("owner adds late joiner -> 200", s == 200, f"{s}")
+s, m2 = req("POST", "/v1/messages", {"thread_id": TH_R3LATE, "from": "agent-a", "to": "*", "type": "note", "body": "after join"}, bearer(TOK_A))
+M2 = m2["id"]
+s, m = req("GET", f"/v1/messages?thread_id={TH_R3LATE}&limit=100", headers=bearer(TOK_R3L))
+seen = [x.get("id") for x in m.get("messages", [])]
+check("late joiner via /v1/messages sees only post-join", M2 in seen and M1 not in seen, f"{seen}")
+
+# P1-B: receipts require readability; same 404 for not-found and not-yours.
+s, _ = req("POST", "/v1/receipts", {"message_id": M2, "agent": "agent-r3late", "status": "received"}, bearer(TOK_R3L))
+check("member writes receipt on readable message -> 201", s == 201, f"{s}")
+s, p = req("POST", "/v1/pairings", {"agent_id": "agent-r3other", "display_name": "R3O", "platform": "test"}, bearer(OWNER))
+s, r = req("POST", "/v1/pairings/redeem", {"code": p["code"]})
+TOK_R3O = r["agent_token"]
+s, _ = req("POST", "/v1/receipts", {"message_id": M2, "agent": "agent-r3other", "status": "received"}, bearer(TOK_R3O))
+check("non-member receipt on another thread's message -> 404 (no oracle)", s == 404, f"{s}")
+s, _ = req("POST", "/v1/receipts", {"message_id": "msg_does_not_exist_zzz", "agent": "agent-r3other", "status": "received"}, bearer(TOK_R3O))
+check("receipt on nonexistent message -> 404 (same)", s == 404, f"{s}")
+
+# P1-C: legacy strict filter — legacy-only thread still lists (positive test).
+TH_LEG = "x_cutout_thread_r3_legacy_only"
+s, _ = req("POST", "/v1/messages", {"thread_id": TH_LEG, "from": "legacy-x", "to": "*", "type": "note", "body": "legacy only"}, bearer(BUS_TOKEN))
+check("legacy posts to new unmanaged thread -> 201", s == 201, f"{s}")
+s, m = req("GET", f"/v1/messages?thread_id={TH_LEG}&limit=10", headers=bearer(BUS_TOKEN))
+found = [x.get("thread_id") for x in m.get("messages", [])]
+check("legacy-only thread lists for legacy caller", TH_LEG in found, f"{found}")
+s, m = req("GET", f"/v1/messages?thread_id={TH_R3LATE}&limit=10", headers=bearer(BUS_TOKEN))
+check("managed thread hidden from legacy caller", m.get("messages", []) == [], f"{m.get('messages', [])}")
+
+# P2-D: rate_log carries per-identity values (smoke test for the bucket column).
+ok, rows = psql("select count(*) from cutout.rate_log where identity is not null")
+check("rate_log rows carry identity", ok and rows.strip() != "0", rows.strip() if ok else rows)
+
+# P2-E: reply_to must be same-thread; idempotency scoped to thread.
+s, _ = req("POST", "/v1/messages", {"thread_id": TH_R3LATE, "from": "agent-a", "to": "*", "type": "note", "body": "xreply", "reply_to": M1}, bearer(TOK_A))
+check("reply_to same thread -> 201", s == 201, f"{s}")
+s, t2 = req("POST", "/v1/threads", {"name": "r3-other"}, bearer(TOK_A))
+TH_R3OTHER = t2["thread_id"]
+s, _ = req("POST", "/v1/messages", {"thread_id": TH_R3OTHER, "from": "agent-a", "to": "*", "type": "note", "body": "xreply2", "reply_to": M1}, bearer(TOK_A))
+check("reply_to cross-thread -> 422", s == 422, f"{s}")
+s, d1 = req("POST", "/v1/messages", {"thread_id": TH_R3LATE, "from": "agent-a", "to": "*", "type": "note", "body": "idem1", "idempotency_key": "key-r3-1"}, bearer(TOK_A))
+check("idempotent post thread 1 -> 201", s == 201, f"{s}")
+s, d2 = req("POST", "/v1/messages", {"thread_id": TH_R3OTHER, "from": "agent-a", "to": "*", "type": "note", "body": "idem2", "idempotency_key": "key-r3-1"}, bearer(TOK_A))
+check("same key different thread -> 201 new message", s == 201 and not d2.get("duplicate"), f"{s} {d2}")
+s, d3 = req("POST", "/v1/messages", {"thread_id": TH_R3LATE, "from": "agent-a", "to": "*", "type": "note", "body": "idem3", "idempotency_key": "key-r3-1"}, bearer(TOK_A))
+check("same key same thread -> 200 duplicate", s == 200 and d3.get("duplicate") and d3.get("id") == d1.get("id"), f"{s} {d3}")
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILURES:", FAIL)

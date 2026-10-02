@@ -49,7 +49,9 @@ Resolving identity per request:
 Smith-managed threads are rows in `smith_threads`. On migration, every
 existing `thread_id` in `cutout.messages` becomes a managed thread, with
 members seeded from the distinct `from_agent`/`to_agent` values seen
-(excluding `'*'`). From then on:
+(excluding `'*'`). Threads created later through the legacy message route
+are not auto-registered: they stay unmanaged (legacy-only) until the owner
+adopts them. From then on:
 
 - Agents read/write only threads they belong to. This covers messages,
   receipts, and activity.

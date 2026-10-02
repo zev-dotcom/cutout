@@ -8,6 +8,12 @@ const RETENTION_DAYS = 30;
 // Requests per minute per token; CUTOUT_RATE_LIMIT overrides (default 60).
 const RATE_LIMIT_ENV = Number(Deno.env.get("CUTOUT_RATE_LIMIT") ?? "60");
 const RATE_LIMIT_PER_MIN = Number.isInteger(RATE_LIMIT_ENV) && RATE_LIMIT_ENV >= 1 ? RATE_LIMIT_ENV : 60;
+// P2-D: global ceiling across all identities so one looping credential cannot
+// starve everyone else. Defaults to 10x the per-identity budget.
+const RATE_LIMIT_GLOBAL_ENV = Number(Deno.env.get("CUTOUT_RATE_LIMIT_GLOBAL") ?? "600");
+const RATE_LIMIT_GLOBAL = Number.isInteger(RATE_LIMIT_GLOBAL_ENV) && RATE_LIMIT_GLOBAL_ENV >= 1 ? RATE_LIMIT_GLOBAL_ENV : 600;
+// Advisory-lock key (int8) serializing the rate-limit check-and-insert.
+const RATE_LIMIT_LOCK_KEY = 8291746213;
 const MAX_BODY_BYTES = 20 * 1024;
 const MAX_METADATA_BYTES = 16 * 1024;
 const MAX_IDEMPOTENCY_KEY = 128;
@@ -140,10 +146,10 @@ function serialize(m) {
     metadata: m.metadata ?? {}
   };
 }
-async function rateState() {
+async function rateState(ident) {
   const rows = await timedQuery(sql`
     select count(*)::int as c, extract(epoch from min(at))::float8 as oldest
-    from cutout.rate_log where at > now() - interval '1 minute'`, "rate_state");
+    from cutout.rate_log where at > now() - interval '1 minute' and identity = ${ident}`, "rate_state");
   return {
     count: rows[0].c,
     oldestEpoch: rows[0].oldest === null ? null : Number(rows[0].oldest)
@@ -158,15 +164,29 @@ function rateHeaders(s) {
     "X-RateLimit-Reset": String(reset)
   };
 }
-async function rateLimit() {
+function rateIdentity(auth) {
+  if (!auth) return "unknown";
+  if (auth.kind === "agent") return `agent:${auth.agentId}`;
+  if (auth.kind === "owner") return "owner";
+  return auth.agentId ? `legacy:${auth.agentId}` : "legacy:anon";
+}
+async function rateLimit(auth) {
+  // P2-D: per-identity bucket plus a global ceiling. The check-and-insert runs
+  // inside one transaction under an advisory lock, so concurrent requests
+  // cannot both observe a below-limit count and overshoot the budget.
   // Log only admitted requests: a rejected (429) request is not counted, so
   // retrying while limited does not extend the lockout.
-  const admitted = await timedQuery(sql`
-    insert into cutout.rate_log (at)
-    select now()
-    where (select count(*) from cutout.rate_log where at > now() - interval '1 minute') < ${RATE_LIMIT_PER_MIN}
-    returning at`, "rate_limit_insert");
-  const state = await rateState();
+  const ident = rateIdentity(auth);
+  const admitted = await sql.begin(async (tx)=>{
+    await tx`select pg_advisory_xact_lock(${RATE_LIMIT_LOCK_KEY})`;
+    return await tx`
+      insert into cutout.rate_log (at, identity)
+      select now(), ${ident}
+      where (select count(*) from cutout.rate_log where at > now() - interval '1 minute') < ${RATE_LIMIT_GLOBAL}
+        and (select count(*) from cutout.rate_log where at > now() - interval '1 minute' and identity = ${ident}) < ${RATE_LIMIT_PER_MIN}
+      returning at`;
+  });
+  const state = await rateState(ident);
   if (admitted.length === 0) {
     const nowS = Date.now() / 1000;
     const retryAfter = state.oldestEpoch === null ? 1 : Math.max(1, Math.ceil(state.oldestEpoch + 60 - nowS));
@@ -286,6 +306,14 @@ async function postMessage(req, auth) {
       error: "reply_to must be a string"
     });
   }
+  // P2-E: reply_to must reference a message in the same thread, so a reply
+  // cannot be used to smuggle a cross-thread reference.
+  if (body.reply_to) {
+    const rt = await timedQuery(sql`select 1 from cutout.messages where id = ${body.reply_to} and thread_id = ${body.thread_id}`, "reply_to_check");
+    if (!rt.length) return jres(422, {
+      error: "reply_to must reference a message in the same thread"
+    });
+  }
   if (body.metadata !== undefined && (typeof body.metadata !== "object" || body.metadata === null || Array.isArray(body.metadata))) {
     return jres(422, {
       error: "metadata must be an object"
@@ -354,10 +382,12 @@ async function postMessage(req, auth) {
     idemKey = body.idempotency_key;
   }
   const from = body.from;
+  // P2-E: idempotency is scoped to (from, key, thread): a reused key in a
+  // different thread is a new message, not a duplicate of the old one.
   const findDup = async ()=>idemKey === null ? [] : await sql`
     select m.id, m.created_at from cutout.idempotency_keys k
     join cutout.messages m on m.id = k.message_id
-    where k.from_agent = ${from} and k.idem_key = ${idemKey}`;
+    where k.from_agent = ${from} and k.idem_key = ${idemKey} and k.thread_id = ${body.thread_id}`;
   // Keys are honored for the retention window: the key row cascades away with
   // its message when the purge removes it.
   const dup = await timedQuery(findDup(), "find_duplicate");
@@ -376,8 +406,8 @@ async function postMessage(req, auth) {
                 ${body.reply_to ?? null}, ${sql.json(metadata)})
         returning id, created_at`;
       if (idemKey !== null) {
-        await tx`insert into cutout.idempotency_keys (from_agent, idem_key, message_id)
-                 values (${from}, ${idemKey}, ${id})`;
+        await tx`insert into cutout.idempotency_keys (from_agent, idem_key, thread_id, message_id)
+                 values (${from}, ${idemKey}, ${body.thread_id}, ${id})`;
       }
       if (auth.kind === "owner") {
         await tx`insert into smith_audit (actor, action, detail)
@@ -457,8 +487,14 @@ async function getMessages(req, arrivedAt, auth) {
       ${cursor ? sql`and ((extract(epoch from created_at) * 1000000)::bigint > ${cursor.us} or ((extract(epoch from created_at) * 1000000)::bigint = ${cursor.us} and id > ${cursor.id}))` : sql``}
       ${threadId ? sql`and thread_id = ${threadId}` : sql``}
       ${to ? sql`and to_agent = ${to}` : scopeAgent ? sql`and (to_agent = ${scopeAgent} or to_agent = '*')` : sql``}
-      ${auth.kind === "agent" ? sql`and thread_id in (select thread_id from smith_thread_members where agent_id = ${auth.agentId})` : sql``}
-      ${auth.kind === "legacy" && LEGACY_STRICT ? sql`and not exists (select 1 from smith_threads s where s.thread_id = thread_id)` : sql``}
+      ${auth.kind === "agent" ? sql`and exists (
+        select 1 from smith_thread_members tm
+        where tm.thread_id = cutout.messages.thread_id
+          and tm.agent_id = ${auth.agentId}
+          and tm.legacy_unverified = false
+          and cutout.messages.created_at >= tm.added_at
+      )` : sql``}
+      ${auth.kind === "legacy" && LEGACY_STRICT ? sql`and not exists (select 1 from smith_threads s where s.thread_id = cutout.messages.thread_id)` : sql``}
       order by created_at asc, id asc
       limit ${limit}`;
     return await timedQuery(q, "query_once");
@@ -564,10 +600,26 @@ async function postReceipt(req, auth) {
       error: "agent must match authenticated agent"
     });
   }
-  const exists = await timedQuery(sql`select thread_id, metadata from cutout.messages where id = ${mid}`, "receipt_exists");
-  if (exists.length === 0) return jres(404, {
-    error: "message not found"
-  });
+  // P1-B: an agent may only write receipts on messages it can actually read
+  // (verified membership of the message's thread, honoring the added_at history
+  // rule). The same 404 covers "not found" and "not yours": no existence oracle.
+  let exists;
+  if (auth.kind === "agent") {
+    exists = await timedQuery(sql`
+      select m.thread_id, m.metadata from cutout.messages m
+      join smith_thread_members tm on tm.thread_id = m.thread_id
+        and tm.agent_id = ${auth.agentId}
+        and tm.legacy_unverified = false
+      where m.id = ${mid} and m.created_at >= tm.added_at`, "receipt_readable");
+    if (exists.length === 0) return jres(404, {
+      error: "message not found"
+    });
+  } else {
+    exists = await timedQuery(sql`select thread_id, metadata from cutout.messages where id = ${mid}`, "receipt_exists");
+    if (exists.length === 0) return jres(404, {
+      error: "message not found"
+    });
+  }
   if (auth.kind === "legacy" && LEGACY_STRICT && await isManagedThread(exists[0].thread_id)) {
     return jres(403, {
       error: "legacy credentials not accepted on managed threads"
@@ -1527,7 +1579,8 @@ async function route(req, arrivedAt) {
     res: jres(404, {
       error: "not found"
     }),
-    state: null
+    state: null,
+    ident: "unknown"
   };
   // Pairing redeem and owner claim are the only unauthenticated routes: the
   // code / setup key is the credential. Brute-force budgets are enforced
@@ -1535,13 +1588,15 @@ async function route(req, arrivedAt) {
   if (path === "/v1/pairings/redeem" && req.method === "POST") {
     return {
       res: await redeemPairing(req),
-      state: null
+      state: null,
+      ident: "unknown"
     };
   }
   if (path === "/v1/owner/claim" && req.method === "POST") {
     return {
       res: await claimOwner(req),
-      state: null
+      state: null,
+      ident: "unknown"
     };
   }
   // Smith credential classes, resolved in order: sm_own_ -> owner, sm_agt_ ->
@@ -1552,16 +1607,19 @@ async function route(req, arrivedAt) {
     res: jres(401, {
       error: "unauthorized"
     }),
-    state: null
+    state: null,
+    ident: "unknown"
   };
-  const { limited, state } = await rateLimit();
+  const { limited, state } = await rateLimit(auth);
   if (limited) return {
     res: limited,
-    state
+    state,
+    ident: rateIdentity(auth)
   };
   const done = (res)=>({
       res,
-      state
+      state,
+      ident: rateIdentity(auth)
     });
   if (path === "/v1/messages" && req.method === "POST") return done(await postMessage(req, auth));
   if (path === "/v1/messages" && req.method === "GET") return done(await getMessages(req, arrivedAt, auth));
@@ -1620,9 +1678,10 @@ Deno.serve(async (req)=>{
   console.log(`cutout startup_wait_ms=${Date.now() - startupAt}`);
   let res;
   let state = null;
+  let ident = "unknown";
   try {
     const routeAt = Date.now();
-    ({ res, state } = await route(req, arrivedAt));
+    ({ res, state, ident } = await route(req, arrivedAt));
     console.log(`cutout route_ms=${Date.now() - routeAt}`);
   } catch (e) {
     console.error(e);
@@ -1633,7 +1692,7 @@ Deno.serve(async (req)=>{
   // Rate-limit headers on every response, including errors and /health.
   try {
     const headerAt = Date.now();
-    const h = rateHeaders(state ?? await rateState());
+    const h = rateHeaders(state ?? await rateState(ident));
     for (const [k, v] of Object.entries(h))res.headers.set(k, v);
     console.log(`cutout rate_headers_ms=${Date.now() - headerAt}`);
   } catch (e) {
