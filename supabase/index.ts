@@ -2760,6 +2760,21 @@ async function peekMessages(auth) {
         and not exists (select 1 from ${S("smith_seen")} sn where sn.message_id = m.id and sn.agent_id = ${auth.agentId}) limit 50`, "peek_owner_unseen");
     await recordSeen(auth.agentId, ot);
   } catch { /* best effort */ }
+  // Reactions others added to this agent's own messages since it last peeked (consumed here, at most 20 per peek).
+  let rxUnseen = [];
+  try {
+    const sc = await timedQuery(sql`select coalesce(last_rx_seen_at, now() - interval '10 minutes')::text as s from ${S("smith_agent_cursor")} where agent_id = ${auth.agentId}`, "peek_rx_since");
+    if (sc.length) {
+      const rr = await timedQuery(sql`select r.message_id, m.thread_id, r.emoji, r.actor, r.at::text as at_txt from ${S("smith_reactions")} r
+        join ${T("messages")} m on m.id = r.message_id
+        join ${S("smith_thread_members")} tm on tm.thread_id = m.thread_id and tm.agent_id = ${auth.agentId} and tm.legacy_unverified = false
+        where m.from_agent = ${auth.agentId} and r.actor <> ${auth.agentId} and r.at > (${sc[0].s}::text)::timestamptz order by r.at asc limit 20`, "peek_rx");
+      if (rr.length) {
+        await timedQuery(sql`update ${S("smith_agent_cursor")} set last_rx_seen_at = (${rr[rr.length - 1].at_txt}::text)::timestamptz where agent_id = ${auth.agentId}`, "peek_rx_mark");
+        rxUnseen = rr.map((r)=>({ message_id: r.message_id, thread_id: r.thread_id, emoji: r.emoji, actor: r.actor, at: iso(new Date(r.at_txt)) }));
+      }
+    }
+  } catch { rxUnseen = []; }
   // Owner live (viewing within 30 s) / typing (within 10 s) in this agent's threads, and a cadence hint.
   let ownerLive = [];
   try {
@@ -2769,7 +2784,7 @@ async function peekMessages(auth) {
     ownerLive = ol.map((r)=>({ thread_id: r.thread_id, typing: r.typing }));
   } catch { ownerLive = []; }
   let hint = null; // seconds until you should look again; null = keep your declared cadence
-  if (st.unread > 0) hint = 5;
+  if (st.unread > 0 || rxUnseen.length) hint = 5;
   else if (ownerLive.some((x)=> x.typing)) hint = 5;
   else if (ownerLive.length) hint = 10;
   else {
@@ -2780,7 +2795,7 @@ async function peekMessages(auth) {
     } catch { /* ignore */ }
   }
   const oldestAt = threads.length ? threads[0].oldest_unread_at : null; // threads are ordered oldest first
-  return jres(200, { owner_live: ownerLive, next_wake_hint_s: hint, unread: st.unread, oldest_unread_age_s: st.oldest_age_s ?? 0, oldest_unread_at: oldestAt, threads, newest_id: st.newest_id ?? null, cursor: cur[0]?.acked_id ? { acked_id: cur[0].acked_id, acked_at: iso(cur[0].acked_at) } : null });
+  return jres(200, { owner_live: ownerLive, next_wake_hint_s: hint, unread: st.unread, oldest_unread_age_s: st.oldest_age_s ?? 0, oldest_unread_at: oldestAt, threads, reactions_unseen: rxUnseen, newest_id: st.newest_id ?? null, cursor: cur[0]?.acked_id ? { acked_id: cur[0].acked_id, acked_at: iso(cur[0].acked_at) } : null });
 }
 async function ackMessages(req, auth) {
   let body; try { body = await req.json(); } catch { return jres(400, { error: "invalid JSON" }); }

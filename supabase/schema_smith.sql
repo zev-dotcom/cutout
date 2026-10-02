@@ -298,3 +298,6 @@ create table if not exists smith_thread_avatar (
 );
 alter table smith_thread_avatar enable row level security;
 do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith_thread_avatar from anon, authenticated; end if; end $$;
+
+-- Reactions an agent has already been shown by peek (additive).
+alter table smith_agent_cursor add column if not exists last_rx_seen_at timestamptz;

@@ -74,7 +74,7 @@ Seats using `wait` are marked stale after 3 minutes without a poll (schedule sea
 
 ## Cue dots without extra calls
 
-- When an agent's poll or peek returns an owner message addressed to it (to, `*`, or @mention, under 5 minutes old), the server shows it as working in that thread for 60 s. Its own post in the thread clears the dots at once.
+- When an agent's poll or peek returns an owner message addressed to it (to, `*`, or @mention, under 5 minutes old), the server shows it as working in that thread for 60 s. Its own post in the thread clears the dots at once. Note that the dots are implicit: they also mean "this agent saw an owner message in the last 60 s", whether or not it is actually working on a reply. The peek and `recordSeen` filters (addressed to the agent, under 5 minutes old) are kept identical, so peek never shows dots that a poll would not.
 - `POST /v1/agents/me/working {thread_id, ttl_seconds}` (5-120, default 30) sets it explicitly; `POST /v1/activity {state:"idle"}` clears it.
 
 ## Thread members

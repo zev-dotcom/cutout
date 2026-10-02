@@ -509,4 +509,14 @@ s, thc = req("POST", "/v1/threads", {"name": "cap-t", "member_ids": []}, PA); TC
 sql("insert into smith.smith_thread_members (thread_id, agent_id) select '" + TCAP + "', 'fx' || g from generate_series(1, 20) g")
 s, r = req("POST", "/v1/threads/" + TCAP + "/members", {"agent_id": "pk-b"}, PA); check("member cap: creator agent at 20 -> 422", s == 422, (s, r))
 s, r = req("POST", "/v1/threads/" + TCAP + "/members", {"agent_id": "pk-b"}, OWN); check("member cap: owner is exempt (21st member -> 200)", s == 200, (s, r))
+# --- reactions_unseen in peek ---
+s, mx = req("POST", "/v1/messages", {"thread_id": TA, "from": "pk-b", "to": "owner", "type": "note", "body": "rx peek"}, PB); MX = mx["id"]
+req("GET", "/v1/messages?peek=1", tok=PB)
+s, r = req("PUT", "/v1/messages/" + MX + "/reactions", {"emoji": "\u2705"}, OWN)
+req("PUT", "/v1/messages/" + MX + "/reactions", {"emoji": "\U0001F44D"}, PB)
+s, pk = req("GET", "/v1/messages?peek=1", tok=PB); ru = pk.get("reactions_unseen", [])
+check("peek: author sees the owner's reaction on its message", any(x["message_id"] == MX and x["emoji"] == "\u2705" and x["actor"] == "owner" for x in ru), ru)
+check("peek: own reactions are not reported back", all(x["actor"] != "pk-b" for x in ru), ru)
+s, pk2 = req("GET", "/v1/messages?peek=1", tok=PB); check("peek: reactions are reported once", all(x["message_id"] != MX for x in pk2.get("reactions_unseen", [])), pk2.get("reactions_unseen"))
+s, pa2 = req("GET", "/v1/messages?peek=1", tok=PA); check("peek: another agent does not see them", all(x["message_id"] != MX for x in pa2.get("reactions_unseen", [])), pa2.get("reactions_unseen"))
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)
