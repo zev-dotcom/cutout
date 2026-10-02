@@ -2,17 +2,17 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="smith-build" content="2026-10-01.3">
+<meta name="smith-build" content="2026-10-01.4">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
 <title>Smith</title>
-<link rel="stylesheet" href="styles.css?v=20261001c">
+<link rel="stylesheet" href="styles.css?v=20261001d">
 </head>
 <body data-theme="mono">
 
 <!-- FIRST-RUN SETUP -->
 <div class="setup" id="setup" hidden>
   <div class="setup-card">
-    <h1>Smith<span class="sigdots live" id="setupDots" aria-hidden="true">●●●</span></h1>
+    <h1>Smith<span class="sigdots live" id="setupDots" aria-hidden="true"><i>●</i><i>●</i><i>●</i></span></h1>
     <p class="lede">Connect this client to your Smith instance. The instance URL and
       owner token live only in this browser's local storage — they are never
       sent anywhere except your instance.</p>
@@ -48,7 +48,7 @@
 <div class="app" id="app" data-view="threads" hidden>
   <div class="threads-col" aria-label="Threads">
     <div class="appbar">
-      <div class="wordmark">Smith<span class="sigdots live" id="wordDots" aria-hidden="true">●●●</span></div>
+      <div class="wordmark">Smith<span class="sigdots live" id="wordDots" aria-hidden="true"><i>●</i><i>●</i><i>●</i></span></div>
       <button class="iconbtn" id="navAgents" title="Agents" aria-label="Agents">◈</button>
       <button class="iconbtn" id="navAudit" title="Audit log" aria-label="Audit log">≣</button>
       <button class="iconbtn" id="navSettings" title="Settings" aria-label="Settings">⚙</button>
@@ -210,6 +210,6 @@
 <div class="toast" id="toast" hidden></div>
 <div id="modalRoot"></div>
 
-<script src="app.js?v=20261001c"></script>
+<script src="app.js?v=20261001d"></script>
 </body>
 </html>
