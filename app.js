@@ -210,7 +210,9 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-function isRegistered(a){ return !a.legacy_unverified && !a.revoked_at; }
+var SMITH_BUILD = "2026-10-01.3";
+// Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
+function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
   state.agents = list || [];
   state.agentById = {};
@@ -696,7 +698,7 @@ async function loadAgents(){
     var list = await api("GET", "/v1/owner/agents");
     indexAgents(Array.isArray(list) ? list : (list.agents || []));
     box.innerHTML = "";
-    var shown = state.agents.filter(function(a){ return !a.legacy_unverified; });
+    var shown = state.agents.filter(function(a){ return isRegistered(a) || a.revoked_at; });
     var hiddenLegacy = state.agents.length - shown.length;
     if (!shown.length){
       box.appendChild(el("p", "fine", "No agents yet. Issue a pairing code below to add one."));
@@ -851,6 +853,7 @@ async function loadAudit(){
 /* ---------- settings ---------- */
 function renderSettings(){
   $("settingsInstance").textContent = baseUrl() || "—";
+  if ($("settingsBuild")) $("settingsBuild").textContent = "Build " + SMITH_BUILD;
 }
 async function rotateToken(){
   modal("Rotate owner token?",
