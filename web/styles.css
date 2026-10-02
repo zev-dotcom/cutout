@@ -388,7 +388,10 @@ select{width:100%;min-height:var(--tap);border:1.5px solid var(--line);border-ra
 @keyframes actspin{to{transform:rotate(360deg)}}
 .actsum{font-size:14px;line-height:1.5;color:var(--ink);margin-top:2px}
 @media (prefers-reduced-motion:reduce){.actspin{animation:none}}
-.updbar{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.updbar{display:flex;align-items:center;justify-content:space-between;gap:4px;padding:0 4px 0 0}
+.updbar button{background:none;border:0;color:inherit;font:inherit;cursor:pointer;min-height:var(--tap)}
+.updbar .updgo{flex:1;text-align:left;padding:0 14px}
+.updbar .updx{min-width:var(--tap);font-size:1.05rem}
 .updx{padding:8px 4px 8px 12px;opacity:.8;font-size:1rem}
 
 /* onboarding */

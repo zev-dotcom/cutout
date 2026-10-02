@@ -384,7 +384,6 @@ async function postMessage(req, auth) {
     if (auth.kind === "agent") {
       const rl = await activityRate(auth.agentId);
       if (rl) return rl;
-      await audit(auth.agentId, "activity_post", { thread_id: body.thread_id });
     }
     if (!metadata.activity.started_at) metadata.activity.started_at = new Date().toISOString();
     if (metadata.activity.state !== "running" && !metadata.activity.finished_at) metadata.activity.finished_at = new Date().toISOString();
@@ -504,6 +503,11 @@ async function postMessage(req, auth) {
       if (auth.kind === "owner") {
         await tx`insert into ${S("smith_audit")} (actor, action, detail)
                  values ('owner', 'send_message', ${sql.json({ thread_id: body.thread_id })})`;
+      }
+      // Counted only when the activity message actually lands (failed or rejected posts do not use quota).
+      if (auth.kind === "agent" && body.type === "activity") {
+        await tx`insert into ${S("smith_audit")} (actor, action, detail)
+                 values (${auth.agentId}, 'activity_post', ${sql.json({ thread_id: body.thread_id })})`;
       }
       return r;
     }), "post_transaction", 3500);

@@ -294,7 +294,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-02.12";
+var SMITH_BUILD = "2026-10-02.14";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -2018,12 +2018,10 @@ function checkForUpdate(){
     // Only a NEWER build prompts (builds sort as YYYY-MM-DD.N); a rolled-back older build never does.
     if (m && buildNewer(m[1], SMITH_BUILD)){
       updateShown = true;
-      var b = document.createElement("button"); b.className = "updbar"; b.type = "button";
-      b.innerHTML = '<span>New version available. Tap to reload</span><span class="updx" role="button" aria-label="Dismiss">\u2715</span>';
-      b.addEventListener("click", function(e){
-        if (e.target.classList && e.target.classList.contains("updx")){ b.remove(); return; }
-        location.reload();
-      });
+      var b = document.createElement("div"); b.className = "updbar"; b.setAttribute("role", "status");
+      b.innerHTML = '<button type="button" class="updgo">New version available. Tap to reload</button><button type="button" class="updx" aria-label="Dismiss">\u2715</button>';
+      b.querySelector(".updgo").addEventListener("click", function(){ location.reload(); });
+      b.querySelector(".updx").addEventListener("click", function(){ b.remove(); });
       document.body.appendChild(b);
     }
   }).catch(function(){});
