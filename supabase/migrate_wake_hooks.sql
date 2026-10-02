@@ -19,4 +19,12 @@ create index if not exists smith_wake_hooks_method_idx on smith.smith_wake_hooks
 
 -- Holds the HMAC signing secret: lock it down. The function connects as a privileged role; nobody else reads this.
 alter table smith.smith_wake_hooks enable row level security;
-revoke all on smith.smith_wake_hooks from anon, authenticated;
+do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith.smith_wake_hooks from anon, authenticated; end if; end $$;
+
+-- Owner read marker per thread (drives the unread badge).
+create table if not exists smith.smith_owner_reads (
+  thread_id    text primary key references smith.smith_threads(thread_id) on delete cascade,
+  last_read_at timestamptz not null default now()
+);
+alter table smith.smith_owner_reads enable row level security;
+do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith.smith_owner_reads from anon, authenticated; end if; end $$;

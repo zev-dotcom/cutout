@@ -1065,12 +1065,15 @@ async function listThreadsSmith(auth) {
   const scope = auth.kind === "owner" ? sql`` : sql`where t.thread_id in (select thread_id from ${S("smith_thread_members")} where agent_id = ${aid})`;
   const threads = await timedQuery(sql`
     select t.thread_id, t.name, max(m.created_at) as last_at,
-      count(*) filter (where (m.to_agent = ${aid} or m.to_agent = '*')
-        and not exists (select 1 from ${T("receipts")} r where r.message_id = m.id and r.agent = ${aid}))::int as unread
+      ${auth.kind === "owner"
+        ? sql`count(*) filter (where m.from_agent <> ${OWNER_ID} and m.created_at > coalesce(orr.last_read_at, 'epoch'::timestamptz))::int`
+        : sql`count(*) filter (where (m.to_agent = ${aid} or m.to_agent = '*')
+        and not exists (select 1 from ${T("receipts")} r where r.message_id = m.id and r.agent = ${aid}))::int`} as unread
     from ${S("smith_threads")} t
     left join ${T("messages")} m on m.thread_id = t.thread_id
+    left join ${S("smith_owner_reads")} orr on orr.thread_id = t.thread_id
     ${scope}
-    group by t.thread_id, t.name
+    group by t.thread_id, t.name, orr.last_read_at
     order by last_at desc nulls last`, "smith_thread_list");
   const tids = threads.map((t)=>t.thread_id);
   const membersBy = new Map(), workingBy = new Map();
@@ -1790,6 +1793,16 @@ async function route(req, arrivedAt) {
     return done(jres(400, {
       error: "invalid path encoding"
     }));
+  }
+  // Owner read marker: the badge on the thread list counts others' messages after this.
+  if (segs[0] === "v1" && segs[1] === "owner" && segs[2] === "threads" && segs.length === 5 && segs[4] === "read" && req.method === "PUT") {
+    const denied = requireOwner(auth);
+    if (denied) return done(denied);
+    const known = await timedQuery(sql`select 1 from ${S("smith_threads")} where thread_id = ${segs[3]}`, "read_thread_known");
+    if (!known.length) return done(jres(404, { error: "thread not found" }));
+    await timedQuery(sql`insert into ${S("smith_owner_reads")} (thread_id, last_read_at) values (${segs[3]}, now())
+      on conflict (thread_id) do update set last_read_at = greatest(${S("smith_owner_reads")}.last_read_at, excluded.last_read_at)`, "owner_read_mark");
+    return done(jres(200, { thread_id: segs[3], read: true }));
   }
   if (segs[0] === "v1" && segs[1] === "threads" && segs.length >= 3) {
     const tid = segs[2];

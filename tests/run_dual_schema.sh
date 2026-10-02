@@ -43,6 +43,7 @@ run_suite() {
     $PSQL -f supabase/schema_smith.sql
   else
     $PSQL -f supabase/migrate_smith_onto_agentcollab.sql
+    $PSQL -f supabase/migrate_wake_hooks.sql
   fi
   local schema_env=()
   if [ "$schema" != "cutout" ]; then schema_env+=(SMITH_SCHEMA="$schema"); fi

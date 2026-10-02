@@ -124,4 +124,17 @@ req("PUT", "/v1/owner/agents/wk-c/wake", {"method": "webhook", "url": "https://h
 req("PUT", "/v1/owner/agents/wk-c/wake", {"method": "wait"}, OWN)
 _sec = sql("select coalesce(signing_secret,'NULL') from smith.smith_wake_hooks where agent_id='wk-c'")
 check("secret cleared when switching away from webhook", "NULL" in str(_sec), _sec)
+def _unread(tid):
+    s2, l = req("GET", "/v1/owner/threads", tok=OWN)
+    return [x for x in (l.get("threads") if isinstance(l, dict) else l) if x["thread_id"] == tid][0]["unread"]
+_s, _th = req("POST", "/v1/threads", {"name": "unread-t", "member_ids": ["wk-a", "wk-c"]}, OWN); _tid = _th["thread_id"]
+_p = lambda tok, frm, body: req("POST", "/v1/messages", {"thread_id": _tid, "from": frm, "to": "*", "type": "note", "body": body}, tok)
+_p(A, "wk-a", "one"); _p(C, "wk-c", "two"); _p(OWN, "owner", "mine")
+check("unread counts only others' messages (2)", _unread(_tid) == 2, _unread(_tid))
+s_, r_ = req("PUT", f"/v1/owner/threads/{_tid}/read", {}, OWN); check("owner marks thread read", s_ == 200, (s_, r_))
+check("unread is 0 after read", _unread(_tid) == 0, _unread(_tid))
+_p(OWN, "owner", "mine2"); check("owner's own message does not add unread", _unread(_tid) == 0)
+import time; time.sleep(0.05); _p(A, "wk-a", "three"); check("new message from others adds unread (1)", _unread(_tid) == 1, _unread(_tid))
+s_, _ = req("PUT", f"/v1/owner/threads/{_tid}/read", {}, A); check("agent cannot set owner read marker (403)", s_ == 403, s_)
+s_, _ = req("PUT", "/v1/owner/threads/nope/read", {}, OWN); check("read marker on unknown thread 404", s_ == 404, s_)
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)

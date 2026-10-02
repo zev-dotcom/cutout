@@ -179,3 +179,9 @@ create table if not exists smith_wake_hooks (
 );
 create index if not exists smith_wake_hooks_method_idx on smith_wake_hooks (method) where enabled;
 alter table smith_wake_hooks enable row level security;
+
+create table if not exists smith_owner_reads (
+  thread_id    text primary key references smith_threads(thread_id) on delete cascade,
+  last_read_at timestamptz not null default now()
+);
+alter table smith_owner_reads enable row level security;

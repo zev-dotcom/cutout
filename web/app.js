@@ -210,7 +210,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-01.4";
+var SMITH_BUILD = "2026-10-01.5";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -412,11 +412,21 @@ function appendMessages(msgs, opts){
   });
   box.dataset.lastday = lastDay;
 }
+var readPing = {};
 function markRead(tid, msgs){
   if (!msgs.length) return;
   var map = loadRead();
   map[tid] = msgs[msgs.length - 1].id;
   saveRead(map);
+  // Server-side owner read marker (survives devices). Best effort, at most one call per 3s per thread.
+  var now = Date.now();
+  if (now - (readPing[tid] || 0) < 3000) return;
+  readPing[tid] = now;
+  api("PUT", "/v1/owner/threads/" + encodeURIComponent(tid) + "/read", {})
+    .then(function(){
+      var t = state.threadById[tid];
+      if (t){ t.unread = 0; renderThreadList(); }
+    }).catch(function(){ /* older instance without the marker: the list keeps its own count */ });
 }
 function openThread(tid){
   state.currentThread = tid;
