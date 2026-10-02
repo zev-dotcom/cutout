@@ -392,6 +392,15 @@ async function postMessage(req, auth) {
       error: "from must match authenticated agent"
     });
   }
+  // P2-b: legacy callers without X-Agent-Id have no bound identity, so `from`
+  // is unchecked above -- but reserved identities are never claimable.
+  // (Unmanaged legacy threads have no sender authenticity by design; see
+  // docs/smith-api.md.)
+  if (auth.kind === "legacy" && RESERVED_AGENT_RE.test(body.from)) {
+    return jres(403, {
+      error: "from is reserved"
+    });
+  }
   if (await isManagedThread(body.thread_id)) {
     if (auth.kind === "legacy") {
       // Strict mode (default): the shared legacy token is refused on managed
@@ -726,7 +735,18 @@ const SETUP_KEY = Deno.env.get("SMITH_SETUP_KEY") ?? "";
 if (!SETUP_KEY) console.error("smith: SMITH_SETUP_KEY unset — /v1/owner/claim is DISABLED");
 // Strict legacy mode (default on): the legacy bus token (+ X-Agent-Id) is
 // refused on managed-thread routes. Relax only during a legacy migration.
-const LEGACY_STRICT = (Deno.env.get("SMITH_LEGACY_STRICT") ?? "1") === "1";
+// P2-a (fail closed): only explicit "0"/"false" disables; any other value
+// (including malformed) keeps strict ON with a loud warning.
+const LEGACY_STRICT = (()=>{
+  const raw = Deno.env.get("SMITH_LEGACY_STRICT");
+  if (raw === undefined) return true;
+  const v = raw.toLowerCase();
+  if (v === "0" || v === "false") return false;
+  if (v !== "1" && v !== "true") {
+    console.error(`smith: unrecognized SMITH_LEGACY_STRICT=${JSON.stringify(raw)} — failing closed (strict ON)`);
+  }
+  return true;
+})();
 // Brute-force budgets for the unauthenticated routes, enforced globally per
 // instance (never keyed on client-supplied X-Forwarded-For). Env-overridable
 // for tests; the defaults assume ~30-bit pairing codes with 10-minute life.
@@ -826,6 +846,14 @@ async function resolveAuth(req) {
     const hid = req.headers.get("X-Agent-Id");
     const aid = hid && hid.length ? hid : null;
     if (aid) {
+      // P2-b: reserved identities cannot be claimed via the legacy header.
+      if (RESERVED_AGENT_RE.test(aid)) {
+        await auditFailedAuth("legacy", {
+          reason: "reserved_id",
+          agent_id: aid
+        });
+        return null;
+      }
       // Revocation applies to every credential class, including the legacy
       // bus-token path: a revoked identity cannot return through it.
       const rows = await timedQuery(sql`select revoked_at from ${S("smith_agents")} where agent_id = ${aid}`, "auth_legacy_revoked");
@@ -1499,13 +1527,37 @@ async function verifyMember(req, auth, threadId, aid) {
   if (!await isManagedThread(threadId)) return jres(404, {
     error: "thread not found"
   });
+  // P2-d: check state before mutating. Verifying an already-verified member
+  // is a no-op (idempotent 200); verifying a non-member is a 404.
+  const cur = await timedQuery(sql`select legacy_unverified, added_at from ${S("smith_thread_members")} where thread_id = ${threadId} and agent_id = ${aid}`, "member_verify_state");
+  if (!cur.length) return jres(404, {
+    error: "member not found"
+  });
+  // P2-d: audit the member's message count so the owner sees what history
+  // they are granting access to.
+  const mc = await timedQuery(sql`select count(*)::int as c from ${T("messages")} where thread_id = ${threadId} and from_agent = ${aid}`, "member_verify_msgcount");
+  const msgCount = mc[0].c;
+  if (!cur[0].legacy_unverified) {
+    await audit(OWNER_ID, "verify_member", {
+      thread_id: threadId,
+      agent_id: aid,
+      already_verified: true,
+      message_count: msgCount
+    });
+    return jres(200, {
+      ok: true,
+      already_verified: true
+    });
+  }
   const rows = await timedQuery(sql`update ${S("smith_thread_members")} set legacy_unverified = false where thread_id = ${threadId} and agent_id = ${aid} returning 1`, "member_verify");
   if (!rows.length) return jres(404, {
     error: "member not found"
   });
   await audit(OWNER_ID, "verify_member", {
     thread_id: threadId,
-    agent_id: aid
+    agent_id: aid,
+    message_count: msgCount,
+    member_since: cur[0].added_at ? String(cur[0].added_at) : null
   });
   return jres(200, {
     ok: true

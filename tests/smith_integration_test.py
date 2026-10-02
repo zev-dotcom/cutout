@@ -407,6 +407,17 @@ check("member flag cleared after verify", ok and out.strip() == "f", out)
 s, au = req("GET", "/v1/owner/audit?limit=20", headers=bearer(OWNER))
 acts = [r.get("action") for r in au.get("audit", [])]
 check("verify_member is audited", "verify_member" in acts, f"{acts}")
+# P2-d: re-verifying is idempotent; audit carries the message count.
+s, vd = req("POST", f"/v1/owner/threads/{TH_G}/members/legacy-ghost/verify", {}, bearer(OWNER))
+check("re-verify already-verified -> 200 already_verified", s == 200 and vd.get("already_verified") is True, f"{s} {vd}")
+s, au = req("GET", "/v1/owner/audit?limit=20", headers=bearer(OWNER))
+vd_acts = [r for r in au.get("audit", []) if r.get("action") == "verify_member"]
+check("verify_member audit has message_count", any("message_count" in (r.get("detail") or {}) for r in vd_acts), f"{vd_acts[:1]}")
+# P2-b: reserved identities not claimable via legacy credentials.
+s, _ = req("GET", "/v1/threads", headers=legacy_headers("owner"))
+check("legacy X-Agent-Id: owner -> 401", s == 401, f"{s}")
+s, _ = req("POST", "/v1/messages", {"thread_id": "x_cutout_thread_p2b_spoof", "from": "owner", "to": "*", "type": "note", "body": "spoof"}, legacy_headers("legacy-bot"))
+check("legacy post from: owner -> 403", s == 403, f"{s}")
 
 # 15. legacy cutout.py behavior intact on unmanaged threads
 LEG = legacy_headers("legacy-bot")
@@ -610,6 +621,27 @@ s, _ = req("GET", f"/v1/messages?thread_id={TH_LEG}&limit=1", headers=legacy_hea
 s, _ = req("GET", f"/v1/messages?thread_id={TH_LEG}&limit=1", headers=legacy_headers("rot-b"))
 ok, rows = psql(f"select string_agg(distinct identity, ',') from {SCHEMA}.rate_log where identity like 'legacy%'")
 check("legacy identities collapse to single 'legacy' bucket", ok and rows.strip() == "legacy", rows.strip() if ok else rows)
+
+# 24. P2-c: rate-limit isolation and global ceiling (real limiter via direct
+# SQL setup, not mocks). Defaults: 60/min per identity, 600/min global.
+# (/health bypasses the limiter; use a /v1/ route. agent-b is revoked by an
+# earlier test, so the "other identity" is the owner.)
+ok, _ = psql(f"DELETE FROM {SCHEMA}.rate_log;")
+check("psql: clear rate_log", ok)
+ok, _ = psql(f"INSERT INTO {SCHEMA}.rate_log (at, identity) SELECT now(), 'agent:agent-a' FROM generate_series(1, 60);")
+check("psql: fill agent-a rate bucket", ok)
+s, _ = req("GET", "/v1/threads", headers=bearer(TOK_A))
+check("exhausted identity -> 429", s == 429, f"{s}")
+s, _ = req("GET", "/v1/owner/threads", headers=bearer(OWNER))
+check("other identity unaffected -> 200", s == 200, f"{s}")
+ok, _ = psql(f"DELETE FROM {SCHEMA}.rate_log;")
+check("psql: clear rate_log", ok)
+ok, _ = psql(f"INSERT INTO {SCHEMA}.rate_log (at, identity) SELECT now(), 'flood-' || g FROM generate_series(1, 600) g;")
+check("psql: fill global rate budget", ok)
+s, _ = req("GET", "/v1/owner/threads", headers=bearer(OWNER))
+check("global ceiling trips for fresh identity -> 429", s == 429, f"{s}")
+ok, _ = psql(f"DELETE FROM {SCHEMA}.rate_log;")
+check("psql: clear rate_log", ok)
 
 # P2-4: idempotency uniqueness is named; re-running the migration is a no-op.
 # Fresh-install path (schema_smith.sql): widened named PK, thread_id NOT NULL.

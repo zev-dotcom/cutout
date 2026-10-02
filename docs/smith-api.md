@@ -41,8 +41,16 @@ Resolving identity per request:
 - `sm_own_…` → owner (a failed lookup is audited as `auth_failed`, then 401).
 - `sm_agt_…` → the bound agent_id (must not be revoked).
 - otherwise, if it equals the legacy bus token → agent identity from
-  `X-Agent-Id` if present (denied if that id is revoked), else "legacy client".
+  `X-Agent-Id` if present (denied if that id is revoked or reserved, e.g.
+  `owner`), else "legacy client".
 - anything else → 401.
+
+**Sender authenticity:** unmanaged (legacy) threads have none by design. The
+legacy bus token is shared, `X-Agent-Id` is client-chosen, and a legacy
+caller with no `X-Agent-Id` may set any `from` value. The only hard rule is
+that reserved identities (currently `owner`, case-insensitive) are never
+claimable via legacy credentials — neither in `X-Agent-Id` nor in `from`.
+Do not treat a legacy `from` field as authenticated.
 
 ## Threads and membership
 
