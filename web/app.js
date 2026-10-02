@@ -210,7 +210,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-01.6";
+var SMITH_BUILD = "2026-10-02.1";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -352,6 +352,29 @@ function receiptLabel(msg){
 function isRenameNote(msg){
   return msg && msg.metadata && msg.metadata.x_cutout_thread_rename;
 }
+/* @mentions: the server stores ids in metadata.mentions; the text keeps "@Name". Chips are drawn
+   from that list only, so typed "@x" with no stored id stays plain text. */
+function mentionLabel(id){ return id === "owner" ? "You" : agentLabel(id); }
+function bodyHtml(msg){
+  var html = esc(msg.body || "");
+  var ids = msg.metadata && Array.isArray(msg.metadata.mentions) ? msg.metadata.mentions : [];
+  if (!ids.length) return html;
+  var names = [];
+  ids.forEach(function(id){
+    if (id === "owner"){ names.push({id: id, n: "owner"}, {id: id, n: "You"}); }
+    else names.push({id: id, n: agentLabel(id)});
+  });
+  names.sort(function(x, y){ return y.n.length - x.n.length; });
+  names.forEach(function(x){
+    var tag = "@" + esc(x.n);
+    var cls = "mention" + (x.id === "owner" ? " me" : "");
+    html = html.split(tag).join('<span class="' + cls + '">' + tag + "</span>");
+  });
+  return html;
+}
+function mentionsMe(msg){
+  return !!(msg.metadata && Array.isArray(msg.metadata.mentions) && msg.metadata.mentions.indexOf("owner") >= 0);
+}
 function msgHtml(msg){
   var mine = msg.from === "owner";
   if (isRenameNote(msg)){
@@ -367,15 +390,15 @@ function msgHtml(msg){
   if (mine){
     var lbl = receiptLabel(msg);
     return '<div class="msgrow msg-out" data-mid="' + esc(msg.id) + '">' +
-      '<div class="bub">' + esc(msg.body || "") + "</div>" +
+      '<div class="bub">' + bodyHtml(msg) + "</div>" +
       (lbl ? '<div class="rcpt">' + lbl + "</div>" : "") + "</div>";
   }
   var nm = esc(agentLabel(msg.from));
   var plat = agentPlat(msg.from);
   var who = '<div class="who">' + nm +
     (plat ? ' <span class="plat">' + esc(String(plat).toUpperCase()) + "</span>" : "") + "</div>";
-  return '<div class="msgrow them" data-mid="' + esc(msg.id) + '">' + who +
-    '<div class="bub">' + esc(msg.body || "") + "</div></div>";
+  return '<div class="msgrow them' + (mentionsMe(msg) ? " ment-me" : "") + '" data-mid="' + esc(msg.id) + '">' + who +
+    '<div class="bub">' + bodyHtml(msg) + "</div></div>";
 }
 /* Cue dots: rendered ONLY from the working array handed in. Empty => nothing. */
 function workingPillHtml(working){
@@ -508,6 +531,50 @@ function startListPoll(){
   }, 15000);
 }
 
+/* ---------- @mention autocomplete ---------- */
+var mentionPicks = {};      // agent_id -> label inserted into the text
+var mentionSel = 0, mentionCands = [], mentionRange = null;
+function closeMentionPop(){ var p = $("mentionPop"); if (p){ p.hidden = true; p.innerHTML = ""; } mentionCands = []; mentionRange = null; }
+function mentionCandidates(q){
+  var t = state.threadById[state.currentThread];
+  var ms = (t && t.members || []).filter(function(m){ return m.agent_id !== "owner"; });
+  q = q.toLowerCase();
+  return ms.map(function(m){ return {id: m.agent_id, label: agentLabel(m.agent_id), plat: agentPlat(m.agent_id)}; })
+    .filter(function(c){ return !q || c.label.toLowerCase().indexOf(q) === 0 || c.id.toLowerCase().indexOf(q) === 0; })
+    .slice(0, 6);
+}
+function renderMentionPop(){
+  var p = $("mentionPop");
+  if (!mentionCands.length){ closeMentionPop(); return; }
+  p.innerHTML = mentionCands.map(function(c, i){
+    return '<button type="button" class="mrow' + (i === mentionSel ? " sel" : "") + '" data-i="' + i + '">' +
+      '<span class="mav">' + esc(c.label.slice(0, 1).toUpperCase()) + '</span>' +
+      '<span class="mnm">' + esc(c.label) + '</span>' +
+      (c.plat && String(c.plat).toLowerCase() !== "unknown" ? '<span class="plat">' + esc(String(c.plat).toUpperCase()) + "</span>" : "") + "</button>";
+  }).join("");
+  p.hidden = false;
+}
+function updateMentionPop(){
+  var input = $("composerInput");
+  var caret = input.selectionStart == null ? input.value.length : input.selectionStart;
+  var m = /(^|\s)@([^\s@]*)$/.exec(input.value.slice(0, caret));
+  if (!m){ closeMentionPop(); return; }
+  mentionRange = {start: caret - m[2].length - 1, end: caret};
+  mentionCands = mentionCandidates(m[2]);
+  mentionSel = 0;
+  renderMentionPop();
+}
+function pickMention(i){
+  var c = mentionCands[i]; if (!c || !mentionRange) return;
+  var input = $("composerInput"), v = input.value;
+  var ins = "@" + c.label + " ";
+  input.value = v.slice(0, mentionRange.start) + ins + v.slice(mentionRange.end);
+  var pos = mentionRange.start + ins.length;
+  mentionPicks[c.id] = c.label;
+  closeMentionPop();
+  input.focus(); try { input.setSelectionRange(pos, pos); } catch(e){}
+}
+
 /* ---------- composer ---------- */
 async function sendMessage(){
   var tid = state.currentThread;
@@ -517,6 +584,7 @@ async function sendMessage(){
   var t = state.threadById[tid];
   var members = (t && t.members || []).filter(function(m){ return m.agent_id !== "owner"; });
   var to = members.length === 1 ? members[0].agent_id : "*";
+  var mentions = Object.keys(mentionPicks).filter(function(id){ return body.indexOf("@" + mentionPicks[id]) >= 0; });
   $("sendBtn").disabled = true;
   try {
     await api("POST", "/v1/messages", {
@@ -525,9 +593,10 @@ async function sendMessage(){
       to: to,
       type: "note",
       body: body,
+      ...(mentions.length ? { metadata: { mentions: mentions } } : {}),
       idempotency_key: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()))
     });
-    input.value = "";
+    input.value = ""; mentionPicks = {}; closeMentionPop();
     pollThread(); // fetch our own message right away
   } catch(e){
     toast(e.message); // keep the text; nothing is faked
@@ -1221,7 +1290,29 @@ $("rotateTokenBtn").addEventListener("click", rotateToken);
 $("changeInstanceBtn").addEventListener("click", changeInstance);
 $("sendBtn").addEventListener("click", sendMessage);
 $("composerInput").addEventListener("keydown", function(e){
+  var open = !$("mentionPop").hidden && mentionCands.length;
+  if (open && (e.key === "ArrowDown" || e.key === "ArrowUp")){
+    e.preventDefault();
+    mentionSel = (mentionSel + (e.key === "ArrowDown" ? 1 : mentionCands.length - 1)) % mentionCands.length;
+    renderMentionPop(); return;
+  }
+  if (open && (e.key === "Enter" || e.key === "Tab")){ e.preventDefault(); pickMention(mentionSel); return; }
+  if (open && e.key === "Escape"){ e.preventDefault(); closeMentionPop(); return; }
   if (e.key === "Enter" && !e.shiftKey){ e.preventDefault(); sendMessage(); }
+});
+$("composerInput").addEventListener("input", updateMentionPop);
+$("composerInput").addEventListener("click", updateMentionPop);
+$("mentionPop").addEventListener("pointerdown", function(e){
+  var b = e.target.closest(".mrow"); if (!b) return;
+  e.preventDefault(); pickMention(Number(b.dataset.i));
+});
+$("mentionBtn").addEventListener("click", function(){
+  var input = $("composerInput"); input.focus();
+  var v = input.value, pos = input.selectionStart == null ? v.length : input.selectionStart;
+  var pre = v.slice(0, pos), need = pre && !/\s$/.test(pre) ? " " : "";
+  input.value = pre + need + "@" + v.slice(pos);
+  var np = pos + need.length + 1; try { input.setSelectionRange(np, np); } catch(e){}
+  updateMentionPop();
 });
 $("threadSearch").addEventListener("input", function(e){
   state.search = e.target.value;

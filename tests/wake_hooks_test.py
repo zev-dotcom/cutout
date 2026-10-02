@@ -199,6 +199,11 @@ req("POST", "/v1/messages", {"thread_id": _ptid, "from": "wk-a", "to": "*", "typ
 ph = [h for h in hits() if "push.test.example/dev1" in h["url"]]
 check("body included only after owner opt-in", len(ph) >= 3 and decrypt(ph[-1]).get("body") == "visible body", len(ph))
 req("PUT", "/v1/owner/push/settings", {"include_body": False}, OWN)
+# --- @mentions ---
+_t.sleep(float(os.environ.get("SMITH_PUSH_DEBOUNCE_MS", "1500")) / 1000 + 1)
+req("POST", "/v1/messages", {"thread_id": _ptid, "from": "wk-a", "to": "*", "type": "note", "body": "hey owner", "metadata": {"mentions": ["owner", "ghost-agent"]}}, A); _t.sleep(1.5)
+ph = [h for h in hits() if "push.test.example/dev1" in h["url"]]
+check("owner push flags a mention", len(ph) >= 1 and decrypt(ph[-1]).get("mention") is True and "hey owner" not in json.dumps(decrypt(ph[-1])), decrypt(ph[-1]) if ph else None)
 s_, _ = req("PUT", "/v1/owner/push/settings", {"contact": "javascript:alert(1)"}, OWN); check("bad contact rejected", s_ == 422, s_)
 req("POST", "/v1/owner/threads/%s/read" % _ptid, {}, OWN)
 s_, r_ = req("POST", "/v1/owner/push/test", {}, OWN); check("push test ok", s_ == 200 and r_["results"][0]["status"] == "ok", r_)
@@ -208,4 +213,28 @@ s_, r_ = req("GET", "/v1/owner/push", tok=OWN); check("410 endpoint auto-removed
 s_, r_ = req("DELETE", "/v1/owner/push/subscription/" + sub["id"], None, OWN); check("revoke device", s_ == 200, (s_, r_))
 s_, r_ = req("GET", "/v1/owner/push", tok=OWN); check("device list empty after revoke", r_["devices"] == [], r_)
 _ = sql("select count(*) from smith.smith_audit where action like 'push%' and (detail::text like '%private%' or detail::text like '%p256dh%' or detail::text like '%auth%')"); check("audit holds no keys", _ == "0", _)
+# --- @mentions: validation, targeted wake, poll visibility ---
+MA, MB, MC = pair("mn-a"), pair("mn-b"), pair("mn-c")
+s, th2 = req("POST", "/v1/threads", {"member_ids": ["mn-a", "mn-b", "mn-c"], "name": "mentions"}, OWN); T2 = th2["thread_id"]
+s, w = req("PUT", "/v1/owner/agents/mn-c/wake", {"method": "webhook", "url": "https://hooks.test.example/wakec"}, OWN)
+def post2(tok, frm, to, body, **kw): return req("POST", "/v1/messages", {"thread_id": T2, "from": frm, "to": to, "type": "note", "body": body, **kw}, tok)
+s, _ = post2(MA, "mn-a", "mn-b", "x", metadata={"mentions": "mn-c"}); check("mentions must be an array (422)", s == 422, s)
+s, _ = post2(MA, "mn-a", "mn-b", "x", metadata={"mentions": [1]}); check("mentions entries must be strings (422)", s == 422, s)
+nc = len([h for h in hits() if "hooks.test.example/wakec" in h["url"]])
+s, m = post2(MA, "mn-a", "mn-b", "plain to b")
+_t.sleep(1.5); check("no wake for a non-mentioned member", len([h for h in hits() if "hooks.test.example/wakec" in h["url"]]) == nc)
+s, m = post2(MA, "mn-a", "mn-b", "ping @mn-c", metadata={"mentions": ["mn-c", "mn-c", "ghost-agent", "owner"]})
+check("mention post 201", s == 201, s)
+_t.sleep(1.5); wc = [h for h in hits() if "hooks.test.example/wakec" in h["url"]]
+check("mentioned member is woken", len(wc) == nc + 1, len(wc) - nc)
+s, g = req("GET", "/v1/messages?thread_id=" + T2, tok=MC)
+got = [x for x in g["messages"] if x["body"] == "ping @mn-c"]
+check("mentioned agent sees the message addressed to someone else", len(got) == 1 and got[0]["metadata"]["mentions"] == ["mn-c", "owner"], got)
+check("unmentioned message not visible to mn-c", all(x["body"] != "plain to b" for x in g["messages"]))
+for _i in range(21):
+    post2(MA, "mn-a", "mn-b", "m%d" % _i, metadata={"mentions": ["owner"]}); 
+s, g = req("GET", "/v1/messages?thread_id=" + T2, tok=MB)
+ms = [x for x in g["messages"] if x["body"].startswith("m") and x["body"][1:].isdigit()]
+n_own = sum(1 for x in ms if "owner" in x["metadata"].get("mentions", []))
+check("owner mentions capped per sender (20/h, 1 used earlier)", n_own == 19 and len(ms) == 21, (n_own, len(ms)))
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)

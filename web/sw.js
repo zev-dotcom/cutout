@@ -8,7 +8,7 @@ self.addEventListener("push", function(e){
   try { d = e.data ? e.data.json() : {}; } catch (x) { d = {}; }
   var count = d.count || 0;
   var title = d.test ? "Smith" : "Smith · " + (d.title || "new message");
-  var body = d.body || (d.test ? "Notifications are working." : count + " new message" + (count === 1 ? "" : "s"));
+  var body = d.body || (d.test ? "Notifications are working." : (d.mention ? "mentioned you" + (count > 1 ? " · " + count + " new messages" : "") : count + " new message" + (count === 1 ? "" : "s")));
   var opts = {
     body: body,
     icon: "icons/icon-192.png",

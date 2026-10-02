@@ -378,6 +378,31 @@ async function postMessage(req, auth) {
   if (linkErr) return jres(422, {
     error: linkErr
   });
+  if (metadata.mentions !== undefined) {
+    // @mentions: structured list of thread members. Anything that is not a member is dropped.
+    if (!Array.isArray(metadata.mentions) || metadata.mentions.some((m)=>typeof m !== "string")) return jres(422, {
+      error: "metadata.mentions must be an array of agent ids"
+    });
+    const want = [...new Set(metadata.mentions)].slice(0, 10);
+    let ok = [];
+    if (want.length) {
+      const mem = await timedQuery(sql`select agent_id from ${S("smith_thread_members")} where thread_id = ${body.thread_id} and agent_id = any(${want})`, "mention_members");
+      const have = new Set(mem.map((r)=>r.agent_id));
+      ok = want.filter((m)=> m === OWNER_ID || have.has(m));
+    }
+    // Per-sender cap on mentions of the owner (they drive push labels): over the cap, the owner id
+    // is dropped (the message still posts and the normal push rules apply).
+    if (ok.includes(OWNER_ID) && body.from !== OWNER_ID) {
+      const cnt = await timedQuery(sql`select count(*)::int as n from ${S("smith_audit")} where action = 'owner_mention' and actor = ${body.from} and at > now() - interval '1 hour'`, "mention_rate");
+      if (cnt[0].n >= MENTION_OWNER_PER_HOUR) {
+        ok = ok.filter((m)=> m !== OWNER_ID);
+        await audit(body.from, "owner_mention_limited", { thread_id: body.thread_id });
+      } else {
+        await audit(body.from, "owner_mention", { thread_id: body.thread_id });
+      }
+    }
+    metadata.mentions = ok;
+  }
   // Smith: identity binding + thread membership. Legacy callers keep v1.1 semantics.
   if (auth.kind === "owner") {
     if (body.from !== OWNER_ID) return jres(403, {
@@ -472,7 +497,7 @@ async function postMessage(req, auth) {
     if (auth.kind === "agent" || auth.kind === "owner") {
       urgentFlag = false;
       try { urgentFlag = await urgentDecision(from, body.thread_id, body.to, body.urgent === true); } catch (e) { console.error("urgent decision failed", e); }
-      afterPostWake(body.thread_id, from, body.to, urgentFlag, body.body);
+      afterPostWake(body.thread_id, from, body.to, urgentFlag, body.body, metadata.mentions);
     }
     return jres(201, {
       id: rows[0].id,
@@ -546,7 +571,7 @@ async function getMessagesInner(req, arrivedAt, auth) {
       where true
       ${cursor ? sql`and ((extract(epoch from created_at) * 1000000)::bigint > ${cursor.us} or ((extract(epoch from created_at) * 1000000)::bigint = ${cursor.us} and id > ${cursor.id}))` : sql``}
       ${threadId ? sql`and thread_id = ${threadId}` : sql``}
-      ${to ? sql`and to_agent = ${to}` : scopeAgent ? sql`and (to_agent = ${scopeAgent} or to_agent = '*')` : sql``}
+      ${to ? sql`and to_agent = ${to}` : scopeAgent ? sql`and (to_agent = ${scopeAgent} or to_agent = '*' or jsonb_exists(metadata->'mentions', ${scopeAgent}))` : sql``}
       ${auth.kind === "agent" ? sql`and exists (
         select 1 from ${S("smith_thread_members")} tm
         where tm.thread_id = ${T("messages")}.thread_id
@@ -727,6 +752,7 @@ async function getThreads(req) {
 // codes for legacy callers. New routes live under the same /v1/ prefix.
 const SMITH_VERSION = "1.0";
 const OWNER_ID = "owner";
+const MENTION_OWNER_PER_HOUR = Number(Deno.env.get("SMITH_MENTION_OWNER_PER_HOUR") ?? 20);
 const PAIRING_CODE_LEN = 6;
 // Pairing codes default to 10 minutes (short-lived, single-use). The owner
 // may explicitly request longer, up to 30 days.
@@ -1950,7 +1976,7 @@ async function wakeUnread(agentId) {
     from ${T("messages")} m
     join ${S("smith_thread_members")} tm on tm.thread_id = m.thread_id and tm.agent_id = ${agentId} and tm.legacy_unverified = false and m.created_at >= tm.added_at
     join ${S("smith_wake_hooks")} h on h.agent_id = ${agentId}
-    where (m.to_agent = ${agentId} or m.to_agent = '*') and m.from_agent <> ${agentId}
+    where (m.to_agent = ${agentId} or m.to_agent = '*' or jsonb_exists(m.metadata->'mentions', ${agentId})) and m.from_agent <> ${agentId}
       and m.created_at > coalesce(h.last_poll_at, h.updated_at)`, "wake_unread");
   return r[0].n;
 }
@@ -2020,13 +2046,14 @@ async function urgentDecision(from, threadId, to, requested) {
   await audit(from, "urgent_wake_limited", { thread_id: threadId, to });
   return false;
 }
-async function wakeAfterPost(threadId, from, to, urgentRequested) {
+async function wakeAfterPost(threadId, from, to, urgentRequested, mentions) {
+  const ment = Array.isArray(mentions) ? mentions : [];
   const recips = await timedQuery(sql`
     select h.agent_id from ${S("smith_wake_hooks")} h
     join ${S("smith_agents")} a on a.agent_id = h.agent_id and a.revoked_at is null and a.token_hash is not null
     join ${S("smith_thread_members")} tm on tm.thread_id = ${threadId} and tm.agent_id = h.agent_id and tm.legacy_unverified = false
     where h.enabled and h.method in ('webhook','email') and h.agent_id <> ${from}
-      and (${to} = '*' or h.agent_id = ${to})`, "wake_recipients");
+      and (${to} = '*' or h.agent_id = ${to} or h.agent_id = any(${ment}))`, "wake_recipients");
   if (!recips.length) return { urgent: false };
   const urgent = urgentRequested === true;
   await Promise.allSettled(recips.map((r)=>wakeFlow(r.agent_id, threadId, urgent)));
@@ -2121,6 +2148,8 @@ async function ownerUnreadTotals(threadId) {
       (select count(*)::int from ${T("messages")} m join ${S("smith_threads")} t on t.thread_id = m.thread_id
         left join ${S("smith_owner_reads")} orr on orr.thread_id = m.thread_id
         where m.from_agent <> ${OWNER_ID} and m.created_at > coalesce(orr.last_read_at, 'epoch'::timestamptz)) as total_unread,
+      (select count(*)::int from ${T("messages")} m left join ${S("smith_owner_reads")} orr on orr.thread_id = m.thread_id
+        where m.thread_id = ${threadId} and m.from_agent <> ${OWNER_ID} and jsonb_exists(m.metadata->'mentions', ${OWNER_ID}) and m.created_at > coalesce(orr.last_read_at, 'epoch'::timestamptz)) as mention_unread,
       (select name from ${S("smith_threads")} where thread_id = ${threadId}) as name`, "push_unread");
   return r[0];
 }
@@ -2144,7 +2173,7 @@ async function pushNotifyOwner(threadId, msgBody, force) {
   const u = await ownerUnreadTotals(threadId);
   if (!u || u.thread_unread <= 0) return "nothing_unread";
   const payload = {
-    v: 1, thread_id: threadId, title: u.name || "Smith", count: u.thread_unread, total: u.total_unread,
+    v: 1, thread_id: threadId, title: u.name || "Smith", count: u.thread_unread, total: u.total_unread, ...(u.mention_unread > 0 ? { mention: true } : {}),
     ...(cfg.include_body && msgBody ? { body: String(msgBody).slice(0, 140) } : {})
   };
   for (const s of claimed){
@@ -2234,8 +2263,8 @@ async function pushRoutes(req, auth, segs) {
   }
   return jres(404, { error: "not found" });
 }
-function afterPostWake(threadId, from, to, urgentRequested, pushBodyHint) {
-  const p = wakeAfterPost(threadId, from, to, urgentRequested).catch((e)=>console.error("wake failed", e));
+function afterPostWake(threadId, from, to, urgentRequested, pushBodyHint, mentions) {
+  const p = wakeAfterPost(threadId, from, to, urgentRequested, mentions).catch((e)=>console.error("wake failed", e));
   try { globalThis.EdgeRuntime?.waitUntil?.(p); } catch { /* local runs just let it float */ }
   if (from !== OWNER_ID) {
     const q = pushNotifyOwner(threadId, pushBodyHint, false).catch((e)=>console.error("push failed", e));
