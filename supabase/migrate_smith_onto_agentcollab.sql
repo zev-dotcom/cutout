@@ -36,6 +36,14 @@
 -- (fails if Smith inserted the same key in two threads during the window;
 -- check first).
 --
+-- M3 (known gap, acceptable v1): a legacy row (from, key, NULL thread_id)
+-- and a Smith row (from, key, thread) do not conflict with each other --
+-- the partial index only guards NULL-vs-NULL, the unique constraint only
+-- guards equal non-null threads. Smith's dedup query filters by thread_id,
+-- so it never sees legacy NULL rows; the two scopes are independent. No
+-- duplicate messages result: the legacy double-post case (same key twice,
+-- both NULL) is still rejected by the partial index.
+--
 -- Builder: verify the real agentcollab tables/columns match the assumed v1.1
 -- shape before running (especially idempotency_keys PK and messages.type).
 
@@ -137,6 +145,12 @@ begin
     on conflict (k) do update set v = excluded.v;
   return jsonb_build_object('purged', purged, 'links_marked_consumed', marked);
 end $func$;
+    -- M5: revoke public execute on the purge function we just created. The
+    -- Smith edge function calls purge at cold start as the DB role in
+    -- SUPABASE_DB_URL; deploy must confirm that role retains execute (it
+    -- does when the migration and the function share the role). We do not
+    -- touch permissions when the live schema already had its own purge.
+    revoke all on function agentcollab.purge(int) from public;
   end if;
 end $mig$;
 
@@ -282,7 +296,15 @@ begin;
 alter table agentcollab.idempotency_keys add column if not exists thread_id text;
 update agentcollab.idempotency_keys k set thread_id = m.thread_id
   from agentcollab.messages m where m.id = k.message_id and k.thread_id is null;
-alter table agentcollab.idempotency_keys drop constraint if exists idempotency_keys_pkey;
+-- M1: drop whatever the live PK is, looked up by contype not by name (the
+-- live constraint may not be named idempotency_keys_pkey).
+do $$ declare pkname text; begin
+  select conname into pkname from pg_constraint
+    where conrelid = 'agentcollab.idempotency_keys'::regclass and contype = 'p';
+  if pkname is not null then
+    execute format('alter table agentcollab.idempotency_keys drop constraint %I', pkname);
+  end if;
+end $$;
 do $$ begin
   if not exists (
     select 1 from pg_constraint
@@ -294,14 +316,15 @@ do $$ begin
       unique (from_agent, idem_key, thread_id);
   end if;
 end $$;
-commit;
--- Legacy double-post guard: NULL thread_id never conflicts in the unique
--- constraint above, which would regress the old PK's rejection of a legacy
--- double-post (same key inserted twice with no thread). This partial index
--- restores it for legacy rows only; Smith rows always carry thread_id.
+-- M2: legacy double-post guard inside the same transaction. NULL thread_id
+-- never conflicts in the unique constraint above, which would regress the
+-- old PK's rejection of a legacy double-post (same key inserted twice with
+-- no thread). This partial index restores it for legacy rows only; Smith
+-- rows always carry thread_id.
 create unique index if not exists idempotency_keys_legacy_uniq
   on agentcollab.idempotency_keys (from_agent, idem_key)
   where thread_id is null;
+commit;
 
 -- P2-D: per-identity rate-limit buckets. The base agentcollab.rate_log only has
 -- (at); add an identity column so the limiter can enforce a per-credential

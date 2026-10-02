@@ -70,8 +70,17 @@ managed; later owner adoption of a legacy thread is explicit and audited.
 supabase functions deploy agentcollab --project-ref spqnjqccdljhprpduvfm
 ```
 
-`CUTOUT_TOKEN` is already set on the live project — it doubles as the
-setup key for step 3. No new secrets needed.
+`AGENTCOLLAB_TOKEN` is already set on the live project. Set the remaining
+secrets:
+
+```bash
+supabase secrets set SMITH_SCHEMA=agentcollab --project-ref spqnjqccdljhprpduvfm
+supabase secrets set SMITH_TABLES_SCHEMA=smith --project-ref spqnjqccdljhprpduvfm
+supabase secrets set SMITH_SETUP_KEY="$(openssl rand -hex 32)" --project-ref spqnjqccdljhprpduvfm
+```
+
+`SMITH_SETUP_KEY` is required: when unset, `/v1/owner/claim` is disabled
+entirely. It is single-use as a setup key (only a hash is stored).
 
 ## 3. Mint the owner token
 
