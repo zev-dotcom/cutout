@@ -210,7 +210,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-02.3";
+var SMITH_BUILD = "2026-10-02.4";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -340,18 +340,29 @@ function renderThreadHeader(t){
     ? "Message " + (others[0].display_name || others[0].agent_id) + "…"
     : "Message " + (t.name || "thread") + "…";
 }
+/* Per-message time: short clock under every bubble; tap the bubble for the full date and seconds. */
+function fmtFull(iso){
+  var d = dOf(iso);
+  return d.toLocaleDateString(undefined, {weekday:"short", month:"short", day:"numeric", year:"numeric"}) + " · " +
+    fmtClock(iso).replace(/ (AM|PM)$/, ":" + (d.getSeconds() < 10 ? "0" : "") + d.getSeconds() + " $1");
+}
+function metaLine(msg){
+  if (!msg.created_at) return receiptLabel(msg);
+  var st = receiptLabel(msg);
+  return '<span class="mt" data-short="' + esc(fmtClock(msg.created_at)) + '" data-full="' + esc(fmtFull(msg.created_at)) + '">' +
+    esc(fmtClock(msg.created_at)) + "</span>" + (st ? " · " + st : "");
+}
 function receiptLabel(msg){
   // Render ONLY from real receipt events attached to the message.
   var rcs = msg.receipts || [];
   if (!rcs.length){
     var sn = msg.seen_by || [];
-    return sn.length ? "✓ <b>seen</b> · " + esc(msg.created_at ? fmtClock(msg.created_at) : "") : "";
+    return sn.length ? "✓ <b>seen</b>" : "";
   }
   var acted = rcs.filter(function(r){ return r.status === "acted"; });
   var recvd = rcs.filter(function(r){ return r.status === "received"; });
-  var t = msg.created_at ? fmtClock(msg.created_at) : "";
-  if (acted.length) return "✓✓ <b>acted</b> · " + esc(t);
-  if (recvd.length) return "✓ <b>received</b> · " + esc(t);
+  if (acted.length) return "✓✓ <b>acted</b>";
+  if (recvd.length) return "✓ <b>received</b>";
   return "";
 }
 function isRenameNote(msg){
@@ -393,7 +404,7 @@ function msgHtml(msg){
     return '<div class="sysmsg">' + esc(msg.body || "") + "</div>";
   }
   if (mine){
-    var lbl = receiptLabel(msg);
+    var lbl = metaLine(msg);
     return '<div class="msgrow msg-out" data-mid="' + esc(msg.id) + '" data-ts="' + esc(msg.created_at || "") + '">' +
       '<div class="bub">' + bodyHtml(msg) + "</div>" +
       (lbl ? '<div class="rcpt">' + lbl + "</div>" : "") + "</div>";
@@ -402,8 +413,9 @@ function msgHtml(msg){
   var plat = agentPlat(msg.from);
   var who = '<div class="who">' + nm +
     (plat ? ' <span class="plat">' + esc(String(plat).toUpperCase()) + "</span>" : "") + "</div>";
+  var tm = msg.created_at ? '<div class="rcpt"><span class="mt" data-short="' + esc(fmtClock(msg.created_at)) + '" data-full="' + esc(fmtFull(msg.created_at)) + '">' + esc(fmtClock(msg.created_at)) + "</span></div>" : "";
   return '<div class="msgrow them' + (mentionsMe(msg) ? " ment-me" : "") + '" data-mid="' + esc(msg.id) + '">' + who +
-    '<div class="bub">' + bodyHtml(msg) + "</div></div>";
+    '<div class="bub">' + bodyHtml(msg) + "</div>" + tm + "</div>";
 }
 /* Cue dots: rendered ONLY from the working array handed in. Empty => nothing. */
 function workingPillHtml(working){
@@ -438,8 +450,24 @@ function appendMessages(msgs, opts){
       lastDay = day;
     }
     box.insertAdjacentHTML("beforeend", msgHtml(m));
+    // Group: consecutive messages from the same sender in the same minute show one time (on the last).
+    var rows = box.querySelectorAll(".msgrow[data-mid]");
+    if (rows.length > 1){
+      var cur = rows[rows.length - 1], prev = rows[rows.length - 2];
+      var a = cur.querySelector(".mt"), b = prev.querySelector(".mt");
+      if (a && b && a.dataset.short === b.dataset.short && prev.className === cur.className &&
+          (prev.className.indexOf("them") < 0 || prev.querySelector(".who").textContent === cur.querySelector(".who").textContent) &&
+          prev.nextElementSibling === cur && !prev.querySelector(".rcpt").textContent.match(/[✓]/)){
+        prev.querySelector(".rcpt").classList.add("mtgrp");
+      }
+    }
   });
   box.dataset.lastday = lastDay;
+}
+function toggleFull(mt){
+  if (!mt) return;
+  var on = mt.classList.toggle("full");
+  mt.textContent = on ? mt.dataset.full : mt.dataset.short;
 }
 var readPing = {};
 function markRead(tid, msgs){
@@ -528,11 +556,12 @@ function applyMarks(marks){
   Object.keys(marks).forEach(function(id){
     var row = box.querySelector('[data-mid="' + id.replace(/"/g, "") + '"]');
     if (!row || !row.classList.contains("msg-out")) return;
-    var lbl = receiptLabel({ receipts: marks[id].receipts, seen_by: marks[id].seen_by, created_at: row.getAttribute("data-ts") || "" });
+    var lbl = metaLine({ receipts: marks[id].receipts, seen_by: marks[id].seen_by, created_at: row.getAttribute("data-ts") || "" });
     var el = row.querySelector(".rcpt");
     if (!lbl){ return; }
     if (!el){ el = document.createElement("div"); el.className = "rcpt"; row.appendChild(el); }
-    if (el.innerHTML !== lbl && !/acted/.test(el.innerHTML)) el.innerHTML = lbl;
+    var wasFull = el.querySelector(".mt.full");
+    if (el.innerHTML !== lbl && !/acted/.test(el.innerHTML)){ el.innerHTML = lbl; if (wasFull) toggleFull(el.querySelector(".mt")); }
   });
 }
 function startThreadStream(tid, gen){
@@ -922,6 +951,9 @@ function healthBlock(a, h){
     " · " + esc(String(h.unread)) + " unread" + (h.unread ? " (oldest " + esc(secs(h.oldest_unread_age_s)) + ")" : "") + "</span></div>" +
     '<div class="hmeta">' + esc(h.wake_method === "none" ? "no wake hook" : "wake: " + h.wake_method + (h.wake_enabled ? "" : " (off)")) +
     " · missed " + esc(String(h.missed_wakes_24h)) + " / " + esc(String(h.wakes_24h)) + " in 24h" + esc(canary) + "</div>" +
+    (h.declared_interval_s ? '<div class="hmeta">declared every ' + esc(secs(h.declared_interval_s)) + " · last poll " +
+      (h.alive_ago_s === null ? "never" : esc(secs(h.alive_ago_s)) + " ago") + (h.stale_vs_declared ? " · <b>over 2x declared</b>" : "") + "</div>" : "") +
+    (h.canary_p95_ms ? '<div class="hmeta">pickup p95 (24h) ' + esc(h.canary_p95_ms < 1000 ? h.canary_p95_ms + " ms" : (h.canary_p95_ms / 1000).toFixed(1) + " s") + "</div>" : "") +
     '<div class="hrow"><button class="hbtn" type="button">Send test</button><span class="hmeta hres"></span></div>';
   var btn = box.querySelector(".hbtn"), res = box.querySelector(".hres");
   btn.addEventListener("click", async function(){
@@ -1437,6 +1469,15 @@ $("threadSearch").addEventListener("input", function(e){
 document.addEventListener("visibilitychange", function(){
   if (state.currentThread && $("threadMsgs") && window.ReadableStream){
     if (document.hidden) stopThreadPoll(); else { startThreadPoll(); pollThread(); }
+  }
+});
+document.addEventListener("click", function(e){
+  var row = e.target.closest && e.target.closest(".msgrow[data-mid]");
+  if (!row || e.target.closest("a,button")) return;
+  var mt = row.querySelector(".mt");
+  if (mt){
+    if (row.querySelector(".rcpt.mtgrp")) row.querySelector(".rcpt.mtgrp").classList.remove("mtgrp");
+    toggleFull(mt);
   }
 });
 applyTheme();
