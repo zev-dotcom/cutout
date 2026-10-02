@@ -65,6 +65,7 @@ from datetime import datetime, timedelta, timezone
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 SETUP_KEY = sys.argv[2] if len(sys.argv) > 2 else "test-setup-key-001"
 BUS_TOKEN = sys.argv[3] if len(sys.argv) > 3 else "test-bus-token-001"
+SCHEMA = os.environ.get("SMITH_SCHEMA", "cutout")  # bus-table schema under test
 
 PASS = []
 FAIL = []
@@ -416,7 +417,7 @@ check("strict: legacy message list excludes managed threads",
 # 16. P0-1: postThread takeover guard — an agent cannot adopt a legacy
 # thread id with history; the owner can, audited, seeded members unverified
 LEGACY_TID = "x_cutout_thread_takeover_" + uuid.uuid4().hex[:8]
-ok, _ = psql(f"INSERT INTO cutout.messages (id, thread_id, from_agent, to_agent, type, body) "
+ok, _ = psql(f"INSERT INTO {SCHEMA}.messages (id, thread_id, from_agent, to_agent, type, body) "
              f"VALUES ('msg_takeover1', '{LEGACY_TID}', 'victim-agent', '*', 'note', 'victim history');")
 check("psql: seed legacy thread with history", ok)
 s, b = req("POST", "/v1/threads", {"name": "takeover", "thread_id": LEGACY_TID}, bearer(TOK_A))
@@ -515,7 +516,7 @@ check("rename is audited (thread_rename)", "thread_rename" in acts, f"{acts}")
 # membership + added_at history rule).
 # Setup: legacy-seeded thread adopted by owner -> unverified member.
 TH_R3 = "x_cutout_thread_r3_unverified"
-psql(f"insert into cutout.messages (id, thread_id, from_agent, to_agent, type, body) values ('msg_r3_legacy1', '{TH_R3}', 'legacy-r3-sender', '*', 'note', 'legacy hello')")
+psql(f"insert into {SCHEMA}.messages (id, thread_id, from_agent, to_agent, type, body) values ('msg_r3_legacy1', '{TH_R3}', 'legacy-r3-sender', '*', 'note', 'legacy hello')")
 s, _ = req("POST", "/v1/threads", {"thread_id": TH_R3, "name": "r3-adopted"}, bearer(OWNER))
 check("owner adopts legacy thread -> 201", s == 201, f"{s}")
 # Pair an agent with the seeded sender id (still unverified).
@@ -565,7 +566,7 @@ s, m = req("GET", f"/v1/messages?thread_id={TH_R3LATE}&limit=10", headers=bearer
 check("managed thread hidden from legacy caller", m.get("messages", []) == [], f"{m.get('messages', [])}")
 
 # P2-D: rate_log carries per-identity values (smoke test for the bucket column).
-ok, rows = psql("select count(*) from cutout.rate_log where identity is not null")
+ok, rows = psql(f"select count(*) from {SCHEMA}.rate_log where identity is not null")
 check("rate_log rows carry identity", ok and rows.strip() != "0", rows.strip() if ok else rows)
 
 # P2-E: reply_to must be same-thread; idempotency scoped to thread.
@@ -585,7 +586,7 @@ check("same key same thread -> 200 duplicate", s == 200 and d3.get("duplicate") 
 # 23. Round-3 P2s (I2 round-3 review of be76d04).
 # P2-2: a missing member row must default to 'infinity' (see nothing), not
 # '-infinity'. White-box check of the exact coalesce default feedMessages uses.
-ok, rows = psql(f"select count(*) from cutout.messages m where m.thread_id = '{TH_R3LATE}' and m.created_at >= coalesce((select tm.added_at from smith_thread_members tm where tm.thread_id = '{TH_R3LATE}' and tm.agent_id = 'ghost-no-such-member'), 'infinity'::timestamptz)")
+ok, rows = psql(f"select count(*) from {SCHEMA}.messages m where m.thread_id = '{TH_R3LATE}' and m.created_at >= coalesce((select tm.added_at from smith_thread_members tm where tm.thread_id = '{TH_R3LATE}' and tm.agent_id = 'ghost-no-such-member'), 'infinity'::timestamptz)")
 check("missing member row sees nothing (fail-closed default)", ok and rows.strip() == "0", rows.strip() if ok else rows)
 
 # P2-3: failed-auth traffic is rate-limited under the fixed 'unauthenticated' bucket.
@@ -593,23 +594,23 @@ s, _ = req("GET", "/v1/threads", headers={"Authorization": "Bearer junk-token-xy
 check("junk token -> 401", s == 401, f"{s}")
 s, _ = req("GET", "/v1/threads", headers={"Authorization": "Bearer sm_agt_no_such_agent"})
 check("unknown agent token -> 401", s == 401, f"{s}")
-ok, rows = psql("select count(*) from cutout.rate_log where identity = 'unauthenticated'")
+ok, rows = psql(f"select count(*) from {SCHEMA}.rate_log where identity = 'unauthenticated'")
 check("failed-auth requests logged under 'unauthenticated'", ok and int(rows.strip()) >= 2, rows.strip() if ok else rows)
 
 # P2-3: legacy callers share one bucket regardless of X-Agent-Id (client-chosen).
 s, _ = req("GET", f"/v1/messages?thread_id={TH_LEG}&limit=1", headers=legacy_headers("rot-a"))
 s, _ = req("GET", f"/v1/messages?thread_id={TH_LEG}&limit=1", headers=legacy_headers("rot-b"))
-ok, rows = psql("select string_agg(distinct identity, ',') from cutout.rate_log where identity like 'legacy%'")
+ok, rows = psql(f"select string_agg(distinct identity, ',') from {SCHEMA}.rate_log where identity like 'legacy%'")
 check("legacy identities collapse to single 'legacy' bucket", ok and rows.strip() == "legacy", rows.strip() if ok else rows)
 
 # P2-4: migration PK constraint is named; re-running the migration is a no-op.
-ok, rows = psql("select conname from pg_constraint where conrelid = 'cutout.idempotency_keys'::regclass and contype = 'p'")
+ok, rows = psql(f"select conname from pg_constraint where conrelid = '{SCHEMA}.idempotency_keys'::regclass and contype = 'p'")
 check("idempotency PK named idempotency_keys_from_key_thread_pkey", ok and rows.strip() == "idempotency_keys_from_key_thread_pkey", rows.strip() if ok else rows)
 p = subprocess.run([f"{_pg}/psql", "-h", "127.0.0.1", "-p", "5433", "-U", "smithtest",
                     "-d", "smithtest", "-v", "ON_ERROR_STOP=1", "-f", "supabase/schema_smith.sql"],
                    env=_env, capture_output=True, text=True)
 check("schema_smith.sql re-runs cleanly", p.returncode == 0, (p.stderr or "")[:200])
-ok, rows = psql("select conname from pg_constraint where conrelid = 'cutout.idempotency_keys'::regclass and contype = 'p'")
+ok, rows = psql(f"select conname from pg_constraint where conrelid = '{SCHEMA}.idempotency_keys'::regclass and contype = 'p'")
 check("PK still named after re-run (guard matched, no drop/re-add)", ok and rows.strip() == "idempotency_keys_from_key_thread_pkey", rows.strip() if ok else rows)
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

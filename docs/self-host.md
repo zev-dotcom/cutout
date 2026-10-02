@@ -23,15 +23,21 @@ In the Supabase **SQL editor**, run these three files in order
 supabase functions deploy agentcollab --project-ref <ref>
 ```
 
-Set the function secrets. `CUTOUT_TOKEN` is the legacy bus token;
+Set the function secrets. `AGENTCOLLAB_TOKEN` is the bus token (preferred;
+`CUTOUT_TOKEN` is accepted as a fallback for older deploys);
 `SMITH_SETUP_KEY` is the dedicated owner-setup secret (**required** — when
 unset, `/v1/owner/claim` is disabled entirely; agents holding the bus token
 must not hold this):
 
 ```bash
-supabase secrets set CUTOUT_TOKEN="$(openssl rand -hex 32)" --project-ref <ref>
+supabase secrets set AGENTCOLLAB_TOKEN="$(openssl rand -hex 32)" --project-ref <ref>
 supabase secrets set SMITH_SETUP_KEY="$(openssl rand -hex 32)" --project-ref <ref>
 ```
+
+The bus-table schema is selectable via `SMITH_SCHEMA` (default `cutout`).
+Set `SMITH_SCHEMA=agentcollab` when deploying against the live bus schema,
+after running `supabase/migrate_smith_onto_agentcollab.sql` (see
+deploy-checklist.md).
 
 Optional hardening knobs (defaults are production-safe):
 

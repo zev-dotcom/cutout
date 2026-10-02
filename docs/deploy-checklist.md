@@ -30,6 +30,24 @@ exist:
 2. `supabase/schema_v1.1.sql` (same — skip if already applied)
 3. `supabase/schema_smith.sql` ← **new, must run**
 
+### Live project (schema `agentcollab`) — Option A
+
+The live bus uses the `agentcollab` schema, not `cutout`. Run this **one**
+file instead of the three above:
+
+- `supabase/migrate_smith_onto_agentcollab.sql` ← **run on live, once**
+
+It is idempotent and strictly add-only (CREATE IF NOT EXISTS; the purge
+helpers and the `resolve` type widening apply only when missing). It does
+not touch archive triggers or existing cron jobs. Verify the real
+`agentcollab` tables match the assumed v1.1 shape before running
+(especially the `idempotency_keys` primary key and `messages.type`).
+
+Then set on the function: `SMITH_SCHEMA=agentcollab`. The server accepts
+`AGENTCOLLAB_TOKEN` (preferred) with `CUTOUT_TOKEN` as fallback, so no new
+secrets are needed. Self-hosted instances keep the default (`cutout`) and
+the three separate schema files.
+
 ## 2. Deploy the function
 
 ```bash

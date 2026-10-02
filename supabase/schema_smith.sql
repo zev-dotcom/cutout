@@ -124,7 +124,11 @@ update cutout.idempotency_keys k set thread_id = m.thread_id
 alter table cutout.idempotency_keys alter column thread_id set not null;
 alter table cutout.idempotency_keys drop constraint if exists idempotency_keys_pkey;
 do $$ begin
-  if not exists (select 1 from pg_constraint where conname = 'idempotency_keys_from_key_thread_pkey') then
+  if not exists (
+    select 1 from pg_constraint
+    where conrelid = 'cutout.idempotency_keys'::regclass
+      and conname = 'idempotency_keys_from_key_thread_pkey'
+  ) then
     alter table cutout.idempotency_keys add constraint idempotency_keys_from_key_thread_pkey primary key (from_agent, idem_key, thread_id);
   end if;
 end $$;

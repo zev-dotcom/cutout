@@ -1,9 +1,10 @@
 // Cutout Bus - Supabase Edge Function port of the SPEC v1.1 reference server.
 // Wire-compatible with SPEC.md v1.1: same endpoints, fields, status codes.
-// Config via env only (no secrets in code): CUTOUT_TOKEN, SUPABASE_DB_URL (auto).
+// Config via env only (no secrets in code): AGENTCOLLAB_TOKEN (preferred) or
+// CUTOUT_TOKEN, SUPABASE_DB_URL (auto), SMITH_SCHEMA (default "cutout").
 import postgres from "npm:postgres@3.4.5";
 const DB_URL = Deno.env.get("SUPABASE_DB_URL");
-const BUS_TOKEN = Deno.env.get("CUTOUT_TOKEN") ?? "";
+const BUS_TOKEN = Deno.env.get("AGENTCOLLAB_TOKEN") ?? Deno.env.get("CUTOUT_TOKEN") ?? "";
 const RETENTION_DAYS = 30;
 // Requests per minute per token; CUTOUT_RATE_LIMIT overrides (default 60).
 const RATE_LIMIT_ENV = Number(Deno.env.get("CUTOUT_RATE_LIMIT") ?? "60");
@@ -57,6 +58,15 @@ const DB_OPTIONS = {
   idle_timeout: 20
 };
 let sql = postgres(poolerUrl(DB_URL), DB_OPTIONS);
+// Option A (deploy-compat): the bus-table schema is selectable. Default
+// "cutout" (self-host); set SMITH_SCHEMA=agentcollab for the live deploy.
+// Validated as a bare identifier at startup; table names are hardcoded in T().
+const SCHEMA = (()=>{
+  const s = Deno.env.get("SMITH_SCHEMA") ?? "cutout";
+  if (!/^[a-z_][a-z0-9_]*$/.test(s)) throw new Error(`bad SMITH_SCHEMA: ${s}`);
+  return s;
+})();
+const T = (name)=>sql.unsafe(`${SCHEMA}.${name}`);
 function recycleDb(client) {
   if (sql !== client) return;
   sql = postgres(poolerUrl(DB_URL), DB_OPTIONS);
@@ -85,7 +95,7 @@ async function timedQuery(query, label, timeoutMs = QUERY_TIMEOUT_MS) {
   }
 }
 // SPEC: purge runs at startup (cold start here) and at least daily (pg_cron job).
-const startupPurge = timedQuery(sql`select cutout.purge(${RETENTION_DAYS})`, "startup_purge", 2000).catch((e)=>console.error("startup purge failed", e));
+const startupPurge = timedQuery(sql`select ${T("purge")}(${RETENTION_DAYS})`, "startup_purge", 2000).catch((e)=>console.error("startup purge failed", e));
 // ---- ULID (Crockford base32, 48-bit time + 80-bit random) -------------------
 const C32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 function ulid(now = Date.now()) {
@@ -149,7 +159,7 @@ function serialize(m) {
 async function rateState(ident) {
   const rows = await timedQuery(sql`
     select count(*)::int as c, extract(epoch from min(at))::float8 as oldest
-    from cutout.rate_log where at > now() - interval '1 minute' and identity = ${ident}`, "rate_state");
+    from ${T("rate_log")} where at > now() - interval '1 minute' and identity = ${ident}`, "rate_state");
   return {
     count: rows[0].c,
     oldestEpoch: rows[0].oldest === null ? null : Number(rows[0].oldest)
@@ -189,10 +199,10 @@ async function rateLimit(auth) {
   const admitted = await sql.begin(async (tx)=>{
     await tx`select pg_advisory_xact_lock(${RATE_LIMIT_LOCK_KEY})`;
     return await tx`
-      insert into cutout.rate_log (at, identity)
+      insert into ${T("rate_log")} (at, identity)
       select now(), ${ident}
-      where (select count(*) from cutout.rate_log where at > now() - interval '1 minute') < ${RATE_LIMIT_GLOBAL}
-        and (select count(*) from cutout.rate_log where at > now() - interval '1 minute' and identity = ${ident}) < ${RATE_LIMIT_PER_MIN}
+      where (select count(*) from ${T("rate_log")} where at > now() - interval '1 minute') < ${RATE_LIMIT_GLOBAL}
+        and (select count(*) from ${T("rate_log")} where at > now() - interval '1 minute' and identity = ${ident}) < ${RATE_LIMIT_PER_MIN}
       returning at`;
   });
   const state = await rateState(ident);
@@ -249,7 +259,7 @@ function staleLink(link: unknown) {
   return exp < Date.now() - LINK_SKEW_MS; // unparseable -> NaN -> false
 }
 async function redactLinks(ids: string[], label: string) {
-  await timedQuery(sql`update cutout.messages
+  await timedQuery(sql`update ${T("messages")}
     set metadata = jsonb_set(metadata, '{one_time_link}',
                              (metadata->'one_time_link')
                                || '{"consumed": true, "url": null, "url_redacted": true}'::jsonb, false)
@@ -323,7 +333,7 @@ async function postMessage(req, auth) {
   // attacker must already know the id). Accepted as low risk; revisit if
   // message ids ever become enumerable.
   if (body.reply_to) {
-    const rt = await timedQuery(sql`select 1 from cutout.messages where id = ${body.reply_to} and thread_id = ${body.thread_id}`, "reply_to_check");
+    const rt = await timedQuery(sql`select 1 from ${T("messages")} where id = ${body.reply_to} and thread_id = ${body.thread_id}`, "reply_to_check");
     if (!rt.length) return jres(422, {
       error: "reply_to must reference a message in the same thread"
     });
@@ -399,8 +409,8 @@ async function postMessage(req, auth) {
   // P2-E: idempotency is scoped to (from, key, thread): a reused key in a
   // different thread is a new message, not a duplicate of the old one.
   const findDup = async ()=>idemKey === null ? [] : await sql`
-    select m.id, m.created_at from cutout.idempotency_keys k
-    join cutout.messages m on m.id = k.message_id
+    select m.id, m.created_at from ${T("idempotency_keys")} k
+    join ${T("messages")} m on m.id = k.message_id
     where k.from_agent = ${from} and k.idem_key = ${idemKey} and k.thread_id = ${body.thread_id}`;
   // Keys are honored for the retention window: the key row cascades away with
   // its message when the purge removes it.
@@ -414,13 +424,13 @@ async function postMessage(req, auth) {
   try {
     const rows = await timedQuery(sql.begin(async (tx)=>{
       const r = await tx`
-        insert into cutout.messages (id, thread_id, from_agent, to_agent, type, body, reply_to, metadata)
+        insert into ${T("messages")} (id, thread_id, from_agent, to_agent, type, body, reply_to, metadata)
         values (${id}, ${body.thread_id}, ${from}, ${body.to},
                 ${body.type}, ${body.body},
                 ${body.reply_to ?? null}, ${sql.json(metadata)})
         returning id, created_at`;
       if (idemKey !== null) {
-        await tx`insert into cutout.idempotency_keys (from_agent, idem_key, thread_id, message_id)
+        await tx`insert into ${T("idempotency_keys")} (from_agent, idem_key, thread_id, message_id)
                  values (${from}, ${idemKey}, ${body.thread_id}, ${id})`;
       }
       if (auth.kind === "owner") {
@@ -496,19 +506,19 @@ async function getMessages(req, arrivedAt, auth) {
     const q = sql`
       select id, thread_id, from_agent, to_agent, type, body, reply_to, created_at,
              (extract(epoch from created_at) * 1000000)::bigint as created_us, metadata
-      from cutout.messages
+      from ${T("messages")}
       where true
       ${cursor ? sql`and ((extract(epoch from created_at) * 1000000)::bigint > ${cursor.us} or ((extract(epoch from created_at) * 1000000)::bigint = ${cursor.us} and id > ${cursor.id}))` : sql``}
       ${threadId ? sql`and thread_id = ${threadId}` : sql``}
       ${to ? sql`and to_agent = ${to}` : scopeAgent ? sql`and (to_agent = ${scopeAgent} or to_agent = '*')` : sql``}
       ${auth.kind === "agent" ? sql`and exists (
         select 1 from smith_thread_members tm
-        where tm.thread_id = cutout.messages.thread_id
+        where tm.thread_id = ${T("messages")}.thread_id
           and tm.agent_id = ${auth.agentId}
           and tm.legacy_unverified = false
-          and cutout.messages.created_at >= tm.added_at
+          and ${T("messages")}.created_at >= tm.added_at
       )` : sql``}
-      ${auth.kind === "legacy" && LEGACY_STRICT ? sql`and not exists (select 1 from smith_threads s where s.thread_id = cutout.messages.thread_id)` : sql``}
+      ${auth.kind === "legacy" && LEGACY_STRICT ? sql`and not exists (select 1 from smith_threads s where s.thread_id = ${T("messages")}.thread_id)` : sql``}
       order by created_at asc, id asc
       limit ${limit}`;
     return await timedQuery(q, "query_once");
@@ -541,7 +551,7 @@ async function enrichMessages(rows, redactLabel) {
   if (rows.length) {
     const ids = rows.map((r)=>r.id);
     const rc = await timedQuery(sql`
-      select message_id, agent, status, at from cutout.receipts
+      select message_id, agent, status, at from ${T("receipts")}
       where message_id = any(${ids}) order by at asc, agent asc`, "receipts");
     for (const r of rc){
       const list = receiptsBy.get(r.message_id) ?? [];
@@ -620,7 +630,7 @@ async function postReceipt(req, auth) {
   let exists;
   if (auth.kind === "agent") {
     exists = await timedQuery(sql`
-      select m.thread_id, m.metadata from cutout.messages m
+      select m.thread_id, m.metadata from ${T("messages")} m
       join smith_thread_members tm on tm.thread_id = m.thread_id
         and tm.agent_id = ${auth.agentId}
         and tm.legacy_unverified = false
@@ -629,7 +639,7 @@ async function postReceipt(req, auth) {
       error: "message not found"
     });
   } else {
-    exists = await timedQuery(sql`select thread_id, metadata from cutout.messages where id = ${mid}`, "receipt_exists");
+    exists = await timedQuery(sql`select thread_id, metadata from ${T("messages")} where id = ${mid}`, "receipt_exists");
     if (exists.length === 0) return jres(404, {
       error: "message not found"
     });
@@ -640,7 +650,7 @@ async function postReceipt(req, auth) {
     });
   }
   await timedQuery(sql`
-    insert into cutout.receipts (message_id, agent, status, at) values (${mid}, ${agent}, ${status}, ${at.toISOString()})
+    insert into ${T("receipts")} (message_id, agent, status, at) values (${mid}, ${agent}, ${status}, ${at.toISOString()})
     on conflict (message_id, agent) do update set status = excluded.status, at = excluded.at`, "receipt_write");
   if (status === "consumed" && exists[0].metadata?.one_time_link) {
     await redactLinks([
@@ -658,9 +668,9 @@ async function getThreads(req) {
       (array_agg(m.type order by m.created_at desc, m.id desc))[1] as last_type,
       ${agentId ? sql`count(*) filter (
         where (m.to_agent = ${agentId} or m.to_agent = '*')
-          and not exists (select 1 from cutout.receipts r where r.message_id = m.id and r.agent = ${agentId})
+          and not exists (select 1 from ${T("receipts")} r where r.message_id = m.id and r.agent = ${agentId})
       )::int` : sql`0`} as unread
-    from cutout.messages m
+    from ${T("messages")} m
     ${LEGACY_STRICT ? sql`where not exists (select 1 from smith_threads s where s.thread_id = m.thread_id)` : sql``}
     group by m.thread_id
     order by last_at desc`, "threads");
@@ -951,11 +961,11 @@ async function postThread(req, auth) {
         // Owner-only legacy adoption: seed members from pre-existing legacy
         // messages, marked unverified (strict P1-2: no access until verified).
         const s1 = await tx`insert into smith_thread_members (thread_id, agent_id, legacy_unverified, added_at)
-                 select ${tid}, from_agent, true, '-infinity'::timestamptz from cutout.messages
+                 select ${tid}, from_agent, true, '-infinity'::timestamptz from ${T("messages")}
                  where thread_id = ${tid} and from_agent is not null and from_agent <> '*'
                  on conflict do nothing returning agent_id`;
         const s2 = await tx`insert into smith_thread_members (thread_id, agent_id, legacy_unverified, added_at)
-                 select ${tid}, to_agent, true, '-infinity'::timestamptz from cutout.messages
+                 select ${tid}, to_agent, true, '-infinity'::timestamptz from ${T("messages")}
                  where thread_id = ${tid} and to_agent is not null and to_agent <> '*'
                  on conflict do nothing returning agent_id`;
         const seeded = [...s1, ...s2].map((r)=>r.agent_id);
@@ -964,7 +974,7 @@ async function postThread(req, auth) {
           seeded_members: seeded
         });
       } else if (suppliedTid) {
-        const existing = await tx`select 1 from cutout.messages where thread_id = ${tid} limit 1`;
+        const existing = await tx`select 1 from ${T("messages")} where thread_id = ${tid} limit 1`;
         if (existing.length) throw new Error(TAKEOVER);
       }
       const all = auth.kind === "owner" ? memberIds : [
@@ -995,9 +1005,9 @@ async function listThreadsSmith(auth) {
   const threads = await timedQuery(sql`
     select t.thread_id, t.name, max(m.created_at) as last_at,
       count(*) filter (where (m.to_agent = ${aid} or m.to_agent = '*')
-        and not exists (select 1 from cutout.receipts r where r.message_id = m.id and r.agent = ${aid}))::int as unread
+        and not exists (select 1 from ${T("receipts")} r where r.message_id = m.id and r.agent = ${aid}))::int as unread
     from smith_threads t
-    left join cutout.messages m on m.thread_id = t.thread_id
+    left join ${T("messages")} m on m.thread_id = t.thread_id
     ${scope}
     group by t.thread_id, t.name
     order by last_at desc nulls last`, "smith_thread_list");
@@ -1061,7 +1071,7 @@ async function renameThread(req, auth, threadId) {
     await tx`update smith_threads set name = ${body.name} where thread_id = ${threadId}`;
     // Renames are data, not message edits: append a note message carrying the
     // compat key, matching the UI contract.
-    await tx`insert into cutout.messages (id, thread_id, from_agent, to_agent, type, body, metadata)
+    await tx`insert into ${T("messages")} (id, thread_id, from_agent, to_agent, type, body, metadata)
              values (${noteId}, ${threadId}, ${auth.agentId}, '*', 'note',
                      ${"Chat renamed to \"" + body.name + "\""},
                      ${sql.json({ x_cutout_thread_rename: { from: oldName, to: body.name } })})`;
@@ -1153,7 +1163,7 @@ async function feedMessages(threadId, cursor, limit, agentId) {
   return await timedQuery(sql`
     select id, thread_id, from_agent, to_agent, type, body, reply_to, created_at,
            (extract(epoch from created_at) * 1000000)::bigint as created_us, metadata
-    from cutout.messages m
+    from ${T("messages")} m
     where m.thread_id = ${threadId}
     ${agentId ? sql`and m.created_at >= coalesce((select tm.added_at from smith_thread_members tm where tm.thread_id = ${threadId} and tm.agent_id = ${agentId}), 'infinity'::timestamptz)` : sql``}
     ${cursor ? sql`and (((extract(epoch from m.created_at) * 1000000)::bigint > ${cursor.us}) or (((extract(epoch from m.created_at) * 1000000)::bigint = ${cursor.us}) and m.id > ${cursor.id}))` : sql``}
