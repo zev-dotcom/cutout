@@ -499,6 +499,8 @@ async function postMessage(req, auth) {
       try { urgentFlag = await urgentDecision(from, body.thread_id, body.to, body.urgent === true); } catch (e) { console.error("urgent decision failed", e); }
       afterPostWake(body.thread_id, from, body.to, urgentFlag, body.body, metadata.mentions);
     }
+    // The agent answered: clear its dots in this thread right away.
+    if (auth.kind === "agent") timedQuery(sql`delete from ${S("smith_activity")} where thread_id = ${body.thread_id} and agent_id = ${auth.agentId}`, "activity_clear_on_post").catch(()=>{});
     return jres(201, {
       id: rows[0].id,
       created_at: iso(rows[0].created_at),
@@ -652,10 +654,25 @@ async function enrichMessages(rows, redactLabel, ownerView = false) {
       ...(ownerView && r.from_agent === OWNER_ID ? { seen_by: seenBy.get(r.id) ?? [] } : {})
     }));
 }
+// Cue dots without an extra call: an agent that has seen (poll or peek) an owner message addressed to it
+// is shown as working in that thread for IMPLICIT_WORKING_SECONDS, or until it posts there.
+async function markWorkingFor(agentId, threadIds) {
+  const ids = [...new Set(threadIds)].filter((t)=> t && !String(t).startsWith("th_wakecheck_"));
+  if (!ids.length) return;
+  try {
+    await timedQuery(sql`insert into ${S("smith_activity")} (thread_id, agent_id, started_at, expires_at)
+      select x, ${agentId}, now(), now() + (${IMPLICIT_WORKING_SECONDS} * interval '1 second') from unnest(${ids}::text[]) as x
+      on conflict (thread_id, agent_id) do update set expires_at = greatest(${S("smith_activity")}.expires_at, excluded.expires_at)`, "implicit_working");
+  } catch { /* best effort */ }
+}
 async function recordSeen(agentId, rows) {
   const ids = rows.filter((r)=> r.from_agent === OWNER_ID).map((r)=> r.id);
   if (!ids.length) return;
-  try { await sql`insert into ${S("smith_seen")} (message_id, agent_id) select x, ${agentId} from unnest(${ids}::text[]) as x on conflict do nothing`; } catch { /* table absent */ }
+  let fresh = [];
+  try { fresh = await sql`insert into ${S("smith_seen")} (message_id, agent_id) select x, ${agentId} from unnest(${ids}::text[]) as x on conflict do nothing returning message_id`; } catch { /* table absent */ }
+  // Dots arm once per message, the first time it is seen (not on every later poll).
+  const freshIds = new Set(fresh.map((r)=> r.message_id));
+  await markWorkingFor(agentId, rows.filter((r)=> freshIds.has(r.id) && Date.now() - new Date(r.created_at).getTime() < 300000).map((r)=> r.thread_id));
 }
 async function threadPresence(threadId) {
   try {
@@ -800,6 +817,7 @@ const PAIRING_CODE_LEN = 6;
 const PAIRING_DEFAULT_MINUTES = 10;
 const PAIRING_MAX_MINUTES = 43200; // 30 days
 const ACTIVITY_TTL_SECONDS = 30;
+const IMPLICIT_WORKING_SECONDS = 60; // dots shown when an agent has seen an owner message; cleared when it posts
 const MAX_THREAD_NAME = 200;
 const RESERVED_AGENT_RE = /^owner$/i;
 // Owner bootstrap: a dedicated setup key, separate from the bus token agents
@@ -1228,8 +1246,15 @@ async function addMember(req, auth, threadId) {
   // intended semantic today (no member-remove route exists, so there is no
   // re-join scenario). If a remove route is ever added, define the re-add
   // semantic explicitly — e.g. refresh added_at on re-add — before shipping it.
-  const denied = requireOwner(auth);
-  if (denied) return denied;
+  // Owner, or the agent that created the thread (never a plain member).
+  if (auth.kind !== "owner") {
+    if (auth.kind !== "agent") return jres(403, { error: "owner or thread creator token required" });
+    const own = await timedQuery(sql`select created_by from ${S("smith_threads")} where thread_id = ${threadId}`, "member_add_creator");
+    if (!own.length) return jres(404, { error: "thread not found" });
+    if (own[0].created_by !== auth.agentId) return jres(403, { error: "only the thread creator or the owner can add members" });
+    const cnt = await timedQuery(sql`select count(*)::int as n from ${S("smith_thread_members")} where thread_id = ${threadId}`, "member_add_count");
+    if (cnt[0].n >= 20) return jres(422, { error: "thread member limit reached (20)" });
+  }
   if (!await isManagedThread(threadId)) return jres(404, {
     error: "thread not found"
   });
@@ -1255,8 +1280,9 @@ async function addMember(req, auth, threadId) {
   if (!rows.length || rows[0].revoked_at !== null) return jres(422, {
     error: `unknown or revoked agent: ${aid}`
   });
+  if (auth.kind !== "owner" && !rows[0].has_token) return jres(422, { error: `agent not registered: ${aid}` });
   await timedQuery(sql`insert into ${S("smith_thread_members")} (thread_id, agent_id) values (${threadId}, ${aid}) on conflict do nothing`, "member_add");
-  await audit(OWNER_ID, "add_member", {
+  await audit(auth.kind === "owner" ? OWNER_ID : auth.agentId, "add_member", {
     thread_id: threadId,
     agent_id: aid
   });
@@ -1334,7 +1360,7 @@ async function threadFeed(req, auth, threadId) {
   return jres(200, await buildFeed(threadId, q, "feed_redact", auth.kind === "owner" ? null : auth.agentId));
 }
 // ---- working-on-reply activity (the cue dots) -----------------------------------
-async function postActivity(req, auth) {
+async function postActivity(req, auth, defaultState = null) {
   const aid = auth.kind === "agent" ? auth.agentId : auth.kind === "legacy" ? auth.agentId : null;
   if (!aid) {
     return jres(403, {
@@ -1352,15 +1378,17 @@ async function postActivity(req, auth) {
   if (typeof body.thread_id !== "string" || body.thread_id.length === 0) return jres(422, {
     error: "thread_id is required"
   });
+  if (body.state === undefined && defaultState) body.state = defaultState;
   if (body.state !== "working" && body.state !== "idle") return jres(422, {
     error: "state must be working or idle"
   });
   const denied = await threadAccess(auth, body.thread_id);
   if (denied) return denied;
+  const ttl = Number.isFinite(Number(body.ttl_seconds)) && Number(body.ttl_seconds) >= 5 ? Math.min(120, Math.floor(Number(body.ttl_seconds))) : ACTIVITY_TTL_SECONDS;
   if (body.state === "working") {
     await timedQuery(sql`
       insert into ${S("smith_activity")} (thread_id, agent_id, started_at, expires_at)
-      values (${body.thread_id}, ${aid}, now(), now() + (${ACTIVITY_TTL_SECONDS} * interval '1 second'))
+      values (${body.thread_id}, ${aid}, now(), now() + (${ttl} * interval '1 second'))
       on conflict (thread_id, agent_id) do update set expires_at = excluded.expires_at`, "activity_working");
   } else {
     await timedQuery(sql`delete from ${S("smith_activity")} where thread_id = ${body.thread_id} and agent_id = ${aid}`, "activity_idle");
@@ -1711,6 +1739,7 @@ async function ownerFeed(req, auth, threadId) {
       error: "audit unavailable"
     });
   }
+  touchOwnerLive(threadId, false);
   const feed = await buildFeed(threadId, q, "owner_feed_redact");
   return jres(200, feed);
 }
@@ -1721,6 +1750,26 @@ async function ownerFeed(req, auth, threadId) {
 let openStreams = 0;
 const lastStreamAudit = new Map();
 const STREAM_MS = Number(Deno.env.get("SMITH_STREAM_MS") ?? 40000);
+// Owner presence per thread: touched by the stream/feed (viewing) and the composer (typing). Agents read it via peek.
+const lastLiveTouch = new Map();
+async function touchOwnerLive(threadId, typing) {
+  const k = threadId + (typing ? ":t" : "");
+  if (Date.now() - (lastLiveTouch.get(k) ?? 0) < (typing ? 2000 : 5000)) return;
+  lastLiveTouch.set(k, Date.now());
+  if (lastLiveTouch.size > 500) { const cut = Date.now() - 60000; for (const [kk, v] of lastLiveTouch) if (v < cut) lastLiveTouch.delete(kk); }
+  try {
+    if (typing) await timedQuery(sql`insert into ${S("smith_owner_live")} (thread_id, at, typing_at) values (${threadId}, now(), now()) on conflict (thread_id) do update set at = now(), typing_at = now()`, "owner_live_typing");
+    else await timedQuery(sql`insert into ${S("smith_owner_live")} (thread_id, at) values (${threadId}, now()) on conflict (thread_id) do update set at = now()`, "owner_live_touch");
+  } catch { /* table absent */ }
+}
+async function ownerTyping(req, auth) {
+  const denied = requireOwner(auth);
+  if (denied) return denied;
+  let body; try { body = await req.json(); } catch { return jres(400, { error: "invalid JSON" }); }
+  if (typeof body.thread_id !== "string" || !await isManagedThread(body.thread_id)) return jres(404, { error: "thread not found" });
+  await touchOwnerLive(body.thread_id, true);
+  return jres(200, { ok: true });
+}
 async function ownerStream(req, auth, threadId) {
   const denied = requireOwner(auth);
   if (denied) return denied;
@@ -1743,6 +1792,7 @@ async function ownerStream(req, auth, threadId) {
       try {
         send("hello", { cursor: cursorStr });
         while (!closed && Date.now() < end) {
+          touchOwnerLive(threadId, false);
           const feed = await buildFeed(threadId, { cursor, limit: 100, since: cursorStr }, "owner_feed_redact");
           if (feed.messages.length) {
             cursorStr = feed.next_cursor; cursor = decodeCursor(cursorStr);
@@ -1909,11 +1959,13 @@ async function route(req, arrivedAt) {
     return done(await postThread(req, auth));
   }
   if (path === "/v1/activity" && req.method === "POST") return done(await postActivity(req, auth));
+  if (path === "/v1/agents/me/working" && req.method === "POST") return done(await postActivity(req, auth, "working"));
   if (path === "/v1/pairings" && req.method === "POST") return done(await issuePairing(req, auth));
   if (path === "/v1/owner/rotate" && req.method === "POST") return done(await rotateOwner(req, auth));
   if (path === "/v1/owner/feed" && req.method === "GET") {
     return done(await ownerFeed(req, auth, new URL(req.url).searchParams.get("thread_id")));
   }
+  if (path === "/v1/owner/typing" && req.method === "POST") return done(await ownerTyping(req, auth));
   if (path === "/v1/owner/stream" && req.method === "GET") return done(await ownerStream(req, auth, new URL(req.url).searchParams.get("thread_id")));
   if (path === "/v1/owner/threads" && req.method === "GET") return done(await ownerThreads(req, auth));
   if (path === "/v1/owner/audit" && req.method === "GET") return done(await ownerAudit(req, auth));
@@ -2466,8 +2518,33 @@ async function peekMessages(auth) {
       group by m.thread_id order by min(m.created_at) asc limit 50`, "peek_threads");
     threads = tr.map((r)=>({ thread_id: r.thread_id, unread: r.unread, oldest_unread_at: iso(r.oldest) }));
   } catch { threads = []; }
+  try {
+    const ot = await timedQuery(sql`select m.id, m.thread_id, m.from_agent, m.created_at from ${T("messages")} m join ${S("smith_thread_members")} tm on tm.thread_id = m.thread_id and tm.agent_id = ${auth.agentId} and tm.legacy_unverified = false and m.created_at >= tm.added_at
+      where m.from_agent = ${OWNER_ID} and (m.to_agent = ${auth.agentId} or m.to_agent = '*' or jsonb_exists(m.metadata->'mentions', ${auth.agentId})) and m.created_at > now() - interval '5 minutes'
+        and not exists (select 1 from ${S("smith_seen")} sn where sn.message_id = m.id and sn.agent_id = ${auth.agentId}) limit 50`, "peek_owner_unseen");
+    await recordSeen(auth.agentId, ot);
+  } catch { /* best effort */ }
+  // Owner live (viewing within 30 s) / typing (within 10 s) in this agent's threads, and a cadence hint.
+  let ownerLive = [];
+  try {
+    const ol = await timedQuery(sql`select l.thread_id, (l.typing_at is not null and l.typing_at > now() - interval '10 seconds') as typing from ${S("smith_owner_live")} l
+      join ${S("smith_thread_members")} tm on tm.thread_id = l.thread_id and tm.agent_id = ${auth.agentId} and tm.legacy_unverified = false
+      where l.at > now() - interval '30 seconds' limit 20`, "peek_owner_live");
+    ownerLive = ol.map((r)=>({ thread_id: r.thread_id, typing: r.typing }));
+  } catch { ownerLive = []; }
+  let hint = null; // seconds until you should look again; null = keep your declared cadence
+  if (st.unread > 0) hint = 5;
+  else if (ownerLive.some((x)=> x.typing)) hint = 5;
+  else if (ownerLive.length) hint = 10;
+  else {
+    try {
+      const rc = await timedQuery(sql`select 1 from ${T("messages")} m join ${S("smith_thread_members")} tm on tm.thread_id = m.thread_id and tm.agent_id = ${auth.agentId} and tm.legacy_unverified = false
+        where m.created_at > now() - interval '10 minutes' and m.thread_id not like 'th_wakecheck_%' limit 1`, "peek_recent");
+      if (rc.length) hint = 30;
+    } catch { /* ignore */ }
+  }
   const oldestAt = threads.length ? threads[0].oldest_unread_at : null; // threads are ordered oldest first
-  return jres(200, { unread: st.unread, oldest_unread_age_s: st.oldest_age_s ?? 0, oldest_unread_at: oldestAt, threads, newest_id: st.newest_id ?? null, cursor: cur[0]?.acked_id ? { acked_id: cur[0].acked_id, acked_at: iso(cur[0].acked_at) } : null });
+  return jres(200, { owner_live: ownerLive, next_wake_hint_s: hint, unread: st.unread, oldest_unread_age_s: st.oldest_age_s ?? 0, oldest_unread_at: oldestAt, threads, newest_id: st.newest_id ?? null, cursor: cur[0]?.acked_id ? { acked_id: cur[0].acked_id, acked_at: iso(cur[0].acked_at) } : null });
 }
 async function ackMessages(req, auth) {
   let body; try { body = await req.json(); } catch { return jres(400, { error: "invalid JSON" }); }

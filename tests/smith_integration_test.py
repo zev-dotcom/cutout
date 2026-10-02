@@ -256,8 +256,8 @@ ids = [e["thread_id"] for e in (tl if isinstance(tl, list) else [])]
 check("agent B thread list excludes A's thread", TH_A not in ids, f"{ids}")
 
 # 7. member-add is owner-only and audited; non-member heartbeat denied
-s, _ = req("POST", f"/v1/threads/{TH_A}/members", {"agent_id": "agent-c"}, bearer(TOK_A))
-check("member-add by non-owner -> 403", s == 403, f"{s}")
+s, _ = req("POST", f"/v1/threads/{TH_A}/members", {"agent_id": "agent-c"}, bearer(TOK_B))
+check("member-add by a non-creator, non-owner -> 403", s == 403, f"{s}")
 s, _ = req("POST", "/v1/activity", {"thread_id": TH_A, "state": "working"}, bearer(TOK_C))
 check("non-member activity heartbeat -> 403", s == 403, f"{s}")
 s, madd = req("POST", f"/v1/threads/{TH_A}/members", {"agent_id": "agent-c"}, bearer(OWNER))

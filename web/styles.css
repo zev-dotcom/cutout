@@ -340,3 +340,14 @@ select{width:100%;min-height:var(--tap);border:1.5px solid var(--line);border-ra
 .rcpt.mtgrp{display:none}
 .rcpt .mt.full{color:var(--ink2)}
 .msgrow.them .rcpt{margin-left:6px;margin-top:3px}
+.tochip{display:inline-block;margin-left:6px;font-size:.72rem;font-weight:600;color:var(--ink3);background:var(--chip,rgba(0,0,0,.06));border-radius:8px;padding:1px 7px;vertical-align:middle;text-transform:none;letter-spacing:0}
+.who.out{margin:0 4px 3px 0;text-align:right}
+.rpchip{display:block;max-width:100%;text-align:left;background:none;border:none;border-left:3px solid var(--line,#ccc);padding:2px 8px;margin:2px 0 3px 4px;font-size:.78rem;color:var(--ink3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+.rpchip b{color:var(--ink2)}
+.msgrow.flash .bub{outline:2px solid var(--accent,#f05a28);outline-offset:2px}
+.sendbtn svg{display:block}
+.cfield{border-radius:22px;align-items:flex-end;padding:0 16px}
+.cfield textarea{flex:1;border:none;background:none;outline:none;font:inherit;font-size:14.5px;color:var(--ink);min-width:0;resize:none;padding:13px 0;line-height:1.3;max-height:128px;overflow-y:auto}
+.sendbtn{background:var(--accent,#f05a28);color:#fff}
+[data-theme="noir"] .sendbtn{color:#fff}
+.sendbtn:disabled{opacity:.5}

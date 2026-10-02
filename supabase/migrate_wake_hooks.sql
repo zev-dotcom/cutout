@@ -95,3 +95,12 @@ create table if not exists smith.smith_seen (
 );
 alter table smith.smith_seen enable row level security;
 do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith.smith_seen from anon, authenticated; end if; end $$;
+
+-- Owner presence per thread (additive): viewing and typing marks, read by agents through peek.
+create table if not exists smith.smith_owner_live (
+  thread_id text primary key,
+  at        timestamptz not null default now(),
+  typing_at timestamptz
+);
+alter table smith.smith_owner_live enable row level security;
+do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith.smith_owner_live from anon, authenticated; end if; end $$;
