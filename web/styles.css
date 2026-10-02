@@ -81,11 +81,14 @@ input,select,textarea{font-family:inherit}
 .avatar.legacy{background:transparent;color:var(--ink);border:2px dashed var(--ink3)}
 [data-theme="noir"] .avatar.legacy{color:var(--ink)}
 .stack{width:50px;height:50px;flex:none;position:relative}
-.stack .avatar{width:26px;height:26px;font-size:11px;position:absolute;top:10px;border:2px solid var(--bg);box-sizing:content-box}
-.stack .avatar:nth-child(1){left:0;z-index:3}.stack .avatar:nth-child(2){left:10px;z-index:2}.stack .avatar:nth-child(3){left:20px;z-index:1}
-.stack.n2 .avatar:nth-child(1){left:4px}.stack.n2 .avatar:nth-child(2){left:16px}
-.stack .avatar.more{z-index:4!important;background:var(--pill-bg)!important;color:var(--ink)!important;font-size:10px;font-weight:800;letter-spacing:-.02em}
-.stack .avatar:nth-child(2){background:#8a867b;color:#fff}.stack .avatar:nth-child(3){background:var(--red);color:#fff}
+.stack .avatar{width:30px;height:30px;box-sizing:border-box;font-size:12px;position:absolute;border:2px solid var(--bg)}
+.stack .avatar:not(:last-child){justify-content:flex-start;align-items:flex-start;padding:3px 0 0 5px}
+.stack .avatar:nth-child(1){left:0;top:0;z-index:1;background:var(--ink)}
+.stack .avatar:nth-child(2){left:12px;top:12px;z-index:2;background:var(--red);color:#fff}
+.stack .avatar:nth-child(3){left:24px;top:24px;z-index:3;width:26px;height:26px;background:#6B6B66;color:#fff;font-size:10px;font-weight:800;letter-spacing:-.02em;padding:0}
+.stack.n2 .avatar:nth-child(1){top:2px}
+.stack.n2 .avatar:nth-child(2){left:18px;top:18px}
+.stack.n2 .avatar:nth-child(2){padding:0}
 .avatar.photo{background-size:cover;background-position:center;background-color:var(--pill-bg);color:transparent}
 .tmeta{flex:1;min-width:0}
 .tnm{font-size:15px;font-weight:700;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -417,5 +420,5 @@ html,body{overflow-x:hidden}
 .hostconfirm{border:1.5px solid var(--red);border-radius:14px;padding:12px 14px;margin:-4px 0 14px;font-size:.92rem;overflow-wrap:anywhere}
 .hostconfirm .ghostbtn{margin-top:8px}
 .hostconfirm[hidden]{display:none}
-.chathead .stack .avatar{width:26px;height:26px;font-size:11px}
-.chathead .stack .avatar.more{font-size:10px}
+.chathead .stack .avatar{width:30px;height:30px;font-size:12px}
+.chathead .stack .avatar:nth-child(3){width:26px;height:26px;font-size:10px}
