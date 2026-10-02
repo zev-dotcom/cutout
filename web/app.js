@@ -1798,12 +1798,21 @@ attachPTR($("threadMsgs"), function(){
   });
 });
 var updateShown = false;
+/* Builds look like YYYY-MM-DD.N: compare each numeric part, so .10 is newer than .9. */
+function buildNewer(a, b){
+  var x = String(a).split(/[.-]/).map(Number), y = String(b).split(/[.-]/).map(Number);
+  for (var i = 0; i < Math.max(x.length, y.length); i++){
+    var p = x[i] || 0, q = y[i] || 0;
+    if (p !== q) return p > q;
+  }
+  return false;
+}
 function checkForUpdate(){
   if (updateShown || document.hidden) return;
   fetch("app.js?cb=" + Date.now(), {cache: "no-store"}).then(function(r){ return r.text(); }).then(function(t){
     var m = /SMITH_BUILD = "([^"]+)"/.exec(t);
     // Only a NEWER build prompts (builds sort as YYYY-MM-DD.N); a rolled-back older build never does.
-    if (m && m[1] > SMITH_BUILD){
+    if (m && buildNewer(m[1], SMITH_BUILD)){
       updateShown = true;
       var b = document.createElement("button"); b.className = "updbar"; b.type = "button";
       b.innerHTML = '<span>New version available. Tap to reload</span><span class="updx" role="button" aria-label="Dismiss">\u2715</span>';
