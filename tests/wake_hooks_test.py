@@ -433,4 +433,7 @@ for i, e in enumerate("\U0001F600\U0001F601\U0001F602\U0001F603\U0001F604\U0001F
 s, r = req("PUT", RP, {"emoji": "\U0001F914"}, OWN); check("21st distinct emoji -> 422", s == 422, s)
 s, r = req("PUT", RP, {"emoji": "\U0001F600"}, PB); check("existing emoji still joinable at the cap", s == 200, s)
 check("reactions are audited", int(sql("select count(*) from smith.smith_audit where action in ('reaction_add','reaction_remove')") or 0) > 3, None)
+sql("insert into smith.smith_audit (actor, action, detail) select 'pk-b', 'reaction_add', '{}'::jsonb from generate_series(1, 60)")
+s, r = req("PUT", RP, {"emoji": "\U0001F601"}, PB); check("61st reaction write in an hour -> 429", s == 429, s)
+s, r = req("PUT", RP, {"emoji": "\U0001F600"}, OWN); check("reaction rate limit is per actor (owner unaffected)", s == 200, s)
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)

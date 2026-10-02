@@ -1215,6 +1215,7 @@ async function listThreadsSmith(auth) {
 }
 // Owner-only per-thread prefs: archive (hide from home) and mute (no push). Agents are unaffected.
 // Reactions: one grapheme per reaction, max 20 distinct emoji per message. They never wake an agent.
+const REACTION_WRITES_PER_HOUR = Number(Deno.env.get("SMITH_REACTIONS_PER_HOUR") ?? "60");
 async function reactionsFor(ids) {
   const out = new Map();
   if (!ids.length) return out;
@@ -1248,14 +1249,17 @@ async function reactionsRoute(req, auth, mid, emojiParam) {
     emoji = body?.emoji;
   }
   if (!oneGrapheme(emoji)) return jres(422, { error: "emoji must be a single emoji" });
+  // 60 reaction writes per actor per hour (counted from the append-only audit log).
+  const rl = await timedQuery(sql`select count(*)::int as n from ${S("smith_audit")} where actor = ${a.actor} and action in ('reaction_add', 'reaction_remove') and at > now() - interval '1 hour'`, "reaction_rate");
+  if (rl[0].n >= REACTION_WRITES_PER_HOUR) return jres(429, { error: "too many reactions, try again later", retry_after_s: 60 }, { "Retry-After": "60" });
   if (req.method === "PUT") {
     const cnt = await timedQuery(sql`select count(distinct emoji)::int as n, bool_or(emoji = ${emoji}) as has from ${S("smith_reactions")} where message_id = ${mid}`, "reaction_count");
     if (cnt[0].n >= 20 && !cnt[0].has) return jres(422, { error: "too many distinct reactions on this message" });
-    await timedQuery(sql`insert into ${S("smith_reactions")} (message_id, actor, emoji) values (${mid}, ${a.actor}, ${emoji}) on conflict do nothing`, "reaction_add");
     await audit(a.actor, "reaction_add", { message_id: mid, thread_id: a.threadId, emoji });
+    await timedQuery(sql`insert into ${S("smith_reactions")} (message_id, actor, emoji) values (${mid}, ${a.actor}, ${emoji}) on conflict do nothing`, "reaction_add");
   } else {
-    await timedQuery(sql`delete from ${S("smith_reactions")} where message_id = ${mid} and actor = ${a.actor} and emoji = ${emoji}`, "reaction_del");
     await audit(a.actor, "reaction_remove", { message_id: mid, thread_id: a.threadId, emoji });
+    await timedQuery(sql`delete from ${S("smith_reactions")} where message_id = ${mid} and actor = ${a.actor} and emoji = ${emoji}`, "reaction_del");
   }
   return jres(200, { message_id: mid, reactions: (await reactionsFor([mid])).get(mid) ?? [] });
 }
@@ -1901,9 +1905,12 @@ async function ownerStream(req, auth, threadId) {
           }
           const reactions = {};
           try {
-            const lastIds = await timedQuery(sql`select id from ${T("messages")} where thread_id = ${threadId} order by created_at desc, id desc limit 60`, "stream_ids");
-            const rm = await reactionsFor(lastIds.map((r)=> r.id));
-            for (const [k, v] of rm) reactions[k] = v;
+            // One query per tick: reactions on the 60 newest messages of this thread.
+            const rr = await timedQuery(sql`select r.message_id, r.emoji, r.actor from ${S("smith_reactions")} r
+              where r.message_id in (select id from ${T("messages")} where thread_id = ${threadId} order by created_at desc, id desc limit 60) order by r.at asc`, "stream_reactions");
+            const tmp = {};
+            for (const r of rr) { const m = (tmp[r.message_id] ??= {}); (m[r.emoji] ??= []).push(r.actor); }
+            for (const k of Object.keys(tmp)) reactions[k] = Object.entries(tmp[k]).map(([emoji, actors])=>({ emoji, actors, count: actors.length }));
           } catch { /* best effort */ }
           const state = { working: feed.working, reactions, presence: feed.presence.map((p)=>({ agent_id: p.agent_id, online: p.online })), marks };
           const nsig = JSON.stringify(state);
