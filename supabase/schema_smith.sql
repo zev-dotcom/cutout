@@ -287,3 +287,14 @@ begin
   alter table messages drop constraint messages_type_check;
   execute 'alter table messages add constraint messages_type_check ' || newdef;
 end $act$;
+
+-- Chat photo (additive): one small image per thread.
+create table if not exists smith_thread_avatar (
+  thread_id  text primary key,
+  mime       text not null,
+  bytes      bytea not null,
+  version    text not null,
+  updated_at timestamptz not null default now()
+);
+alter table smith_thread_avatar enable row level security;
+do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith_thread_avatar from anon, authenticated; end if; end $$;

@@ -1205,6 +1205,13 @@ async function listThreadsSmith(auth) {
       workingBy.set(r.thread_id, list);
     }
   }
+  const avatarBy = new Map();
+  if (tids.length) {
+    try {
+      const ar = await timedQuery(sql`select thread_id, version from ${S("smith_thread_avatar")} where thread_id = any(${tids})`, "thread_avatar_versions");
+      for (const r of ar) avatarBy.set(r.thread_id, r.version);
+    } catch { /* table absent */ }
+  }
   const prefsBy = new Map();
   if (auth.kind === "owner" && tids.length) {
     try {
@@ -1223,6 +1230,7 @@ async function listThreadsSmith(auth) {
         unread: t.unread,
         members: membersBy.get(t.thread_id) ?? [],
         working: workingBy.get(t.thread_id) ?? [],
+        avatar_version: avatarBy.get(t.thread_id) ?? null,
         ...(auth.kind === "owner" ? { archived: !!pf && pf.archived_at !== null, muted, muted_until: muted ? iso(pf.muted_until) : null } : {})
       };
     })
@@ -1324,6 +1332,47 @@ async function reactionsRoute(req, auth, mid, emojiParam) {
     await timedQuery(sql`delete from ${S("smith_reactions")} where message_id = ${mid} and actor = ${a.actor} and emoji = ${emoji}`, "reaction_del");
   }
   return jres(200, { message_id: mid, reactions: (await reactionsFor([mid])).get(mid) ?? [] });
+}
+// Chat photo: one small image per thread. Owner or the thread's creator sets it; members read it (auth'd GET).
+const AVATAR_MAX_BYTES = 100 * 1024;
+function avatarMime(b) {
+  if (b.length > 12 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return "image/png";
+  if (b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
+  if (b.length > 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return "image/webp";
+  return null;
+}
+async function threadAvatar(req, auth, threadId) {
+  const denied = await threadAccess(auth, threadId);
+  if (denied) return denied;
+  if (req.method === "GET") {
+    const r = await timedQuery(sql`select mime, bytes, version from ${S("smith_thread_avatar")} where thread_id = ${threadId}`, "avatar_get");
+    if (!r.length) return jres(404, { error: "no chat photo" });
+    return new Response(r[0].bytes, { status: 200, headers: { "content-type": r[0].mime, "cache-control": "private, max-age=86400", "x-content-type-options": "nosniff", etag: `"${r[0].version}"` } });
+  }
+  if (auth.kind !== "owner") {
+    if (auth.kind !== "agent") return jres(403, { error: "owner or thread creator token required" });
+    const own = await timedQuery(sql`select created_by from ${S("smith_threads")} where thread_id = ${threadId}`, "avatar_creator");
+    if (!own.length || own[0].created_by !== auth.agentId) return jres(403, { error: "only the thread creator or the owner can change the chat photo" });
+  }
+  const actor = auth.kind === "owner" ? OWNER_ID : auth.agentId;
+  if (req.method === "DELETE") {
+    await audit(actor, "thread_avatar_remove", { thread_id: threadId });
+    await timedQuery(sql`delete from ${S("smith_thread_avatar")} where thread_id = ${threadId}`, "avatar_delete");
+    return jres(200, { thread_id: threadId, avatar_version: null });
+  }
+  const len = Number(req.headers.get("content-length") ?? "0");
+  if (len > AVATAR_MAX_BYTES) return jres(413, { error: "chat photo exceeds 100 KB" });
+  const buf = new Uint8Array(await req.arrayBuffer());
+  if (buf.length === 0) return jres(422, { error: "image body required" });
+  if (buf.length > AVATAR_MAX_BYTES) return jres(413, { error: "chat photo exceeds 100 KB" });
+  const mime = avatarMime(buf);
+  if (!mime) return jres(415, { error: "chat photo must be png, jpeg or webp" });
+  const hash = await crypto.subtle.digest("SHA-256", buf);
+  const version = [...new Uint8Array(hash)].slice(0, 6).map((x)=> x.toString(16).padStart(2, "0")).join("");
+  await audit(actor, "thread_avatar_set", { thread_id: threadId, bytes: buf.length, mime });
+  await timedQuery(sql`insert into ${S("smith_thread_avatar")} (thread_id, mime, bytes, version) values (${threadId}, ${mime}, ${buf}, ${version})
+    on conflict (thread_id) do update set mime = excluded.mime, bytes = excluded.bytes, version = excluded.version, updated_at = now()`, "avatar_set");
+  return jres(200, { thread_id: threadId, avatar_version: version });
 }
 async function ownerThreadPrefs(req, auth, threadId) {
   const denied = requireOwner(auth);
@@ -2135,6 +2184,7 @@ async function route(req, arrivedAt) {
   if (path === "/v1/owner/feed" && req.method === "GET") {
     return done(await ownerFeed(req, auth, new URL(req.url).searchParams.get("thread_id")));
   }
+  { const tv = path.match(/^\/v1\/threads\/([^/]+)\/avatar$/); if (tv && (req.method === "GET" || req.method === "PUT" || req.method === "DELETE")) return done(await threadAvatar(req, auth, decodeURIComponent(tv[1]))); }
   { const am = path.match(/^\/v1\/messages\/([^/]+)\/activity$/); if (am && (req.method === "PATCH" || req.method === "PUT")) return done(await patchActivity(req, auth, decodeURIComponent(am[1]))); }
   { const rm = path.match(/^\/v1\/messages\/([^/]+)\/reactions(?:\/([^/]+))?$/);
     if (rm && ((!rm[2] && (req.method === "PUT" || req.method === "GET")) || (rm[2] && req.method === "DELETE"))) return done(await reactionsRoute(req, auth, decodeURIComponent(rm[1]), rm[2] ? decodeURIComponent(rm[2]) : null)); }
