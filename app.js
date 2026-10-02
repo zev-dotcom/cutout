@@ -189,14 +189,90 @@ function avatarHtml(member){
   return '<div class="avatar">' + esc(letterFor(nm)) + "</div>";
 }
 function stackHtml(members){
-  var ms = members.slice(0, 3);
-  var inner = ms.map(function(m, i){
+  // Overlapped circles, newest on top. Over 3 members: two circles and a "+N" circle.
+  var many = members.length > 3;
+  var ms = members.slice(0, many ? 2 : Math.min(members.length, 3));
+  var inner = ms.map(function(m){
     var nm = m.display_name || m.agent_id || "?";
-    var cls = i === ms.length - 1 ? "avatar" : "avatar nl";
-    return '<div class="' + cls + '">' + esc(letterFor(nm)) + "</div>";
+    return '<div class="avatar">' + esc(letterFor(nm)) + "</div>";
   }).join("");
-  if (members.length > 3) inner += '<span class="countchip">+' + (members.length - 3) + "</span>";
-  return '<div class="stack">' + inner + "</div>";
+  if (many) inner += '<div class="avatar more">+' + (members.length - 2) + "</div>";
+  return '<div class="stack n' + (many ? 3 : ms.length) + '">' + inner + "</div>";
+}
+
+/* Uploaded chat photo (owner or creator set it). Fetched with the token, cached by version. */
+var avCache = {};
+function photoHtml(t){
+  return '<div class="avatar photo" data-avt="' + esc(t.thread_id) + '" data-avv="' + esc(t.avatar_version) + '"></div>';
+}
+function threadAvHtml(t, fallbackHtml){
+  return t && t.avatar_version ? photoHtml(t) : fallbackHtml;
+}
+function hydrateAvatars(root){
+  (root || document).querySelectorAll(".avatar.photo[data-avt]").forEach(function(n){
+    var key = n.dataset.avt + ":" + n.dataset.avv;
+    if (avCache[key]){ n.style.backgroundImage = "url(" + avCache[key] + ")"; return; }
+    if (avCache[key] === null) return;
+    avCache[key] = null; // fetch once
+    fetch(baseUrl() + "/v1/threads/" + encodeURIComponent(n.dataset.avt) + "/avatar?v=" + encodeURIComponent(n.dataset.avv), { headers: { "Authorization": "Bearer " + token() } })
+      .then(function(r){ if (!r.ok) throw new Error("avatar " + r.status); return r.blob(); })
+      .then(function(bl){
+        Object.keys(avCache).forEach(function(k){
+          if (k.indexOf(n.dataset.avt + ":") === 0 && k !== key && avCache[k]){ URL.revokeObjectURL(avCache[k]); delete avCache[k]; }
+        });
+        avCache[key] = URL.createObjectURL(bl);
+        document.querySelectorAll('.avatar.photo[data-avt="' + CSS.escape(n.dataset.avt) + '"][data-avv="' + CSS.escape(n.dataset.avv) + '"]').forEach(function(m){ m.style.backgroundImage = "url(" + avCache[key] + ")"; });
+      })
+      .catch(function(){ delete avCache[key]; });
+  });
+}
+function resizeToAvatar(file){
+  return new Promise(function(resolve, reject){
+    var url = URL.createObjectURL(file), img = new Image();
+    img.onload = function(){
+      var S = 256, c = document.createElement("canvas"); c.width = S; c.height = S;
+      var side = Math.min(img.width, img.height), sx = (img.width - side) / 2, sy = (img.height - side) / 2;
+      c.getContext("2d").drawImage(img, sx, sy, side, side, 0, 0, S, S);
+      URL.revokeObjectURL(url);
+      var tries = [["image/webp", .85], ["image/webp", .7], ["image/jpeg", .8], ["image/jpeg", .6], ["image/jpeg", .4]], i = 0;
+      (function next(){
+        var tr = tries[i++]; if (!tr) return reject(new Error("Photo could not be made small enough"));
+        c.toBlob(function(bl){
+          if (bl && bl.type === tr[0] && bl.size <= 100 * 1024) resolve(bl); else next();
+        }, tr[0], tr[1]);
+      })();
+    };
+    img.onerror = function(){ URL.revokeObjectURL(url); reject(new Error("Could not read that image")); };
+    img.src = url;
+  });
+}
+async function setChatPhoto(t, file){
+  try {
+    var bl = await resizeToAvatar(file);
+    var res = await fetch(baseUrl() + "/v1/threads/" + encodeURIComponent(t.thread_id) + "/avatar", {
+      method: "PUT", headers: { "Authorization": "Bearer " + token(), "Content-Type": bl.type }, body: bl });
+    var data = null; try { data = await res.json(); } catch(e){}
+    if (!res.ok) throw new Error((data && data.error) || ("HTTP " + res.status));
+    await loadThreads();
+    var nt = state.threadById[t.thread_id];
+    if (nt && state.currentThread === t.thread_id) renderThreadHeader(nt);
+    toast("Chat photo updated");
+  } catch(e){ toast(e.message); }
+}
+async function removeChatPhoto(t){
+  try {
+    await api("DELETE", "/v1/threads/" + encodeURIComponent(t.thread_id) + "/avatar");
+    await loadThreads();
+    var nt = state.threadById[t.thread_id];
+    if (nt && state.currentThread === t.thread_id) renderThreadHeader(nt);
+    toast("Chat photo removed");
+  } catch(e){ toast(e.message); }
+}
+function pickChatPhoto(t){
+  closeSheet();
+  var inp = document.createElement("input"); inp.type = "file"; inp.accept = "image/png,image/jpeg,image/webp,image/*";
+  inp.onchange = function(){ if (inp.files && inp.files[0]) setChatPhoto(t, inp.files[0]); };
+  inp.click();
 }
 
 /* ---------- agent names ---------- */
@@ -210,7 +286,7 @@ function agentPlat(agentId){
 }
 /* Registered = paired through Smith (has its own token). Legacy bus ids carried over
    from a pre-Smith bus have no Smith identity and are never offered to the user. */
-var SMITH_BUILD = "2026-10-02.9";
+var SMITH_BUILD = "2026-10-02.10";
 // Registered = holds a Smith token. (legacy_unverified stays true on seeded rows even after pairing.)
 function isRegistered(a){ return !!a.has_token && !a.revoked_at; }
 function indexAgents(list){
@@ -272,9 +348,9 @@ function renderThreadList(){
       var r = el("button", "trow");
       r.dataset.tid = t.thread_id;
       r.setAttribute("aria-current", t.thread_id === state.currentThread ? "true" : "false");
-      var av = (t.members || []).length > 1
+      var av = threadAvHtml(t, (t.members || []).length > 1
         ? stackHtml(visibleMembers(t.members))
-        : avatarHtml(t.members[0] || {display_name: t.name});
+        : avatarHtml(t.members[0] || {display_name: t.name}));
       var right = '<div class="tright"><div class="ttime">' +
         esc(t.last_at ? fmtListTime(t.last_at) : "") + "</div>" +
         (t.muted ? '<span class="mutedic" title="Muted" aria-label="Muted">muted</span>' : "") +
@@ -301,6 +377,7 @@ function renderThreadList(){
   } else if (archivedList.length && q){
     section("ARCHIVED", archivedList);
   }
+  hydrateAvatars(box);
   if (!list.length){
     box.appendChild(el("div", "emptymsgs",
       q ? "No chats match your search." :
@@ -325,6 +402,8 @@ function openThreadMenu(t){
   closeSheet();
   var sh = el("div", "sheet"); sh.id = "sheet";
   var items = [
+    ["Change chat photo", function(){ pickChatPhoto(t); }],
+    t.avatar_version ? ["Remove chat photo", function(){ closeSheet(); removeChatPhoto(t); }] : null,
     [t.archived ? "Unarchive chat" : "Archive chat", { archived: !t.archived }],
     t.muted ? ["Turn notifications on", { muted: false }] : null,
     t.muted ? null : ["Mute for 1 hour", { muted: "1h" }],
@@ -338,7 +417,7 @@ function openThreadMenu(t){
   sh.innerHTML = inner;
   sh.addEventListener("click", function(e){
     if (e.target === sh || e.target.classList.contains("cancel")) return closeSheet();
-    var b = e.target.closest(".sheetbtn"); if (b && b.dataset.i != null) setPrefs(t, items[Number(b.dataset.i)][1]);
+    var b = e.target.closest(".sheetbtn"); if (b && b.dataset.i != null){ var act = items[Number(b.dataset.i)][1]; if (typeof act === "function") act(); else setPrefs(t, act); }
   });
   document.body.appendChild(sh);
 }
@@ -384,8 +463,9 @@ function renderThreadHeader(t){
     sub.innerHTML = memberSubHtml(t);
   }
   var ms = t.members || [];
-  $("threadAvatar").innerHTML = visibleMembers(ms).length > 1 ? stackHtml(visibleMembers(ms))
-    : avatarHtml(ms[0] || {display_name: t.name});
+  $("threadAvatar").innerHTML = threadAvHtml(t, visibleMembers(ms).length > 1 ? stackHtml(visibleMembers(ms))
+    : avatarHtml(ms[0] || {display_name: t.name}));
+  hydrateAvatars($("threadAvatar"));
   var others = ms.filter(function(m){ return m.agent_id !== "owner"; });
   $("composerInput").placeholder = others.length === 1
     ? "Message " + (others[0].display_name || others[0].agent_id) + "…"
