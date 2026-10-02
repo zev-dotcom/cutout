@@ -364,3 +364,10 @@ select{width:100%;min-height:var(--tap);border:1.5px solid var(--line);border-ra
 .mutedic{font-size:.68rem;font-weight:700;letter-spacing:.04em;color:var(--ink3);margin-right:6px;text-transform:uppercase}
 .chathead .iconbtn{min-width:36px;padding:0}
 .chathead .hinfo{min-width:0;flex:1}
+.rxs{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.msgrow.msg-out .rxs{justify-content:flex-end}
+.rx{min-height:28px;padding:0 9px;border-radius:14px;border:1.5px solid var(--line);background:var(--bg2);color:var(--ink);font-size:.85rem;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
+.rx.mine{border-color:var(--accent,#f05a28);background:rgba(240,90,40,.12)}
+.rxn{font-size:.75rem;font-weight:700;color:var(--ink2)}
+.rxbar{display:flex;justify-content:space-between;gap:4px;padding:6px 2px}
+.rxpick{flex:1;min-height:var(--tap);border:0;border-radius:12px;background:var(--bg2);font-size:1.5rem;cursor:pointer}

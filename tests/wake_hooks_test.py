@@ -3,7 +3,7 @@
 Server must run with: SMITH_SCHEMA=agentcollab SMITH_TABLES_SCHEMA=smith SMITH_SETUP_KEY=test-setup-key-001
 SMITH_WAKE_DEBOUNCE_MS=1500 SMITH_WAKE_RECHECK_MS=3000 SMITH_WAKE_URGENT_PER_HOUR=3
 and --preload tests/wake_preload.ts (fake DNS/fetch for *.test.example)."""
-import re, hashlib, hmac, json, os, subprocess, sys, time, urllib.request, urllib.error
+import urllib.parse, re, hashlib, hmac, json, os, subprocess, sys, time, urllib.request, urllib.error
 BASE = sys.argv[1]; PSQL = sys.argv[2:]
 HITS = os.environ.get("WAKE_HITS_FILE", "/tmp/wake-hits.jsonl")
 fails = 0
@@ -413,4 +413,24 @@ req("POST", "/v1/messages", {"thread_id": TA, "from": "pk-b", "to": "owner", "ty
 check("a new agent message unarchives", row(TA)["archived"] is False and row(TA)["muted"] is True, row(TA))
 s, r = req("PUT", "/v1/owner/threads/" + TA + "/prefs", {"muted": False}, OWN); check("unmute", row(TA)["muted"] is False, None)
 s, r = req("GET", "/v1/threads", tok=PB); check("agents never see prefs fields", all("archived" not in x for x in r), None)
+# --- reactions ---
+s, mm = req("POST", "/v1/messages", {"thread_id": TA, "from": "pk-b", "to": "owner", "type": "note", "body": "react to me"}, PB); MID = mm["id"]
+RP = "/v1/messages/" + MID + "/reactions"
+s, r = req("PUT", RP, {"emoji": "\U0001F44D"}, OWN); check("owner adds a reaction", s == 200 and r["reactions"][0]["count"] == 1, (s, r))
+s, r = req("PUT", RP, {"emoji": "\U0001F44D"}, PB); check("agent adds the same emoji: count 2, actors listed", s == 200 and r["reactions"][0]["count"] == 2 and set(r["reactions"][0]["actors"]) == {"owner", "pk-b"}, r)
+s, r = req("PUT", RP, {"emoji": "\U0001F44D"}, OWN); check("duplicate reaction is idempotent", r["reactions"][0]["count"] == 2, r)
+s, r = req("PUT", RP, {"emoji": "hello"}, OWN); check("non-emoji -> 422", s == 422, s)
+s, r = req("PUT", RP, {"emoji": "\U0001F44D\U0001F44D"}, OWN); check("two graphemes -> 422", s == 422, s)
+s, r = req("PUT", RP, {"emoji": "\U0001F44D"}, PA); check("non-member agent cannot react (403)", s == 403, s)
+s, r = req("PUT", "/v1/messages/nope/reactions", {"emoji": "\U0001F44D"}, OWN); check("unknown message -> 404", s == 404, s)
+s, fd = req("GET", "/v1/owner/feed?thread_id=" + TA, tok=OWN); mine = [m for m in fd["messages"] if m["id"] == MID][0]
+check("feed carries reactions", mine["reactions"][0]["emoji"] == "\U0001F44D" and mine["reactions"][0]["count"] == 2, mine.get("reactions"))
+s, r = req("DELETE", RP + "/" + urllib.parse.quote("\U0001F44D"), tok=PB); check("agent removes only its own reaction", s == 200 and r["reactions"][0]["actors"] == ["owner"], r)
+s, r = req("GET", RP, tok=PB); check("GET reactions", s == 200 and len(r["reactions"]) == 1, r)
+s, r = req("DELETE", RP + "/" + urllib.parse.quote("\U0001F44D"), tok=OWN); check("owner removes; none left", r["reactions"] == [], r)
+for i, e in enumerate("\U0001F600\U0001F601\U0001F602\U0001F603\U0001F604\U0001F605\U0001F606\U0001F607\U0001F608\U0001F609\U0001F60A\U0001F60B\U0001F60C\U0001F60D\U0001F60E\U0001F60F\U0001F610\U0001F611\U0001F612\U0001F613"):
+    req("PUT", RP, {"emoji": e}, OWN)
+s, r = req("PUT", RP, {"emoji": "\U0001F914"}, OWN); check("21st distinct emoji -> 422", s == 422, s)
+s, r = req("PUT", RP, {"emoji": "\U0001F600"}, PB); check("existing emoji still joinable at the cap", s == 200, s)
+check("reactions are audited", int(sql("select count(*) from smith.smith_audit where action in ('reaction_add','reaction_remove')") or 0) > 3, None)
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)

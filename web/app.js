@@ -458,6 +458,59 @@ function replyChip(msg){
 function mentionsMe(msg){
   return !!(msg.metadata && Array.isArray(msg.metadata.mentions) && msg.metadata.mentions.indexOf("owner") >= 0);
 }
+var QUICK_RX = ["\uD83D\uDC4D", "\u2764\uFE0F", "\uD83D\uDE02", "\uD83C\uDF89", "\uD83D\uDC40", "\u2705"];
+function rxHtml(list){
+  if (!list || !list.length) return "";
+  return '<div class="rxs">' + list.map(function(r){
+    var mine = (r.actors || []).indexOf("owner") >= 0;
+    var who = (r.actors || []).map(function(a){ return a === "owner" ? "You" : agentLabel(a); }).join(", ");
+    return '<button type="button" class="rx' + (mine ? " mine" : "") + '" data-e="' + esc(r.emoji) + '" title="' + esc(who) + '" aria-label="' + esc(r.emoji + " " + r.count + (mine ? ", you reacted" : "")) + '">' +
+      esc(r.emoji) + (r.count > 1 ? ' <span class="rxn">' + r.count + "</span>" : "") + "</button>";
+  }).join("") + "</div>";
+}
+function setRx(row, list){
+  if (!row) return;
+  var old = row.querySelector(".rxs"), html = rxHtml(list);
+  if (old && !html){ old.remove(); return; }
+  if (!html) return;
+  var tmp = document.createElement("div"); tmp.innerHTML = html;
+  if (old){ if (old.innerHTML !== tmp.firstChild.innerHTML) old.innerHTML = tmp.firstChild.innerHTML; }
+  else { var b = row.querySelector(".bub"); if (b) b.insertAdjacentElement("afterend", tmp.firstChild); }
+}
+function applyReactions(map){
+  var box = $("threadMsgs"); if (!box || !map) return;
+  box.querySelectorAll(".msgrow[data-mid]").forEach(function(row){
+    var id = row.getAttribute("data-mid");
+    if (map[id]) setRx(row, map[id]); else if (row.querySelector(".rxs") && map.hasOwnProperty(id) === false && state.rxSeen && state.rxSeen[id]) setRx(row, []);
+  });
+  state.rxSeen = {}; Object.keys(map).forEach(function(k){ state.rxSeen[k] = 1; });
+}
+async function toggleRx(mid, emoji){
+  var row = $("threadMsgs").querySelector('[data-mid="' + String(mid).replace(/"/g, "") + '"]');
+  var chip = row && Array.prototype.filter.call(row.querySelectorAll(".rx"), function(c){ return c.dataset.e === emoji; })[0];
+  var mine = chip && chip.classList.contains("mine");
+  try {
+    var r = mine ? await api("DELETE", "/v1/messages/" + encodeURIComponent(mid) + "/reactions/" + encodeURIComponent(emoji))
+                 : await api("PUT", "/v1/messages/" + encodeURIComponent(mid) + "/reactions", { emoji: emoji });
+    setRx(row, r.reactions || []);
+  } catch (e){ toast("Could not react"); }
+}
+function openReactBar(mid){
+  closeSheet();
+  var sh = el("div", "sheet"); sh.id = "sheet";
+  sh.innerHTML = '<div class="sheetbox" role="dialog" aria-label="React"><div class="rxbar">' +
+    QUICK_RX.map(function(e){ return '<button type="button" class="rxpick" data-e="' + esc(e) + '">' + esc(e) + "</button>"; }).join("") +
+    '</div><button type="button" class="sheetbtn cancel">Cancel</button></div>';
+  sh.addEventListener("click", function(e){
+    if (e.target === sh || e.target.classList.contains("cancel")) return closeSheet();
+    var b = e.target.closest(".rxpick"); if (!b) return;
+    var row = $("threadMsgs").querySelector('[data-mid="' + String(mid).replace(/"/g, "") + '"]');
+    var have = row && Array.prototype.some.call(row.querySelectorAll(".rx.mine"), function(c){ return c.dataset.e === b.dataset.e; });
+    closeSheet();
+    if (!have) toggleRx(mid, b.dataset.e); else toggleRx(mid, b.dataset.e);
+  });
+  document.body.appendChild(sh);
+}
 function msgHtml(msg){
   var mine = msg.from === "owner";
   if (isRenameNote(msg)){
@@ -474,7 +527,7 @@ function msgHtml(msg){
     var lbl = metaLine(msg);
     return '<div class="msgrow msg-out" data-mid="' + esc(msg.id) + '" data-ts="' + esc(msg.created_at || "") + '">' +
       (msg.to && msg.to !== "*" && msg.to !== "owner" ? '<div class="who out">' + toChip(msg) + "</div>" : "") + replyChip(msg) +
-      '<div class="bub">' + bodyHtml(msg) + "</div>" +
+      '<div class="bub">' + bodyHtml(msg) + "</div>" + rxHtml(msg.reactions) +
       (lbl ? '<div class="rcpt">' + lbl + "</div>" : "") + "</div>";
   }
   var nm = esc(agentLabel(msg.from));
@@ -483,7 +536,7 @@ function msgHtml(msg){
     (plat ? ' <span class="plat">' + esc(String(plat).toUpperCase()) + "</span>" : "") + toChip(msg) + "</div>" + replyChip(msg);
   var tm = msg.created_at ? '<div class="rcpt"><span class="mt" data-short="' + esc(fmtClock(msg.created_at)) + '" data-full="' + esc(fmtFull(msg.created_at)) + '">' + esc(fmtClock(msg.created_at)) + "</span></div>" : "";
   return '<div class="msgrow them' + (mentionsMe(msg) ? " ment-me" : "") + '" data-mid="' + esc(msg.id) + '">' + who +
-    '<div class="bub">' + bodyHtml(msg) + "</div>" + tm + "</div>";
+    '<div class="bub">' + bodyHtml(msg) + "</div>" + rxHtml(msg.reactions) + tm + "</div>";
 }
 /* Cue dots: rendered ONLY from the working array handed in. Empty => nothing. */
 function workingPillHtml(working){
@@ -660,7 +713,7 @@ function startThreadStream(tid, gen){
               markRead(tid, d.messages || []);
               refreshThreadsQuiet();
             } else if (ev === "state"){
-              setWorking(d.working); applyPresence(d.presence); applyMarks(d.marks);
+              setWorking(d.working); applyPresence(d.presence); applyMarks(d.marks); applyReactions(d.reactions);
             }
           });
         }
@@ -1598,6 +1651,19 @@ function checkForUpdate(){
 setInterval(checkForUpdate, 10 * 60 * 1000);
 document.addEventListener("visibilitychange", function(){ if (!document.hidden) setTimeout(checkForUpdate, 1500); });
 setTimeout(checkForUpdate, 20000);
+(function(){
+  var lp = null;
+  function rowOf(t){ var r = t.closest && t.closest("#threadMsgs .msgrow[data-mid]"); return r && t.closest(".bub") ? r : null; }
+  var tm = $("threadMsgs");
+  tm.addEventListener("touchstart", function(e){ var r = rowOf(e.target); if (!r) return; clearTimeout(lp); lp = setTimeout(function(){ r.dataset.lp = "1"; openReactBar(r.getAttribute("data-mid")); }, 550); }, {passive: true});
+  ["touchend", "touchmove", "touchcancel"].forEach(function(n){ tm.addEventListener(n, function(){ clearTimeout(lp); }, {passive: true}); });
+  tm.addEventListener("contextmenu", function(e){ var r = rowOf(e.target); if (!r) return; e.preventDefault(); openReactBar(r.getAttribute("data-mid")); });
+  tm.addEventListener("dblclick", function(e){ var r = rowOf(e.target); if (r) openReactBar(r.getAttribute("data-mid")); });
+  tm.addEventListener("click", function(e){
+    var c = e.target.closest && e.target.closest(".rx"); if (!c) return;
+    var r = c.closest(".msgrow[data-mid]"); if (r) toggleRx(r.getAttribute("data-mid"), c.dataset.e);
+  });
+})();
 document.addEventListener("click", function(e){
   var jb = e.target.closest && e.target.closest(".rpchip");
   if (jb){

@@ -257,3 +257,15 @@ create table if not exists smith_thread_prefs (
   muted_until timestamptz
 );
 alter table smith_thread_prefs enable row level security;
+
+-- Message reactions (additive).
+create table if not exists smith_reactions (
+  message_id text not null,
+  actor      text not null,
+  emoji      text not null,
+  at         timestamptz not null default now(),
+  primary key (message_id, actor, emoji)
+);
+create index if not exists smith_reactions_msg on smith_reactions (message_id);
+alter table smith_reactions enable row level security;
+do $$ begin if exists (select 1 from pg_roles where rolname='anon') then revoke all on smith_reactions from anon, authenticated; end if; end $$;

@@ -650,8 +650,10 @@ async function enrichMessages(rows, redactLabel, ownerView = false) {
       for (const r of sr) { const l = seenBy.get(r.message_id) ?? []; l.push({ agent: r.agent_id, at: iso(r.at) }); seenBy.set(r.message_id, l); }
     } catch { /* table absent */ }
   }
+  const reactBy = await reactionsFor(rows.map((r)=> r.id));
   return rows.map((r)=>({
       ...serialize(r),
+      reactions: reactBy.get(r.id) ?? [],
       receipts: receiptsBy.get(r.id) ?? [],
       ...(ownerView && r.from_agent === OWNER_ID ? { seen_by: seenBy.get(r.id) ?? [] } : {})
     }));
@@ -1212,6 +1214,51 @@ async function listThreadsSmith(auth) {
   };
 }
 // Owner-only per-thread prefs: archive (hide from home) and mute (no push). Agents are unaffected.
+// Reactions: one grapheme per reaction, max 20 distinct emoji per message. They never wake an agent.
+async function reactionsFor(ids) {
+  const out = new Map();
+  if (!ids.length) return out;
+  try {
+    const rr = await timedQuery(sql`select message_id, emoji, actor from ${S("smith_reactions")} where message_id = any(${ids}) order by at asc`, "reactions_for");
+    const tmp = new Map();
+    for (const r of rr) { const k = r.message_id; const m = tmp.get(k) ?? new Map(); const a = m.get(r.emoji) ?? []; a.push(r.actor); m.set(r.emoji, a); tmp.set(k, m); }
+    for (const [k, m] of tmp) out.set(k, [...m.entries()].map(([emoji, actors])=>({ emoji, actors, count: actors.length })));
+  } catch { /* table absent */ }
+  return out;
+}
+function oneGrapheme(e) {
+  if (typeof e !== "string" || !e || e.length > 32) return false;
+  try { return [...new Intl.Segmenter("en", { granularity: "grapheme" }).segment(e)].length === 1 && /\p{Extended_Pictographic}|\p{Regional_Indicator}|[#*0-9]\uFE0F?\u20E3/u.test(e); } catch { return false; }
+}
+async function reactionAccess(auth, mid) {
+  if (auth.kind === "legacy") return { err: jres(403, { error: "legacy credentials not accepted on managed threads" }) };
+  const m = await timedQuery(sql`select thread_id from ${T("messages")} where id = ${mid}`, "reaction_msg");
+  if (!m.length) return { err: jres(404, { error: "message not found" }) };
+  const denied = await threadAccess(auth, m[0].thread_id);
+  if (denied) return { err: denied };
+  return { threadId: m[0].thread_id, actor: auth.kind === "owner" ? OWNER_ID : auth.agentId };
+}
+async function reactionsRoute(req, auth, mid, emojiParam) {
+  const a = await reactionAccess(auth, mid);
+  if (a.err) return a.err;
+  if (req.method === "GET") return jres(200, { message_id: mid, reactions: (await reactionsFor([mid])).get(mid) ?? [] });
+  let emoji = emojiParam;
+  if (req.method === "PUT") {
+    let body; try { body = await req.json(); } catch { return jres(400, { error: "invalid JSON" }); }
+    emoji = body?.emoji;
+  }
+  if (!oneGrapheme(emoji)) return jres(422, { error: "emoji must be a single emoji" });
+  if (req.method === "PUT") {
+    const cnt = await timedQuery(sql`select count(distinct emoji)::int as n, bool_or(emoji = ${emoji}) as has from ${S("smith_reactions")} where message_id = ${mid}`, "reaction_count");
+    if (cnt[0].n >= 20 && !cnt[0].has) return jres(422, { error: "too many distinct reactions on this message" });
+    await timedQuery(sql`insert into ${S("smith_reactions")} (message_id, actor, emoji) values (${mid}, ${a.actor}, ${emoji}) on conflict do nothing`, "reaction_add");
+    await audit(a.actor, "reaction_add", { message_id: mid, thread_id: a.threadId, emoji });
+  } else {
+    await timedQuery(sql`delete from ${S("smith_reactions")} where message_id = ${mid} and actor = ${a.actor} and emoji = ${emoji}`, "reaction_del");
+    await audit(a.actor, "reaction_remove", { message_id: mid, thread_id: a.threadId, emoji });
+  }
+  return jres(200, { message_id: mid, reactions: (await reactionsFor([mid])).get(mid) ?? [] });
+}
 async function ownerThreadPrefs(req, auth, threadId) {
   const denied = requireOwner(auth);
   if (denied) return denied;
@@ -1852,7 +1899,13 @@ async function ownerStream(req, auth, threadId) {
               for (const r of sr) (marks[r.message_id] ??= { receipts: [], seen_by: [] }).seen_by.push({ agent: r.agent_id, at: iso(r.at) });
             } catch { /* table absent */ }
           }
-          const state = { working: feed.working, presence: feed.presence.map((p)=>({ agent_id: p.agent_id, online: p.online })), marks };
+          const reactions = {};
+          try {
+            const lastIds = await timedQuery(sql`select id from ${T("messages")} where thread_id = ${threadId} order by created_at desc, id desc limit 60`, "stream_ids");
+            const rm = await reactionsFor(lastIds.map((r)=> r.id));
+            for (const [k, v] of rm) reactions[k] = v;
+          } catch { /* best effort */ }
+          const state = { working: feed.working, reactions, presence: feed.presence.map((p)=>({ agent_id: p.agent_id, online: p.online })), marks };
           const nsig = JSON.stringify(state);
           if (nsig !== sig) { sig = nsig; send("state", { ...state, presence: feed.presence }); }
           else send("ping", {});
@@ -2008,6 +2061,8 @@ async function route(req, arrivedAt) {
   if (path === "/v1/owner/feed" && req.method === "GET") {
     return done(await ownerFeed(req, auth, new URL(req.url).searchParams.get("thread_id")));
   }
+  { const rm = path.match(/^\/v1\/messages\/([^/]+)\/reactions(?:\/([^/]+))?$/);
+    if (rm && ((!rm[2] && (req.method === "PUT" || req.method === "GET")) || (rm[2] && req.method === "DELETE"))) return done(await reactionsRoute(req, auth, decodeURIComponent(rm[1]), rm[2] ? decodeURIComponent(rm[2]) : null)); }
   { const pm = path.match(/^\/v1\/owner\/threads\/([^/]+)\/prefs$/); if (pm && req.method === "PUT") return done(await ownerThreadPrefs(req, auth, decodeURIComponent(pm[1]))); }
   if (path === "/v1/owner/typing" && req.method === "POST") return done(await ownerTyping(req, auth));
   if (path === "/v1/owner/stream" && req.method === "GET") return done(await ownerStream(req, auth, new URL(req.url).searchParams.get("thread_id")));
