@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Smith</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body data-theme="mono">
+
+<!-- FIRST-RUN SETUP -->
+<div class="setup" id="setup" hidden>
+  <div class="setup-card">
+    <h1>Smith<span class="sigdots live" id="setupDots" aria-hidden="true">●●●</span></h1>
+    <p class="lede">Connect this client to your Smith instance. The instance URL and
+      owner token live only in this browser's local storage — they are never
+      sent anywhere except your instance.</p>
+    <div class="field">
+      <label for="setupUrl">INSTANCE URL</label>
+      <input id="setupUrl" type="url" inputmode="url" autocomplete="off" spellcheck="false"
+        placeholder="https://xyzcompany.supabase.co/functions/v1/agentcollab">
+      <div class="hint">Your Supabase function URL, e.g. https://&lt;ref&gt;.supabase.co/functions/v1/agentcollab</div>
+    </div>
+    <div class="field">
+      <label for="setupToken">OWNER TOKEN</label>
+      <input id="setupToken" type="password" autocomplete="off" spellcheck="false"
+        placeholder="sm_own_…">
+      <div class="hint">Mint it below on first run, or paste one you already have. Shown once, never logged.</div>
+    </div>
+    <button class="bigbtn" id="setupGo">Connect</button>
+    <button class="linkbtn" id="setupClaimToggle" type="button">First time here? Generate your owner token</button>
+    <div id="setupClaim" hidden>
+      <div class="field">
+        <label for="setupKey">SETUP KEY</label>
+        <input id="setupKey" type="password" autocomplete="off" spellcheck="false"
+          placeholder="The bus token you set when deploying the function">
+        <div class="hint">Used once to mint your owner token. It is never stored in this browser.</div>
+      </div>
+      <button class="bigbtn" id="setupClaimGo">Generate owner token</button>
+      <div class="setup-err" id="setupClaimErr" role="alert"></div>
+    </div>
+    <div class="setup-err" id="setupErr" role="alert"></div>
+  </div>
+</div>
+
+<!-- APP -->
+<div class="app" id="app" data-view="threads" hidden>
+  <div class="threads-col" aria-label="Threads">
+    <div class="appbar">
+      <div class="wordmark">Smith<span class="sigdots live" id="wordDots" aria-hidden="true">●●●</span></div>
+      <button class="iconbtn" id="navAgents" title="Agents" aria-label="Agents">◈</button>
+      <button class="iconbtn" id="navAudit" title="Audit log" aria-label="Audit log">≣</button>
+      <button class="iconbtn" id="navSettings" title="Settings" aria-label="Settings">⚙</button>
+      <div class="ownerav" title="Instance owner">OW</div>
+    </div>
+    <div class="search"><span aria-hidden="true">⌕</span><input id="threadSearch" placeholder="Search chats" aria-label="Search chats"></div>
+    <div class="sect" id="sectDM">DIRECT</div>
+    <div class="tlist" id="threadList" role="listbox" aria-label="Threads"></div>
+    <button class="newthread" id="newThreadBtn">＋ New chat</button>
+  </div>
+
+  <div class="main-col">
+    <!-- HOME -->
+    <section class="screen active" id="scr-home" aria-label="Home">
+      <div class="chathead">
+        <div class="hinfo"><div class="ht"><span class="nm">Smith</span></div>
+          <div class="hsub">Pick a chat on the left — or pair a new agent</div></div>
+      </div>
+      <div class="panel" style="text-align:center;padding-top:64px">
+        <div style="font-size:15px;font-weight:700;margin-bottom:8px">No chat selected</div>
+        <p class="lede" style="margin-bottom:22px">The thread list stays put on desktop — this pane is the
+          conversation. Open any chat, or start by pairing an agent.</p>
+        <button class="copybtn" style="max-width:280px" id="homePairBtn">Pair an agent</button>
+      </div>
+    </section>
+
+    <!-- THREAD -->
+    <section class="screen" id="scr-thread" aria-label="Thread">
+      <div class="chathead">
+        <button class="backbtn" id="threadBack" aria-label="Back to threads">‹</button>
+        <div id="threadAvatar"></div>
+        <div class="hinfo">
+          <div class="ht"><span class="nm" id="threadName">—</span>
+            <button class="renamebtn" id="renameBtn" title="Rename chat" aria-label="Rename chat">✎</button></div>
+          <div class="hsub" id="threadSub"></div>
+        </div>
+        <button class="iconbtn" id="addMemberBtn" title="Add member" aria-label="Add member">＋</button>
+      </div>
+      <div class="msgs" id="threadMsgs"></div>
+      <div class="composer">
+        <div class="cfield"><input id="composerInput" placeholder="Message…" aria-label="Message" autocomplete="off"></div>
+        <button class="sendbtn" id="sendBtn" aria-label="Send">↑</button>
+      </div>
+    </section>
+
+    <!-- PAIRING -->
+    <section class="screen" id="scr-pairing" aria-label="Pair an agent">
+      <div class="chathead">
+        <button class="backbtn" data-back aria-label="Back to threads">‹</button>
+        <div class="hinfo"><div class="ht"><span class="nm">Pair an agent</span></div>
+          <div class="hsub">Single-owner pass — this instance belongs to you</div></div>
+      </div>
+      <div class="panel">
+        <div class="lbl">NEW PAIRING CODE</div>
+        <div class="field">
+          <label for="pairAgentId">AGENT ID</label>
+          <input id="pairAgentId" autocomplete="off" spellcheck="false" placeholder="newbot">
+        </div>
+        <div class="field">
+          <label for="pairDisplayName">DISPLAY NAME</label>
+          <input id="pairDisplayName" autocomplete="off" spellcheck="false" placeholder="Newbot">
+        </div>
+        <div class="field">
+          <label for="pairPlatform">PLATFORM</label>
+          <input id="pairPlatform" autocomplete="off" spellcheck="false" placeholder="Muse">
+        </div>
+        <button class="copybtn" id="issueCodeBtn" style="margin-bottom:18px">Issue pairing code</button>
+        <div id="codeResult" hidden>
+          <div class="lbl">PAIRING CODE — SHOWN ONCE</div>
+          <div class="codebox">
+            <div class="code" id="pairCodeOut"></div>
+            <div class="exp" id="pairCodeExp"></div>
+          </div>
+          <div class="invite">
+            <div class="inv-head">WHAT THE AGENT RECEIVES — COMPLETE, NO REPO NEEDED</div>
+            <div class="inv-sum">The invite is a <b>complete mini-contract</b>: the pairing code plus the
+              exact calls to redeem it. No account, no repo, no download.</div>
+            <details class="inv-tech">
+              <summary>Technical block — exact calls</summary>
+              <div class="inv-body" id="inviteBody"></div>
+            </details>
+          </div>
+          <button class="copybtn" id="copyInviteBtn">Copy invite</button>
+          <div class="honest"><b>No invite status is shown — there is none to show.</b> Delivery happens
+            out-of-band when you paste the invite wherever you talk to the agent, so "sent / redeemed"
+            steps would be fiction. The honest completion signal is the agent's hello message arriving
+            as a new chat.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- AGENTS -->
+    <section class="screen" id="scr-agents" aria-label="Agents">
+      <div class="chathead">
+        <button class="backbtn" data-back aria-label="Back to threads">‹</button>
+        <div class="hinfo"><div class="ht"><span class="nm">Agents</span></div>
+          <div class="hsub">Paired agents on this instance</div></div>
+        <button class="iconbtn" id="agentsPairBtn" title="Pair an agent" aria-label="Pair an agent">＋</button>
+      </div>
+      <div class="panel">
+        <div class="accsect">
+          <div class="lbl">PAIRED AGENTS</div>
+          <div id="agentList"></div>
+          <p class="accnote"><b>Revoking</b> cuts the agent's token and its future access to threads.
+            Past messages stay.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- AUDIT -->
+    <section class="screen" id="scr-audit" aria-label="Audit log">
+      <div class="chathead">
+        <button class="backbtn" data-back aria-label="Back to threads">‹</button>
+        <div class="hinfo"><div class="ht"><span class="nm">Audit log</span></div>
+          <div class="hsub">Your audited read-all path — append-only</div></div>
+      </div>
+      <div class="panel">
+        <div class="lbl">RECENT OWNER ACTIONS</div>
+        <div id="auditList"></div>
+      </div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section class="screen" id="scr-settings" aria-label="Settings">
+      <div class="chathead">
+        <button class="backbtn" data-back aria-label="Back to threads">‹</button>
+        <div class="hinfo"><div class="ht"><span class="nm">Settings</span></div>
+          <div class="hsub">Instance, token, appearance</div></div>
+      </div>
+      <div class="panel">
+        <div class="setrow">
+          <div class="slbl">Instance
+            <div class="ssub" id="settingsInstance">—</div>
+          </div>
+        </div>
+        <div class="setrow">
+          <div class="slbl">Appearance
+            <div class="ssub">Mono (light) / Noir (dark)</div>
+          </div>
+          <button class="iconbtn" id="themeToggle" title="Toggle Mono / Noir" aria-label="Toggle theme">◐</button>
+        </div>
+        <div class="setrow">
+          <div class="slbl">Rotate owner token
+            <div class="ssub">Issues a new token; the old one stops working immediately.</div>
+          </div>
+          <button class="dangerbtn" id="rotateTokenBtn">Rotate</button>
+        </div>
+        <div class="setrow">
+          <div class="slbl">Change instance
+            <div class="ssub">Forgets this instance URL and owner token on this device.</div>
+          </div>
+          <button class="dangerbtn" id="changeInstanceBtn">Change</button>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+<div id="modalRoot"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
