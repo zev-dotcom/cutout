@@ -450,4 +450,9 @@ s, r = req("PATCH", "/v1/messages/" + AID + "/activity", {"state": "done", "summ
 check("author finishes the activity, finished_at set", s == 200 and r["activity"]["state"] == "done" and "finished_at" in r["activity"] and r["activity"]["kind"] == "call", (s, r))
 s, r = req("PATCH", "/v1/messages/" + AID + "/activity", {"state": "nope"}, PB); check("bad state on update -> 422", s == 422, s)
 s, r = req("PATCH", "/v1/messages/" + mm["id"] + "/activity", {"state": "done"}, PB); check("update on a non-activity message -> 422", s == 422, s)
+# --- peek isolation and consistency ---
+req("POST", "/v1/messages", {"thread_id": TA, "from": "owner", "to": "*", "type": "note", "body": "for members only"}, OWN); time.sleep(0.3)
+s, pa = req("GET", "/v1/messages?peek=1", tok=PA); check("peek: non-member sees no thread it is not in", all(x["thread_id"] != TA for x in pa["threads"]), pa["threads"])
+s, pb = req("GET", "/v1/messages?peek=1", tok=PB); check("peek: member sees the thread", any(x["thread_id"] == TA for x in pb["threads"]), pb["threads"])
+check("peek: sum of per-thread unread matches total unread", sum(x["unread"] for x in pb["threads"]) == pb["unread"], (pb["unread"], pb["threads"]))
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)
