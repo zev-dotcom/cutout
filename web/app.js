@@ -109,22 +109,30 @@ function token(){
   var c = loadCfg();
   return c ? c.token : "";
 }
-async function api(method, path, body){
-  var res = await fetch(baseUrl() + path, {
-    method: method,
-    headers: {
-      "Authorization": "Bearer " + token(),
-      "Content-Type": "application/json"
-    },
-    body: body == null ? undefined : JSON.stringify(body)
-  });
+async function api(method, path, body, timeoutMs){
+  var ctl = timeoutMs ? new AbortController() : null, timer = ctl ? setTimeout(function(){ ctl.abort(); }, timeoutMs) : null;
+  var res;
+  try {
+    res = await fetch(baseUrl() + path, {
+      method: method,
+      headers: {
+        "Authorization": "Bearer " + token(),
+        "Content-Type": "application/json"
+      },
+      body: body == null ? undefined : JSON.stringify(body),
+      signal: ctl ? ctl.signal : undefined
+    });
+  } catch(e){
+    if (ctl && ctl.signal.aborted){ var te = new Error("Timed out. Check your connection."); te.timeout = true; throw te; }
+    throw e;
+  } finally { if (timer) clearTimeout(timer); }
   var data = null;
   try { data = await res.json(); } catch(e){ /* non-JSON */ }
   if (!res.ok){
     var msg = (data && data.error) ? data.error : ("HTTP " + res.status);
     if (res.status === 401) msg = "Owner token rejected (401). Check the token in Settings.";
     if (res.status === 403) msg = "Forbidden (403): " + msg;
-    throw new Error(msg);
+    var err = new Error(msg); err.status = res.status; throw err;
   }
   return data;
 }
@@ -989,7 +997,7 @@ async function doPost(p){
       thread_id: p.tid, from: "owner", to: p.to, type: "note", body: p.body,
       metadata: { client_key: p.key, ...(p.mentions.length ? { mentions: p.mentions } : {}) },
       idempotency_key: p.key
-    });
+    }, 15000); // a hung request becomes "Not sent" so the queue keeps moving; the same key makes the retry safe
     delete pendingSends[p.key]; outboxDrop(p.key);
     var row = pendingRow(p);
     if (p.tid !== state.currentThread){ if (row) row.remove(); return; }
@@ -1001,24 +1009,27 @@ async function doPost(p){
     $("threadMsgs").scrollTop = $("threadMsgs").scrollHeight;
     pollThread(); // pick up receipts and anything else, off the critical path
   } catch(e){
+    // A definite refusal (4xx other than timeout/rate limit) will not succeed on its own: do not keep it for auto-resend.
+    if (e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429){ delete pendingSends[p.key]; outboxDrop(p.key); }
     markFailed(p, e.message);
   }
 }
 /* Sends that never got an answer (thread left, reload, app killed): show them again and send once more with
    the same key. The server treats the key as the same message, so nothing is posted twice and nothing is lost. */
 function resumeOutbox(tid){
-  var o = loadOutbox(), now = Date.now();
+  var o = loadOutbox(), now = Date.now(), expired = 0;
   Object.keys(o).forEach(function(k){
-    var p = o[k];
-    if (now - Date.parse(p.at) > 24 * 3600 * 1000){ outboxDrop(k); return; }
+    var p = o[k], age = now - Date.parse(p.at);
+    if (age > 24 * 3600 * 1000){ outboxDrop(k); expired++; return; }
     if (p.tid !== tid) return;
     var box = $("threadMsgs");
     if (box.querySelector('[data-pk="' + CSS.escape(p.key) + '"]')) return;
     p.mentions = p.mentions || [];
-    pendingSends[p.key] = p;
     showPending(p);
-    postPending(p);
+    if (pendingSends[p.key] || age < 10 * 60 * 1000){ pendingSends[p.key] = p; postPending(p); }
+    else { pendingSends[p.key] = p; markFailed(p); }   // old: let the person decide, it may be stale
   });
+  if (expired) toast(expired === 1 ? "An unsent message from over a day ago was discarded." : expired + " unsent messages from over a day ago were discarded.");
 }
 function sendMessage(){
   var tid = state.currentThread;
