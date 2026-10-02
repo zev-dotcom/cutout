@@ -18,13 +18,13 @@ html{font-size:100%}
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-  background:var(--bg);color:var(--ink);min-height:100vh;-webkit-font-smoothing:antialiased;
+  background:var(--bg);color:var(--ink);min-height:100vh;min-height:100dvh;-webkit-font-smoothing:antialiased;
   transition:background var(--motion-slow),color var(--motion-slow)}
 button{font-family:inherit}
 input,select,textarea{font-family:inherit}
 
 /* ============ SETUP ============ */
-.setup{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.setup{min-height:100vh;min-height:var(--vvh,100dvh);display:flex;align-items:center;justify-content:center;padding:24px}
 .setup-card{width:100%;max-width:440px;background:var(--bg2);border:1.5px solid var(--line);
   border-radius:24px;padding:32px 28px;box-shadow:0 24px 70px rgba(0,0,0,.10)}
 .setup-card h1{font-size:28px;font-weight:800;letter-spacing:-.03em;margin-bottom:6px}
@@ -245,7 +245,7 @@ input,select,textarea{font-family:inherit}
 /* ============ RESPONSIVE ============ */
 @media (max-width:899px){
   body{padding:0}
-  .app{flex-direction:column;height:100vh;min-height:100vh;max-height:none;border:none;border-radius:0;margin-top:0}
+  .app{flex-direction:column;height:100vh;height:var(--vvh,100dvh);min-height:0;max-height:none;border:none;border-radius:0;margin-top:0}
   .app[data-view="threads"] .threads-col{display:flex;width:100%;border-right:none}
   .app[data-view="threads"] .main-col{display:none}
   .app:not([data-view="threads"]) .threads-col{display:none}
@@ -265,3 +265,8 @@ input,select,textarea{font-family:inherit}
 
 /* hidden attribute must win over display:flex rules (setup card stayed visible) */
 [hidden]{display:none !important}
+
+/* keyboard-safe: --vvh is set from visualViewport so the composer stays above the on-screen keyboard */
+html,body{overscroll-behavior:none}
+.msgs{min-height:0}
+@media (max-width:760px){ body{overflow:hidden} .setup{overflow-y:auto;align-items:flex-start} }
