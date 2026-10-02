@@ -492,6 +492,7 @@ def rawnl(m, p, data, tok):
 check("avatar: chunked PUT without content-length rejected", rawnl("PUT", "/v1/threads/" + TAV + "/avatar", PNG, PA) in (411, 413), None)
 s, b, h = raw("PUT", "/v1/threads/" + TAV + "/avatar", PNG, PA); v1 = json.loads(b).get("avatar_version") if s == 200 else None; check("avatar: creator sets png", s == 200 and v1 and len(v1) == 12, (s, b))
 s, b, h = raw("GET", "/v1/threads/" + TAV + "/avatar", tok=PB); check("avatar: member GET returns the bytes with image type", s == 200 and b == PNG and h.get("Content-Type", h.get("content-type")) == "image/png" and "nosniff" in str(h).lower(), (s, h))
+s, b, h = raw("GET", "/v1/threads/" + TAV + "/avatar?v=" + v1, tok=PB); check("avatar: GET with ?v=<version> returns 200 (query ignored by router)", s == 200 and b == PNG, s)
 s, b, h = raw("GET", "/v1/threads/" + TAV + "/avatar", tok=PA2) if False else raw("GET", "/v1/threads/" + TAV + "/avatar", tok=OWN); check("avatar: owner can read", s == 200, s)
 s, ls = req("GET", "/v1/owner/threads", tok=OWN); row = [t for t in ls["threads"] if t["thread_id"] == TAV]
 check("avatar: owner thread list carries avatar_version", row and row[0].get("avatar_version") == v1, row)
