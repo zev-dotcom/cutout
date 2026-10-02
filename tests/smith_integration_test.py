@@ -37,6 +37,10 @@ already applied), then exercises the Smith contract end to end:
      actor; agent failures audited consistently
  22. P1-4: separate phase — claim disabled when SMITH_SETUP_KEY unset
      (run with the no-setup-key flag against a keyless server)
+ 23. Round-3 P2s: fail-closed default for a missing member row; failed-auth
+     traffic under the fixed 'unauthenticated' rate bucket; all legacy
+     callers in one bucket regardless of X-Agent-Id; named idempotency PK
+     with an idempotent migration re-run
 
 Setup: Postgres with schema.sql + schema_v1.1.sql + schema_smith.sql applied,
 then e.g.:
@@ -577,6 +581,36 @@ s, d2 = req("POST", "/v1/messages", {"thread_id": TH_R3OTHER, "from": "agent-a",
 check("same key different thread -> 201 new message", s == 201 and not d2.get("duplicate"), f"{s} {d2}")
 s, d3 = req("POST", "/v1/messages", {"thread_id": TH_R3LATE, "from": "agent-a", "to": "*", "type": "note", "body": "idem3", "idempotency_key": "key-r3-1"}, bearer(TOK_A))
 check("same key same thread -> 200 duplicate", s == 200 and d3.get("duplicate") and d3.get("id") == d1.get("id"), f"{s} {d3}")
+
+# 23. Round-3 P2s (I2 round-3 review of be76d04).
+# P2-2: a missing member row must default to 'infinity' (see nothing), not
+# '-infinity'. White-box check of the exact coalesce default feedMessages uses.
+ok, rows = psql(f"select count(*) from cutout.messages m where m.thread_id = '{TH_R3LATE}' and m.created_at >= coalesce((select tm.added_at from smith_thread_members tm where tm.thread_id = '{TH_R3LATE}' and tm.agent_id = 'ghost-no-such-member'), 'infinity'::timestamptz)")
+check("missing member row sees nothing (fail-closed default)", ok and rows.strip() == "0", rows.strip() if ok else rows)
+
+# P2-3: failed-auth traffic is rate-limited under the fixed 'unauthenticated' bucket.
+s, _ = req("GET", "/v1/threads", headers={"Authorization": "Bearer junk-token-xyz"})
+check("junk token -> 401", s == 401, f"{s}")
+s, _ = req("GET", "/v1/threads", headers={"Authorization": "Bearer sm_agt_no_such_agent"})
+check("unknown agent token -> 401", s == 401, f"{s}")
+ok, rows = psql("select count(*) from cutout.rate_log where identity = 'unauthenticated'")
+check("failed-auth requests logged under 'unauthenticated'", ok and int(rows.strip()) >= 2, rows.strip() if ok else rows)
+
+# P2-3: legacy callers share one bucket regardless of X-Agent-Id (client-chosen).
+s, _ = req("GET", f"/v1/messages?thread_id={TH_LEG}&limit=1", headers=legacy_headers("rot-a"))
+s, _ = req("GET", f"/v1/messages?thread_id={TH_LEG}&limit=1", headers=legacy_headers("rot-b"))
+ok, rows = psql("select string_agg(distinct identity, ',') from cutout.rate_log where identity like 'legacy%'")
+check("legacy identities collapse to single 'legacy' bucket", ok and rows.strip() == "legacy", rows.strip() if ok else rows)
+
+# P2-4: migration PK constraint is named; re-running the migration is a no-op.
+ok, rows = psql("select conname from pg_constraint where conrelid = 'cutout.idempotency_keys'::regclass and contype = 'p'")
+check("idempotency PK named idempotency_keys_from_key_thread_pkey", ok and rows.strip() == "idempotency_keys_from_key_thread_pkey", rows.strip() if ok else rows)
+p = subprocess.run([f"{_pg}/psql", "-h", "127.0.0.1", "-p", "5433", "-U", "smithtest",
+                    "-d", "smithtest", "-v", "ON_ERROR_STOP=1", "-f", "supabase/schema_smith.sql"],
+                   env=_env, capture_output=True, text=True)
+check("schema_smith.sql re-runs cleanly", p.returncode == 0, (p.stderr or "")[:200])
+ok, rows = psql("select conname from pg_constraint where conrelid = 'cutout.idempotency_keys'::regclass and contype = 'p'")
+check("PK still named after re-run (guard matched, no drop/re-add)", ok and rows.strip() == "idempotency_keys_from_key_thread_pkey", rows.strip() if ok else rows)
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:

@@ -267,6 +267,24 @@ owner can reset budgets via `POST /v1/owner/security/reset-budgets`
 (audited). Failed-auth audit rows are deduped to one per credential class
 per minute so unauthenticated callers cannot flood the append-only log.
 
+Smith routes use per-identity buckets (`agent:<id>`, `owner`, one shared
+`legacy` bucket — `X-Agent-Id` is client-chosen, so legacy callers are not
+keyed on it) plus a global ceiling (default 10x the per-identity budget,
+`CUTOUT_RATE_LIMIT_GLOBAL`). The limiter runs **before** auth: requests
+with unrecognized credentials count against a fixed `unauthenticated`
+bucket instead of skipping the limiter. Check-and-insert is atomic under a
+single advisory lock; the lock serializes every request's rate check, which
+is negligible at this scale (one tiny insert per request). `rate_log` rows
+older than one day are purged at startup and daily via `pg_cron`.
+
+Re-adding an existing thread member keeps their original `added_at` (the
+insert is `on conflict do nothing`); there is no member-remove route in v1,
+so the re-join semantic is intentionally undefined — define it before
+adding one. `reply_to` existence is checked without the history rule: a
+late joiner who already knows a pre-join message id can confirm it exists,
+but the body stays hidden; accepted as low risk while ids are not
+enumerable.
+
 Out of v1 (P2-10): retention/gap flags (`data_complete_since`, `gap`) and
 per-recipient counters from the wake/health design. Feed cursors are
 `(created_us, id)` ordered by `created_at asc, id asc`.

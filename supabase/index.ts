@@ -165,15 +165,24 @@ function rateHeaders(s) {
   };
 }
 function rateIdentity(auth) {
-  if (!auth) return "unknown";
+  // Failed-auth traffic shares one fixed bucket: it is limited before the
+  // auth check, so junk-token floods cannot skip the limiter (each would
+  // otherwise cost a hash plus a DB lookup with no budget).
+  if (!auth) return "unauthenticated";
   if (auth.kind === "agent") return `agent:${auth.agentId}`;
   if (auth.kind === "owner") return "owner";
-  return auth.agentId ? `legacy:${auth.agentId}` : "legacy:anon";
+  // Legacy: X-Agent-Id is client-chosen, so a legacy caller could rotate the
+  // header to dodge a per-id bucket. All legacy traffic shares one bucket;
+  // only the global ceiling bounds it further.
+  return "legacy";
 }
 async function rateLimit(auth) {
   // P2-D: per-identity bucket plus a global ceiling. The check-and-insert runs
   // inside one transaction under an advisory lock, so concurrent requests
   // cannot both observe a below-limit count and overshoot the budget.
+  // The single global lock serializes every request's rate check; at this
+  // scale (tens of requests per second worst case, one tiny insert per
+  // request) the serialization cost is negligible — no sharding needed.
   // Log only admitted requests: a rejected (429) request is not counted, so
   // retrying while limited does not extend the lockout.
   const ident = rateIdentity(auth);
@@ -308,6 +317,11 @@ async function postMessage(req, auth) {
   }
   // P2-E: reply_to must reference a message in the same thread, so a reply
   // cannot be used to smuggle a cross-thread reference.
+  // Note (round-3 review item 6): the existence check is NOT subject to the
+  // added_at history rule — a late joiner can probe message ids from before
+  // their join (the message body stays hidden; only existence leaks, and the
+  // attacker must already know the id). Accepted as low risk; revisit if
+  // message ids ever become enumerable.
   if (body.reply_to) {
     const rt = await timedQuery(sql`select 1 from cutout.messages where id = ${body.reply_to} and thread_id = ${body.thread_id}`, "reply_to_check");
     if (!rt.length) return jres(422, {
@@ -1068,6 +1082,11 @@ async function addMember(req, auth, threadId) {
   // Owner-only: any member could otherwise expose full thread history to
   // another agent. The add is audited; the new member's added_at is set to
   // now, so the feed shows them history from here (P1-3).
+  // Note (round-3 review item 5): the insert uses on conflict do nothing, so
+  // re-adding an existing member keeps their original added_at. That is the
+  // intended semantic today (no member-remove route exists, so there is no
+  // re-join scenario). If a remove route is ever added, define the re-add
+  // semantic explicitly — e.g. refresh added_at on re-add — before shipping it.
   const denied = requireOwner(auth);
   if (denied) return denied;
   if (!await isManagedThread(threadId)) return jres(404, {
@@ -1136,7 +1155,7 @@ async function feedMessages(threadId, cursor, limit, agentId) {
            (extract(epoch from created_at) * 1000000)::bigint as created_us, metadata
     from cutout.messages m
     where m.thread_id = ${threadId}
-    ${agentId ? sql`and m.created_at >= coalesce((select tm.added_at from smith_thread_members tm where tm.thread_id = ${threadId} and tm.agent_id = ${agentId}), '-infinity'::timestamptz)` : sql``}
+    ${agentId ? sql`and m.created_at >= coalesce((select tm.added_at from smith_thread_members tm where tm.thread_id = ${threadId} and tm.agent_id = ${agentId}), 'infinity'::timestamptz)` : sql``}
     ${cursor ? sql`and (((extract(epoch from m.created_at) * 1000000)::bigint > ${cursor.us}) or (((extract(epoch from m.created_at) * 1000000)::bigint = ${cursor.us}) and m.id > ${cursor.id}))` : sql``}
     order by m.created_at asc, m.id asc
     limit ${limit}`, "feed_query");
@@ -1160,8 +1179,11 @@ async function threadFeed(req, auth, threadId) {
   const denied = await threadAccess(auth, threadId);
   if (denied) return denied;
   // P1-3: a member sees history from their join time (added_at). Seeded
-  // pre-existing participants have added_at '-infinity': full history. The
-  // filter stays in SQL so driver date parsing never sees '-infinity'.
+  // pre-existing participants have added_at '-infinity': full history. A
+  // missing member row defaults to 'infinity' (see nothing): fail-closed, so
+  // any future caller that reaches this filter without a threadAccess check
+  // leaks nothing. The filter stays in SQL so driver date parsing never sees
+  // '-infinity'.
   const q = parseFeedQuery(req);
   if (q.error) return q.error;
   return jres(200, await buildFeed(threadId, q, "feed_redact", auth.kind === "owner" ? null : auth.agentId));
@@ -1602,17 +1624,20 @@ async function route(req, arrivedAt) {
   // Smith credential classes, resolved in order: sm_own_ -> owner, sm_agt_ ->
   // bound agent, else the legacy bus token (+ optional X-Agent-Id), else 401.
   // A recognized sm_ prefix that fails its lookup never falls through to legacy.
+  // The rate limiter runs BEFORE the auth check: failed-auth traffic counts
+  // against the fixed 'unauthenticated' bucket instead of skipping the
+  // limiter entirely.
   const auth = await resolveAuth(req);
+  const { limited, state } = await rateLimit(auth);
+  if (limited) return {
+    res: limited,
+    state,
+    ident: rateIdentity(auth)
+  };
   if (!auth) return {
     res: jres(401, {
       error: "unauthorized"
     }),
-    state: null,
-    ident: "unknown"
-  };
-  const { limited, state } = await rateLimit(auth);
-  if (limited) return {
-    res: limited,
     state,
     ident: rateIdentity(auth)
   };

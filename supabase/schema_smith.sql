@@ -112,7 +112,12 @@ on conflict (agent_id) do nothing;
 -- rejects UPDATE and DELETE so a compromised function cannot rewrite history.
 -- P2-E: scope idempotency keys to (from_agent, idem_key, thread_id) so a reused
 -- key in a different thread creates a new message instead of returning the old
--- thread's message id.
+-- thread's message id. The PK constraint is named explicitly so the idempotence
+-- guard matches on re-run (an unnamed ADD PRIMARY KEY would be created as
+-- idempotency_keys_pkey and the guard would never match, dropping and
+-- re-adding the PK on every migration). The whole block runs in one
+-- transaction so a re-run can never leave the table without its PK.
+begin;
 alter table cutout.idempotency_keys add column if not exists thread_id text;
 update cutout.idempotency_keys k set thread_id = m.thread_id
   from cutout.messages m where m.id = k.message_id and k.thread_id is null;
@@ -120,9 +125,10 @@ alter table cutout.idempotency_keys alter column thread_id set not null;
 alter table cutout.idempotency_keys drop constraint if exists idempotency_keys_pkey;
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'idempotency_keys_from_key_thread_pkey') then
-    alter table cutout.idempotency_keys add primary key (from_agent, idem_key, thread_id);
+    alter table cutout.idempotency_keys add constraint idempotency_keys_from_key_thread_pkey primary key (from_agent, idem_key, thread_id);
   end if;
 end $$;
+commit;
 
 -- P2-D: per-identity rate-limit buckets. The base cutout.rate_log only has
 -- (at); add an identity column so the limiter can enforce a per-credential
