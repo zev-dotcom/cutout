@@ -1009,8 +1009,8 @@ async function doPost(p){
     $("threadMsgs").scrollTop = $("threadMsgs").scrollHeight;
     pollThread(); // pick up receipts and anything else, off the critical path
   } catch(e){
-    // A definite refusal (4xx other than timeout/rate limit) will not succeed on its own: do not keep it for auto-resend.
-    if (e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429){ delete pendingSends[p.key]; outboxDrop(p.key); }
+    // A definite refusal (400, 404, 413, 422) will not succeed on its own: do not keep it for auto-resend.
+    if (e.status === 400 || e.status === 404 || e.status === 413 || e.status === 422){ delete pendingSends[p.key]; outboxDrop(p.key); } // 401/403 keep it: a fixed token must not lose the text
     markFailed(p, e.message);
   }
 }
