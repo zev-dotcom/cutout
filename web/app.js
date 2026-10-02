@@ -521,6 +521,13 @@ function bodyHtml(msg){
 }
 /* Who a message is addressed to, and what it replies to. */
 var msgIndex = {};
+var MSG_INDEX_MAX = 2000;
+function indexMsg(m){
+  // Only what a reply chip needs: sender and the first 140 characters. Oldest entries drop at the cap.
+  msgIndex[m.id] = { from: m.from, body: String(m.body || "").slice(0, 140) };
+  var ks = Object.keys(msgIndex);
+  if (ks.length > MSG_INDEX_MAX) ks.slice(0, ks.length - MSG_INDEX_MAX).forEach(function(k){ delete msgIndex[k]; });
+}
 function toChip(msg){
   var to = msg.to;
   if (!to || to === "*") return "";
@@ -690,7 +697,7 @@ function appendMessages(msgs, opts){
   msgs.forEach(function(m){
     // Concurrent polls (timer + send) can return the same message twice: render each id once.
     if (m.id && box.querySelector('[data-mid="' + String(m.id).replace(/"/g, "") + '"]')) return;
-    if (m.id) msgIndex[m.id] = { from: m.from, body: m.body };
+    if (m.id) indexMsg(m);
     var day = fmtDay(m.created_at);
     if (day !== lastDay){
       box.insertAdjacentHTML("beforeend", '<div class="day">' + esc(day) + "</div>");
