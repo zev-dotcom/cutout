@@ -909,3 +909,23 @@ $("threadSearch").addEventListener("input", function(e){
 applyTheme();
 boot();
 })();
+
+/* ---------- on-screen keyboard handling ---------- */
+(function(){
+  var vv = window.visualViewport;
+  function fit(){
+    var h = vv ? vv.height : window.innerHeight;
+    document.documentElement.style.setProperty("--vvh", Math.round(h) + "px");
+    if (vv) window.scrollTo(0, 0);
+    var m = document.querySelector(".msgs");
+    var f = document.activeElement;
+    if (f && /^(INPUT|TEXTAREA|SELECT)$/.test(f.tagName)){
+      if (f.id === "composerInput" && m) m.scrollTop = m.scrollHeight;
+      else f.scrollIntoView({block: "center"});
+    }
+  }
+  if (vv){ vv.addEventListener("resize", fit); vv.addEventListener("scroll", function(){ window.scrollTo(0, 0); }); }
+  window.addEventListener("resize", fit);
+  document.addEventListener("focusin", function(){ setTimeout(fit, 120); setTimeout(fit, 400); });
+  fit();
+})();
