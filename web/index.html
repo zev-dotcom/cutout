@@ -13,7 +13,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Smith">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="stylesheet" href="styles.css?v=20261002l">
+<link rel="stylesheet" href="styles.css?v=20261002m">
 </head>
 <body data-theme="mono">
 
@@ -57,6 +57,7 @@
         placeholder="https://your-smith-address">
       <div class="hint">The address of your Smith, from your setup link or your host.</div>
     </div>
+    <div class="hostconfirm" id="setupHost" hidden><div>This address came from a link: <b id="setupHostName"></b></div><div class="hint">Only continue if you trust it. Your owner token is sent to this address.</div><button class="ghostbtn" id="setupHostOk" type="button">Yes, use this address</button></div>
     <div class="field">
       <label for="setupToken">OWNER TOKEN</label>
       <input id="setupToken" type="password" autocomplete="off" spellcheck="false"
@@ -270,6 +271,6 @@
 <div class="toast" id="toast" hidden></div>
 <div id="modalRoot"></div>
 
-<script src="app.js?v=20261002l"></script>
+<script src="app.js?v=20261002m"></script>
 </body>
 </html>

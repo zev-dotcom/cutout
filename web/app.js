@@ -1313,6 +1313,7 @@ async function setupConnect(){
   err.textContent = "";
   if (!url || !/^https?:\/\//.test(url)){ err.textContent = "Enter a valid instance URL (https://…)."; return; }
   if (!tok){ err.textContent = "Enter the owner token."; return; }
+  if (needHostConfirm){ err.textContent = "Check the address above and tap \"Yes, use this address\" first."; return; }
   var btn = $("setupGo");
   btn.disabled = true;
   btn.textContent = "Connecting…";
@@ -1343,6 +1344,7 @@ async function setupClaim(){
   err.textContent = "";
   if (!url || !/^https?:\/\//.test(url)){ err.textContent = "Enter the instance URL above first."; return; }
   if (!key){ err.textContent = "Enter the setup key (the bus token you deployed the function with)."; return; }
+  if (needHostConfirm){ err.textContent = "Check the address above and tap \"Yes, use this address\" first."; return; }
   var btn = $("setupClaimGo");
   btn.disabled = true;
   btn.textContent = "Generating…";
@@ -1397,10 +1399,15 @@ window.addEventListener("appinstalled", function(){
   deferredInstall = null; renderInstall(); renderNotifications();
   toast("Smith is installed.");
 });
-function iosSteps(){
-  return '<ol><li>Tap the <span class="glyph">Share</span> button (the square with an arrow) in Safari.</li>' +
-    '<li>Scroll down and tap <span class="glyph">Add to Home Screen</span>.</li>' +
-    '<li>Tap <span class="glyph">Add</span>, then open Smith from your home screen.</li></ol>';
+function iosStepItems(){
+  return ['Tap the <span class="glyph">Share</span> button (the square with an arrow) in Safari.',
+    'Scroll down and tap <span class="glyph">Add to Home Screen</span>.',
+    'Tap <span class="glyph">Add</span>, then open Smith from your home screen.'];
+}
+function iosSteps(cls, wrap){
+  return "<ol" + (cls ? ' class="' + cls + '"' : "") + ">" + iosStepItems().map(function(t){
+    return "<li>" + (wrap ? "<span>" + t + "</span>" : t) + "</li>";
+  }).join("") + "</ol>";
 }
 function runInstall(){
   if (deferredInstall){
@@ -1562,6 +1569,7 @@ window.addEventListener("hashchange", function(){ loadThreads().then(openFromHas
 
 /* ---------- onboarding: install, connect, notifications ---------- */
 var LS_PENDING_INSTANCE = "smith.pending.instance";
+var LS_PENDING_FROM_LINK = "smith.pending.fromlink";
 var LS_ONB_SKIP = "smith.onb.skipinstall";
 var LS_ONB_STEP3 = "smith.onb.step3";
 var LS_WELCOME = "smith.onb.welcome";
@@ -1569,10 +1577,19 @@ var LS_WELCOME = "smith.onb.welcome";
 function parseInstance(str){
   str = String(str || "").trim();
   if (!str) return "";
+  var cand = str;
   var m = /[#?&](?:instance|setup)=([^&#]+)/i.exec(str);
-  var cand = m ? decodeURIComponent(m[1]) : str;
-  cand = cand.trim().replace(/\/+$/, "");
-  return /^https?:\/\/[^\s]+$/i.test(cand) ? cand : "";
+  if (m){
+    try { cand = decodeURIComponent(m[1]); } catch(e){ return ""; }
+  }
+  cand = cand.trim();
+  var u;
+  try { u = new URL(cand); } catch(e){ return ""; }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return "";
+  if (u.username || u.password) return "";
+  // A bare address must not carry credentials in its query or hash.
+  if (/(?:^|[?&#])(?:[a-z_]*(?:token|key|secret|code|password)[a-z_]*)=/i.test(u.search + u.hash)) return "";
+  return (u.origin + u.pathname).replace(/\/+$/, "");
 }
 function pendingInstance(){
   var v = ""; try { v = localStorage.getItem(LS_PENDING_INSTANCE) || ""; } catch(e){}
@@ -1581,7 +1598,7 @@ function pendingInstance(){
 (function captureInstanceFromLink(){
   var found = parseInstance((location.hash || "") + "&" + (location.search || ""));
   if (!found) return;
-  try { localStorage.setItem(LS_PENDING_INSTANCE, found); } catch(e){}
+  try { localStorage.setItem(LS_PENDING_INSTANCE, found); localStorage.setItem(LS_PENDING_FROM_LINK, "1"); } catch(e){}
   try { history.replaceState(null, "", location.pathname); } catch(e){}
 })();
 function setupLinkForCopy(){
@@ -1616,7 +1633,7 @@ function showOnbInstall(done){
   } else {
     body.innerHTML = "<h2>Add Smith to your Home Screen</h2>" +
       '<p class="lede">Smith works best as an app: full screen, and notifications when an agent replies. Set it up from the home-screen icon so it keeps your connection.</p>' +
-      iosSteps().replace("<ol>", '<ol class="onbsteps">').replace(/<li>/g, "<li><span>").replace(/<\/li>/g, "</span></li>") + '<p class="fine">It must be Safari.</p>';
+      iosSteps("onbsteps", true) + '<p class="fine">It must be Safari.</p>';
     go.textContent = "I added it";
     go.onclick = function(){ showOnbInstall(true); };
   }
@@ -1652,8 +1669,25 @@ function renderWelcome(){
 }
 $("setupLink").addEventListener("input", function(){
   var v = parseInstance(this.value);
-  if (v){ $("setupUrl").value = v; try { localStorage.setItem(LS_PENDING_INSTANCE, v); } catch(e){} }
+  if (v){ $("setupUrl").value = v; try { localStorage.setItem(LS_PENDING_INSTANCE, v); localStorage.removeItem(LS_PENDING_FROM_LINK); } catch(e){} setHostConfirm(false); }
 });
+/* An address that arrived through a link needs one explicit tap before the token is sent anywhere. */
+var needHostConfirm = false;
+function setHostConfirm(on){
+  needHostConfirm = !!on;
+  var box = $("setupHost"); if (!box) return;
+  box.hidden = !on;
+  if (!on) return;
+  var host = ""; try { host = new URL($("setupUrl").value).host; } catch(e){}
+  $("setupHostName").textContent = host || $("setupUrl").value;
+  $("setupHostOk").hidden = false;
+}
+$("setupHostOk").addEventListener("click", function(){
+  needHostConfirm = false; $("setupHostOk").hidden = true;
+  $("setupHostName").parentNode.classList.add("ok");
+  try { localStorage.removeItem(LS_PENDING_FROM_LINK); } catch(e){}
+});
+$("setupUrl").addEventListener("input", function(){ if (needHostConfirm){ needHostConfirm = false; $("setupHost").hidden = true; } });
 function boot(){
   var cfg = loadCfg();
   var has = cfg && cfg.url && cfg.token;
@@ -1665,6 +1699,8 @@ function boot(){
     $("onbInstall").hidden = true;
     $("setupUrl").value = pend || "";
     $("setupLink").value = "";
+    var fromLink = false; try { fromLink = !!localStorage.getItem(LS_PENDING_FROM_LINK); } catch(e){}
+    setHostConfirm(!!(pend && fromLink));
     $("setupToken").value = "";
     $("setupKey").value = "";
     $("setupClaim").hidden = true;

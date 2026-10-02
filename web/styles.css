@@ -413,3 +413,6 @@ html,body{overflow-x:hidden}
 .welcomecard .ic-h{display:flex;justify-content:space-between;align-items:center;font-weight:700}
 .onb-card .lede{font-size:.95rem;color:var(--ink2);line-height:1.6;margin-bottom:16px}
 .onb-card .fine{font-size:.85rem;color:var(--ink3)}
+.hostconfirm{border:1.5px solid var(--accent,#f05a28);border-radius:14px;padding:12px 14px;margin:-4px 0 14px;font-size:.92rem;overflow-wrap:anywhere}
+.hostconfirm .ghostbtn{margin-top:8px}
+.hostconfirm[hidden]{display:none}
